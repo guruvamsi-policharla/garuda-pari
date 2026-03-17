@@ -82,7 +82,8 @@ where
 
     let max_n = *batch_sizes.iter().max().unwrap();
     let mut proofs_and_inputs = Vec::with_capacity(max_n);
-    println!("Generating {} proofs", max_n);
+    println!("Generating {} proofs...", max_n);
+    let prove_start = Instant::now();
     for _ in 0..max_n {
         let a = E::ScalarField::rand(&mut rng);
         let b = E::ScalarField::rand(&mut rng);
@@ -94,40 +95,47 @@ where
         let input = vec![a * b];
         proofs_and_inputs.push((proof, input));
     }
-
-    println!("\n{:-<70}", "");
+    let prove_elapsed = prove_start.elapsed();
     println!(
-        "{:<8} {:>14} {:>14} {:>10}",
-        "N", "Individual", "Batch", "Speedup"
+        "Generated {} proofs in {:.3} ms ({:.3} ms/proof)",
+        max_n,
+        prove_elapsed.as_secs_f64() * 1000.0,
+        prove_elapsed.as_secs_f64() * 1000.0 / max_n as f64,
     );
-    println!("{:-<70}", "");
+
+    println!("\n{:-<100}", "");
+    println!(
+        "{:<8} {:>12} {:>12} {:>12} {:>12} {:>12} {:>10}",
+        "N", "Individual", "Per-proof", "MSMs", "Pairing", "Batch tot", "Speedup"
+    );
+    println!("{:-<100}", "");
 
     for &n in &batch_sizes {
         let slice = &proofs_and_inputs[..n];
 
-        // Time individual verification: verify each proof one by one
         let start = Instant::now();
         for (proof, input) in slice.iter() {
             assert!(Pari::<E>::verify(proof, &vk, input));
         }
         let individual_elapsed = start.elapsed();
 
-        // Time batch verification
-        let start = Instant::now();
-        assert!(Pari::<E>::batch_verify(slice, &vk, &mut rng));
-        let batch_elapsed = start.elapsed();
-
-        let speedup = individual_elapsed.as_secs_f64() / batch_elapsed.as_secs_f64();
+        let (ok, breakdown) = Pari::<E>::batch_verify_timed(slice, &vk, &mut rng);
+        assert!(ok);
+        let batch_total = breakdown.per_proof + breakdown.msm_and_accum + breakdown.pairing;
+        let speedup = individual_elapsed.as_secs_f64() / batch_total.as_secs_f64();
 
         println!(
-            "{:<8} {:>11.3} ms {:>11.3} ms {:>9.2}x",
+            "{:<8} {:>9.3} ms {:>9.3} ms {:>9.3} ms {:>9.3} ms {:>9.3} ms {:>9.2}x",
             n,
             individual_elapsed.as_secs_f64() * 1000.0,
-            batch_elapsed.as_secs_f64() * 1000.0,
+            breakdown.per_proof.as_secs_f64() * 1000.0,
+            breakdown.msm_and_accum.as_secs_f64() * 1000.0,
+            breakdown.pairing.as_secs_f64() * 1000.0,
+            batch_total.as_secs_f64() * 1000.0,
             speedup,
         );
     }
-    println!("{:-<70}", "");
+    println!("{:-<100}", "");
 }
 
 impl<ConstraintF: Field> ConstraintSynthesizer<ConstraintF> for Circuit1<ConstraintF> {

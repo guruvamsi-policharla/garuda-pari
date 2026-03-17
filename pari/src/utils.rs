@@ -1,5 +1,7 @@
 use crate::data_structures::VerifyingKey;
 use ark_ec::pairing::Pairing;
+#[cfg(not(feature = "sol"))]
+use shared_utils::transcript::IOPTranscript;
 
 #[cfg(not(feature = "sol"))]
 pub fn compute_chall<E: Pairing>(
@@ -7,13 +9,36 @@ pub fn compute_chall<E: Pairing>(
     public_input: &[E::ScalarField],
     t_g: &E::G1Affine,
 ) -> E::ScalarField {
-    use shared_utils::transcript::IOPTranscript;
     let mut transcript = IOPTranscript::<E::ScalarField>::new(crate::Pari::<E>::SNARK_NAME);
     let _ = transcript.append_serializable_element(b"vk", vk);
     let _ = transcript.append_serializable_element(b"input", &public_input.to_vec());
     let _ = transcript.append_serializable_element(b"comm", t_g);
-    let challenge = transcript.get_and_append_challenge("r".as_bytes()).unwrap();
-    challenge
+    transcript.get_and_append_challenge("r".as_bytes()).unwrap()
+}
+
+/// Pre-seed a transcript with the VK. Clone the result for each proof to avoid
+/// re-serializing the VK N times during batch verification.
+#[cfg(not(feature = "sol"))]
+pub fn seed_transcript_with_vk<E: Pairing>(
+    vk: &VerifyingKey<E>,
+) -> IOPTranscript<E::ScalarField> {
+    let mut transcript = IOPTranscript::<E::ScalarField>::new(crate::Pari::<E>::SNARK_NAME);
+    let _ = transcript.append_serializable_element(b"vk", vk);
+    transcript
+}
+
+/// Compute the Fiat-Shamir challenge from a pre-seeded transcript (already
+/// contains the VK). Clones the base transcript so the caller can reuse it.
+#[cfg(not(feature = "sol"))]
+pub fn compute_chall_from_transcript<E: Pairing>(
+    base_transcript: &IOPTranscript<E::ScalarField>,
+    public_input: &[E::ScalarField],
+    t_g: &E::G1Affine,
+) -> E::ScalarField {
+    let mut transcript = base_transcript.clone();
+    let _ = transcript.append_serializable_element(b"input", &public_input.to_vec());
+    let _ = transcript.append_serializable_element(b"comm", t_g);
+    transcript.get_and_append_challenge("r".as_bytes()).unwrap()
 }
 #[cfg(feature = "sol")]
 use ark_ec::AffineRepr;
