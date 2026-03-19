@@ -20,12 +20,12 @@ impl<E: Pairing> Pari<E> {
     /// Batch verification of N Pari proofs using random linear combination.
     ///
     /// Reduces N independent pairing checks to a single 3-pairing check by
-    /// sampling random challenges ρ ←$ F^N and accumulating proof elements:
-    ///   T̃ = Σ ρ_k · T^(k),  Ũ = Σ ρ_k · U^(k),  Ṽ = Σ (ρ_k · r^(k)) · U^(k)
-    ///   ṽ_a = Σ ρ_k · v_a^(k),  ṽ_b = Σ ρ_k · v_b^(k),  ṽ_q = Σ ρ_k · v_q^(k)
+    /// sampling random challenges rho <-$ F^N and accumulating proof elements:
+    ///   T_tilde = Sum rho_k * T^(k),  U_tilde = Sum rho_k * U^(k),  V_tilde = Sum (rho_k * r^(k)) * U^(k)
+    ///   va_tilde = Sum rho_k * v_a^(k),  vb_tilde = Sum rho_k * v_b^(k),  vq_tilde = Sum rho_k * v_q^(k)
     ///
     /// Then checks:
-    ///   e(T̃, [δ₂]₂) · e(Ũ, [τ]₂) · e(ṽ_a·[α]₁ + ṽ_b·[β]₁ + ṽ_q·[1]₁ − Ṽ, [1]₂) = 1_T
+    ///   e(T_tilde, [delta_2]_2) * e(U_tilde, [tau]_2) * e(va_tilde*[alpha]_1 + vb_tilde*[beta]_1 + vq_tilde*[1]_1 - V_tilde, [1]_2) = 1_T
     pub fn batch_verify(
         proofs_and_inputs: &[(Proof<E>, Vec<E::ScalarField>)],
         vk: &VerifyingKey<E>,
@@ -44,8 +44,6 @@ impl<E: Pairing> Pari<E> {
         }
 
         /////////////////////// Challenge computation ///////////////////////
-        // Pre-seed transcript with VK once, then clone per proof
-        #[cfg(not(feature = "sol"))]
         let challenges: Vec<E::ScalarField> = {
             let base_transcript = crate::utils::seed_transcript_with_vk::<E>(vk);
             proofs_and_inputs
@@ -59,14 +57,6 @@ impl<E: Pairing> Pari<E> {
                 })
                 .collect()
         };
-
-        #[cfg(feature = "sol")]
-        let challenges: Vec<E::ScalarField> = proofs_and_inputs
-            .iter()
-            .map(|(proof, public_input)| {
-                crate::utils::compute_chall::<E>(vk, public_input, &proof.t_g)
-            })
-            .collect();
 
         /////////////////////// Per-proof computations ///////////////////////
         // Batch-evaluate Lagrange coefficients: precompute shared constants once,
@@ -106,21 +96,21 @@ impl<E: Pairing> Pari<E> {
         }
 
         /////////////////////// Random linear combination ///////////////////////
-        // Sample ρ ←$ F^N and accumulate proof elements
+        // Sample rho <-$ F^N and accumulate proof elements
         let rhos: Vec<E::ScalarField> = (0..n).map(|_| E::ScalarField::rand(rng)).collect();
 
         let t_bases: Vec<E::G1Affine> = proofs_and_inputs.iter().map(|(p, _)| p.t_g).collect();
         let u_bases: Vec<E::G1Affine> = proofs_and_inputs.iter().map(|(p, _)| p.u_g).collect();
 
-        // T̃ = Σ_{k=1}^N ρ_k · T^(k)
+        // T_tilde = Sum_{k=1}^N rho_k * T^(k)
         let t_tilde: E::G1Affine =
             <E::G1 as VariableBaseMSM>::msm_unchecked(&t_bases, &rhos).into();
 
-        // Ũ = Σ_{k=1}^N ρ_k · U^(k)
+        // U_tilde = Sum_{k=1}^N rho_k * U^(k)
         let u_tilde: E::G1Affine =
             <E::G1 as VariableBaseMSM>::msm_unchecked(&u_bases, &rhos).into();
 
-        // Ṽ = Σ_{k=1}^N (ρ_k · r^(k)) · U^(k)
+        // V_tilde = Sum_{k=1}^N (rho_k * r^(k)) * U^(k)
         let rho_r: Vec<E::ScalarField> = rhos
             .iter()
             .zip(&challenges)
@@ -129,7 +119,7 @@ impl<E: Pairing> Pari<E> {
         let v_tilde: E::G1Affine =
             <E::G1 as VariableBaseMSM>::msm_unchecked(&u_bases, &rho_r).into();
 
-        // ṽ_a = Σ_{k=1}^N ρ_k · v_a^(k)
+        // va_tilde = Sum_{k=1}^N rho_k * v_a^(k)
         let v_a_tilde = rhos
             .iter()
             .zip(proofs_and_inputs.iter())
@@ -137,7 +127,7 @@ impl<E: Pairing> Pari<E> {
                 acc + *rho * p.v_a
             });
 
-        // ṽ_b = Σ_{k=1}^N ρ_k · v_b^(k)
+        // vb_tilde = Sum_{k=1}^N rho_k * v_b^(k)
         let v_b_tilde = rhos
             .iter()
             .zip(proofs_and_inputs.iter())
@@ -145,7 +135,7 @@ impl<E: Pairing> Pari<E> {
                 acc + *rho * p.v_b
             });
 
-        // ṽ_q = Σ_{k=1}^N ρ_k · v_q^(k)
+        // vq_tilde = Sum_{k=1}^N rho_k * v_q^(k)
         let v_q_tilde = rhos
             .iter()
             .zip(&v_qs)
@@ -192,7 +182,6 @@ impl<E: Pairing> Pari<E> {
         /////////////////////// Phase 1: Per-proof computation ///////////////////////
         let t0 = Instant::now();
 
-        #[cfg(not(feature = "sol"))]
         let challenges: Vec<E::ScalarField> = {
             let base_transcript = crate::utils::seed_transcript_with_vk::<E>(vk);
             proofs_and_inputs
@@ -206,14 +195,6 @@ impl<E: Pairing> Pari<E> {
                 })
                 .collect()
         };
-
-        #[cfg(feature = "sol")]
-        let challenges: Vec<E::ScalarField> = proofs_and_inputs
-            .iter()
-            .map(|(proof, public_input)| {
-                crate::utils::compute_chall::<E>(vk, public_input, &proof.t_g)
-            })
-            .collect();
 
         let instance_size = vk.succinct_index.instance_len;
         let r1cs_orig_num_cnstrs = vk.succinct_index.num_constraints - instance_size;
@@ -349,7 +330,7 @@ impl<E: Pairing> Pari<E> {
             neg_cur *= &group_gen;
         }
 
-        // Evaluate z_K(τ^(k)) for all k, then batch-invert (1 inversion + 3N muls
+        // Evaluate z_K(tau^(k)) for all k, then batch-invert (1 inversion + 3N muls
         // instead of N independent inversions)
         let mut z_h_inv: Vec<F> = challenges
             .iter()

@@ -32,11 +32,6 @@ harness = false
 
 
 [[bench]]
-name = "rescue-pari-synthesis"
-path = "benches/rescue-pari-synthesis.rs"
-harness = false
-
-[[bench]]
 name = "rescue-groth16"
 path = "benches/rescue-groth16.rs"
 harness = false
