@@ -78,7 +78,7 @@ where
     };
     let (pk, vk): (ProvingKey<E>, VerifyingKey<E>) = Pari::<E>::keygen(circuit.clone(), &mut rng);
 
-    let batch_sizes = [2, 32, 512, 8096];
+    let batch_sizes = [2, 32, 512, 8096, 64768];
 
     let max_n = *batch_sizes.iter().max().unwrap();
     let mut proofs_and_inputs = Vec::with_capacity(max_n);
