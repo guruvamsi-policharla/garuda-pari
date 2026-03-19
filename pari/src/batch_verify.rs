@@ -163,7 +163,7 @@ impl<E: Pairing> Pari<E> {
     /// constants and the geometric sequence once, then batch-inverts the
     /// vanishing polynomial evaluations across all challenges.
     ///
-    /// Returns `(lagrange_coeffs_per_proof, z_K_inv_per_proof)`.
+    /// Returns `(lagrange_coeffs_per_proof, z_H_inv_per_proof)`.
     fn batch_eval_last_lagrange_coeffs<F: FftField>(
         domain: &Radix2EvaluationDomain<F>,
         challenges: &[F],
@@ -172,13 +172,12 @@ impl<E: Pairing> Pari<E> {
     ) -> (Vec<Vec<F>>, Vec<F>) {
         let n = challenges.len();
 
-        // Domain constants — computed once
         let group_gen = domain.group_gen();
         let group_gen_inv = domain.group_gen_inv();
-        let v_0_inv = domain.size_as_field_element();
+        let domain_size = domain.size_as_field_element();
         let start_gen = group_gen.pow([start_ind as u64]);
 
-        // Geometric sequence: neg_elems[i] = -ω^(start_ind + i), computed once
+        // neg_elems[i] = -omega^(start_ind + i), shared across all proofs
         let mut neg_elems = Vec::with_capacity(count);
         let mut neg_cur = -start_gen;
         for _ in 0..count {
@@ -186,29 +185,34 @@ impl<E: Pairing> Pari<E> {
             neg_cur *= &group_gen;
         }
 
-        // Evaluate z_K(tau^(k)) for all k, then batch-invert (1 inversion + 3N muls
-        // instead of N independent inversions)
-        let mut z_h_inv: Vec<F> = challenges
+        // Evaluate z_H(tau_k) for all k
+        let z_h_vals: Vec<F> = challenges
             .iter()
             .map(|tau| domain.evaluate_vanishing_polynomial(*tau))
             .collect();
-        for z in z_h_inv.iter() {
+        for z in &z_h_vals {
             assert!(!z.is_zero());
         }
-        batch_inversion_and_mul(&mut z_h_inv, &F::one());
 
-        // Per-proof: fill Lagrange coefficient vectors using precomputed neg_elems
+        // Lagrange coefficients: L_j(tau) = omega^j * z_H(tau) / (N * (tau - omega^j)).
+        // z_H is in the numerator, so we build the denominators
+        // N * omega^(-j) * (tau - omega^j) and batch-invert them,
+        // folding in start_gen * z_H as the numerator constant.
         let mut all_lagrange_coeffs = Vec::with_capacity(n);
-        for (tau, z_inv) in challenges.iter().zip(&z_h_inv) {
-            let mut l_i = *z_inv * v_0_inv;
+        for (tau, z_h) in challenges.iter().zip(&z_h_vals) {
+            let mut l_i = domain_size;
             let mut coeffs = vec![F::zero(); count];
             for (coeff, neg_elem) in coeffs.iter_mut().zip(&neg_elems) {
                 *coeff = l_i * (*tau + *neg_elem);
                 l_i *= &group_gen_inv;
             }
-            batch_inversion_and_mul(&mut coeffs, &start_gen);
+            batch_inversion_and_mul(&mut coeffs, &(start_gen * *z_h));
             all_lagrange_coeffs.push(coeffs);
         }
+
+        // Batch-invert z_H values separately for v_q computation
+        let mut z_h_inv = z_h_vals;
+        batch_inversion_and_mul(&mut z_h_inv, &F::one());
 
         (all_lagrange_coeffs, z_h_inv)
     }
