@@ -49,7 +49,7 @@ where
     };
     let (pk, vk) = Pari::<E>::keygen(circuit, &mut rng);
 
-    let batch_sizes = [2, 32, 512, 8192, 64768];
+    let batch_sizes = [2, 32, 512, 8192, 65536];
     let max_n = *batch_sizes.last().unwrap();
 
     println!("Generating {} proofs...", max_n);

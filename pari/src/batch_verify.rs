@@ -6,8 +6,8 @@ use ark_ec::pairing::Pairing;
 use ark_ec::{AffineRepr, VariableBaseMSM};
 use ark_ff::{FftField, Field, PrimeField, Zero};
 use ark_poly::{EvaluationDomain, Radix2EvaluationDomain};
-use ark_std::{ops::Neg, rand::RngCore, UniformRand};
-use shared_utils::{batch_inversion_and_mul, msm_bigint_wnaf};
+use ark_std::{ops::Neg, rand::RngCore};
+use shared_utils::{batch_inversion_and_mul, msm_bigint_wnaf, msm_pippenger};
 
 impl<E: Pairing> Pari<E> {
     /// Batch verification of N Pari proofs using random linear combination.
@@ -89,21 +89,30 @@ impl<E: Pairing> Pari<E> {
         }
 
         /////////////////////// Random linear combination ///////////////////////
-        // Sample rho <-$ F^N and accumulate proof elements
-        let rhos: Vec<E::ScalarField> = (0..n).map(|_| E::ScalarField::rand(rng)).collect();
+        // Sample 128-bit rho <-$ [0, 2^128)^N (sufficient for 2^-128 soundness)
+        const SMALL_SCALAR_BITS: usize = 128;
+        let rhos: Vec<E::ScalarField> = (0..n)
+            .map(|_| {
+                let mut bytes = [0u8; 16];
+                rng.fill_bytes(&mut bytes);
+                E::ScalarField::from_le_bytes_mod_order(&bytes)
+            })
+            .collect();
+        let rho_bigints: Vec<<E::ScalarField as PrimeField>::BigInt> =
+            rhos.iter().map(|r| r.into_bigint()).collect();
 
         let t_bases: Vec<E::G1Affine> = proofs_and_inputs.iter().map(|(p, _)| p.t_g).collect();
         let u_bases: Vec<E::G1Affine> = proofs_and_inputs.iter().map(|(p, _)| p.u_g).collect();
 
-        // T_tilde = Sum_{k=1}^N rho_k * T^(k)
+        // T_tilde = Sum_{k=1}^N rho_k * T^(k)  [128-bit MSM]
         let t_tilde: E::G1Affine =
-            <E::G1 as VariableBaseMSM>::msm_unchecked(&t_bases, &rhos).into();
+            msm_pippenger::<E::G1>(&t_bases, &rho_bigints, SMALL_SCALAR_BITS).into();
 
-        // U_tilde = Sum_{k=1}^N rho_k * U^(k)
+        // U_tilde = Sum_{k=1}^N rho_k * U^(k)  [128-bit MSM]
         let u_tilde: E::G1Affine =
-            <E::G1 as VariableBaseMSM>::msm_unchecked(&u_bases, &rhos).into();
+            msm_pippenger::<E::G1>(&u_bases, &rho_bigints, SMALL_SCALAR_BITS).into();
 
-        // V_tilde = Sum_{k=1}^N (rho_k * r^(k)) * U^(k)
+        // V_tilde = Sum_{k=1}^N (rho_k * r^(k)) * U^(k)  [full-size MSM]
         let rho_r: Vec<E::ScalarField> = rhos
             .iter()
             .zip(&challenges)

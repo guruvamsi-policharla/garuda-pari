@@ -108,6 +108,75 @@ fn make_digits<const W: usize>(
     })
 }
 
+/// Pippenger MSM with configurable scalar bit-length.
+///
+/// For batch verification with 128-bit random challenges, pass `scalar_bits = 128`
+/// to halve the number of Pippenger windows compared to full-size scalars.
+pub fn msm_pippenger<V: VariableBaseMSM>(
+    bases: &[V::MulBase],
+    scalars: &[<V::ScalarField as PrimeField>::BigInt],
+    scalar_bits: usize,
+) -> V {
+    let size = bases.len().min(scalars.len());
+    if size == 0 || scalar_bits == 0 {
+        return V::zero();
+    }
+
+    let c = if size < 32 {
+        3
+    } else {
+        ln_without_floats(size) + 2
+    };
+
+    let zero = V::zero();
+    let num_buckets = (1 << c) - 1;
+
+    let window_sums: Vec<_> = (0..scalar_bits)
+        .step_by(c)
+        .map(|w_start| {
+            let mut buckets = vec![zero; num_buckets];
+
+            for (scalar, base) in scalars[..size].iter().zip(&bases[..size]) {
+                if scalar.is_zero() {
+                    continue;
+                }
+                let mut s = *scalar;
+                s >>= w_start as u32;
+                let idx = (s.as_ref()[0] & ((1u64 << c) - 1)) as usize;
+                if idx != 0 {
+                    buckets[idx - 1] += base;
+                }
+            }
+
+            let mut running_sum = V::zero();
+            let mut res = V::zero();
+            for b in buckets.into_iter().rev() {
+                running_sum += &b;
+                res += &running_sum;
+            }
+            res
+        })
+        .collect();
+
+    let lowest = window_sums[0];
+    lowest
+        + &window_sums[1..]
+            .iter()
+            .rev()
+            .fold(V::zero(), |mut total, sum_i| {
+                total += sum_i;
+                for _ in 0..c {
+                    total.double_in_place();
+                }
+                total
+            })
+}
+
+fn ln_without_floats(a: usize) -> usize {
+    let log2a = (usize::BITS - a.leading_zeros()) as usize;
+    log2a * 69 / 100
+}
+
 /// Given a vector of field elements {v_i}, compute the vector {coeff * v_i^(-1)}.
 /// This method is explicitly single-threaded.
 pub fn batch_inversion_and_mul<F: Field>(v: &mut [F], coeff: &F) {
