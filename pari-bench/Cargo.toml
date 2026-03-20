@@ -37,6 +37,11 @@ path = "benches/batch-verify-pari.rs"
 harness = false
 
 [[bench]]
+name = "parallel-batch-verify-pari"
+path = "benches/parallel-batch-verify-pari.rs"
+harness = false
+
+[[bench]]
 name = "rescue-groth16"
 path = "benches/rescue-groth16.rs"
 harness = false
