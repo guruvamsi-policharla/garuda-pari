@@ -24,6 +24,11 @@ fn run_test() {
     let _ = test_circuit::<Bn254>();
 }
 
+#[test]
+fn run_batch_test() {
+    let _ = test_batch_circuit::<Bn254>();
+}
+
 fn test_circuit<E: Pairing>()
 where
     E::G1Affine: Neg<Output = E::G1Affine>,
@@ -50,6 +55,42 @@ where
 struct Circuit1<F: Field> {
     a: Option<F>,
     b: Option<F>,
+}
+
+fn test_batch_circuit<E: Pairing>()
+where
+    E::G1Affine: Neg<Output = E::G1Affine>,
+    E: Pairing,
+    E::ScalarField: Field,
+    E::ScalarField: std::convert::From<i32>,
+    E::BaseField: PrimeField,
+    <<E as Pairing>::G1Affine as AffineRepr>::BaseField: PrimeField,
+{
+    let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(test_rng().next_u64());
+
+    let a_val = E::ScalarField::rand(&mut rng);
+    let b_val = E::ScalarField::rand(&mut rng);
+    let circuit = Circuit1 {
+        a: Some(a_val),
+        b: Some(b_val),
+    };
+    let (pk, vk): (ProvingKey<E>, VerifyingKey<E>) = Pari::<E>::keygen(circuit.clone(), &mut rng);
+
+    let n = 4;
+    let mut proofs_and_inputs = Vec::with_capacity(n);
+    for _ in 0..n {
+        let a = E::ScalarField::rand(&mut rng);
+        let b = E::ScalarField::rand(&mut rng);
+        let circuit = Circuit1 {
+            a: Some(a),
+            b: Some(b),
+        };
+        let proof: Proof<E> = Pari::prove(circuit, &pk).unwrap();
+        let input = vec![a * b];
+        proofs_and_inputs.push((proof, input));
+    }
+
+    assert!(Pari::<E>::batch_verify(&proofs_and_inputs, &vk, &mut rng));
 }
 
 impl<ConstraintF: Field> ConstraintSynthesizer<ConstraintF> for Circuit1<ConstraintF> {

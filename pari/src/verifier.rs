@@ -143,7 +143,7 @@ impl<E: Pairing> Pari<E> {
         (lagrange_coefficients_inverse, neg_hi, nom_i)
     }
 
-    fn eval_last_lagrange_coeffs<F: FftField>(
+    pub(crate) fn eval_last_lagrange_coeffs<F: FftField>(
         domain: &Radix2EvaluationDomain<F>,
         tau: F,
         start_ind: usize,
