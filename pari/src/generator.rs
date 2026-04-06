@@ -21,8 +21,13 @@ use ark_relations::{
 use ark_std::{end_timer, rand::RngCore, start_timer, vec::Vec, UniformRand};
 
 impl<E: Pairing> Pari<E> {
+    /// Generate proving and verifying keys for ZK-Pari.
+    ///
+    /// `witness_split` is the number of witness variables (in post-outlining order)
+    /// committed via sigma_1 / delta_1. The remaining witness variables use sigma_2 / delta_2.
     pub fn keygen<C: ConstraintSynthesizer<E::ScalarField>, R: RngCore>(
         circuit: C,
+        witness_split: usize,
         rng: &mut R,
     ) -> (ProvingKey<E>, VerifyingKey<E>)
     where
@@ -30,7 +35,6 @@ impl<E: Pairing> Pari<E> {
         E::ScalarField: Field,
     {
         let cs = Self::circuit_to_keygen_cs(circuit).unwrap();
-        // Check if the constraint system has only one predicate which is Sqaured R1CS
         #[cfg(debug_assertions)]
         {
             assert_eq!(cs.num_predicates(), 1);
@@ -41,30 +45,42 @@ impl<E: Pairing> Pari<E> {
             );
         }
 
-        /////////////////////// Extract the constraint system  information ///////////////////////
+        /////////////////////// Extract the constraint system information ///////////////////////
         let instance_len = cs.num_instance_variables();
         let num_constraints = cs.num_constraints();
+        let num_witness = cs.num_witness_variables();
+        assert!(
+            witness_split <= num_witness,
+            "witness_split ({witness_split}) exceeds number of witness variables ({num_witness})"
+        );
+
         /////////////////////// Generators ///////////////////////
         let timer_sample_generators = start_timer!(|| "Sample generators");
-
         let g = E::G1::rand(rng);
         let h = E::G2::rand(rng);
         end_timer!(timer_sample_generators);
-        /////////////////////// Trapdoor generation ///////////////////////
 
+        /////////////////////// Trapdoor generation ///////////////////////
         let timer_trapdoor_gen = start_timer!(|| "Trapdoor generation and exponentiations");
         let alpha = E::ScalarField::rand(rng);
         let beta = E::ScalarField::rand(rng);
+        let gamma = E::ScalarField::rand(rng);
+        let delta_one = E::ScalarField::rand(rng);
         let delta_two = E::ScalarField::rand(rng);
         let tau = E::ScalarField::rand(rng);
 
         let alpha_g: <E as Pairing>::G1 = g * alpha;
         let beta_g = g * beta;
+        let gamma_h = h * gamma;
+        let delta_one_h = h * delta_one;
         let delta_two_h = h * delta_two;
         let tau_h = h * tau;
 
+        let delta_one_inverse = delta_one.inverse().unwrap();
         let delta_two_inverse = delta_two.inverse().unwrap();
 
+        let alpha_over_delta_one = alpha * delta_one_inverse;
+        let beta_over_delta_one = beta * delta_one_inverse;
         let alpha_over_delta_two = alpha * delta_two_inverse;
         let beta_over_delta_two = beta * delta_two_inverse;
         end_timer!(timer_trapdoor_gen);
@@ -72,48 +88,49 @@ impl<E: Pairing> Pari<E> {
         /////////////////////// Computing the FFT domain ///////////////////////
         let timer_fft_domain = start_timer!(|| "Computing the FFT domain");
         let domain = Radix2EvaluationDomain::new(cs.num_constraints()).unwrap();
-        assert_ne!(
-            domain.evaluate_vanishing_polynomial(tau),
-            E::ScalarField::zero()
-        );
+        let v_k_at_tau = domain.evaluate_vanishing_polynomial(tau);
+        assert_ne!(v_k_at_tau, E::ScalarField::zero());
         end_timer!(timer_fft_domain);
         let domain_size = domain.size();
         let max_degree = domain_size - 1;
-        /////////////////////// Computing {a_i(tau)}_{i=n+1}^{k}, {b_i(tau)}_{i=n+1}^{k} ////////////////////////
+
+        /////////////////////// Computing {a_i(tau)}, {b_i(tau)} ////////////////////////
         let timer_compute_a_b = start_timer!(|| "Computing a_i(tau)'s and b_i(tau)'s");
         let (a, b) = Self::compute_ai_bi_at_tau(tau, &cs, domain).unwrap();
         end_timer!(timer_compute_a_b);
+
         /////////////////////// Succinct Index ///////////////////////
         let timer_succinct_index = start_timer!(|| "Generating Succinct Index");
         let num_public_inputs = cs.num_instance_variables();
         let succinct_index = SuccinctIndex {
             num_constraints,
             instance_len,
+            witness_split,
         };
         end_timer!(timer_succinct_index);
-        /////////////////////// interpolation Domain and powers of tau ///////////////////////
-        //TODO: Find the correct len of powers of tau
+
+        /////////////////////// Powers of tau ///////////////////////
         let timer_powers_of_tau = start_timer!(|| "Computing powers of tau");
         let mut powers_of_tau = vec![E::ScalarField::ONE];
         let mut cur = tau;
-        for _ in 0..=max_degree {
+        // Need max_degree + 2 powers for sigma_q_comm (m+1 entries, indices 0..=m)
+        for _ in 0..=max_degree + 1 {
             powers_of_tau.push(cur);
             cur *= &tau;
         }
         end_timer!(timer_powers_of_tau);
-        /////////////////////// proving key generations ///////////////////////
+
+        /////////////////////// Proving key generation ///////////////////////
         let timer_pk_gen = start_timer!(|| "Generating Proving Key");
 
         let timer_batch_mul_prep = start_timer!(|| "Batch Mul Preprocessing startup");
-        let table = BatchMulPreprocessing::new(g, max_degree + 1);
+        let table = BatchMulPreprocessing::new(g, max_degree + 2);
         end_timer!(timer_batch_mul_prep);
 
         /////////////////////// Opening Keys ///////////////////////
         let timer_opening_keys = start_timer!(|| "Computing Opening Keys");
 
-        /////////////////////// Sigma_a ///////////////////////
-        // Construct sigma_a, It's denoted by sigma_a in the paper: step 7, fig 6, https://eprint.iacr.org/2024/1245.pdf
-        // sigma_a = [(beta a_i(tau)/delta_1)G]_{i=1}^k
+        // Sigma_A: [alpha * tau^i * G] for i = 0..m-1 (m entries)
         let timer_sigma_a = start_timer!(|| "Computing sigma_a");
         let sigma_a_powers = powers_of_tau[0..max_degree + 1]
             .par_iter()
@@ -122,9 +139,7 @@ impl<E: Pairing> Pari<E> {
         let sigma_a = table.batch_mul(&sigma_a_powers);
         end_timer!(timer_sigma_a);
 
-        /////////////////////// Sigma_b ///////////////////////
-        // Construct sigma_b, It's denoted by sigma_b in the paper: step 7, fig 6, https://eprint.iacr.org/2024/1245.pdf
-        // sigma_b = [(beta b_i(tau)/delta_1)G]_{i=1}^k
+        // Sigma_B: [beta * tau^i * G] for i = 0..m-1 (m entries)
         let timer_sigma_b = start_timer!(|| "Computing sigma_b");
         let sigma_b_powers = powers_of_tau[0..max_degree + 1]
             .par_iter()
@@ -133,50 +148,75 @@ impl<E: Pairing> Pari<E> {
         let sigma_b = table.batch_mul(&sigma_b_powers);
         end_timer!(timer_sigma_b);
 
-        /////////////////////// Sigma_q_opening ///////////////////////
-        // Construct sigma_q_opening, It's denoted by sigma_q' in the paper: step 7, fig 6, https://eprint.iacr.org/2024/1245.pdf
-        // sigma_q_opening = [(tau^i/delta_1)G]_{i=1}^k
+        // Sigma_Q_opening: [tau^i * G] for i = 0..m-1 (m entries)
         let timer_sigma_q_opening = start_timer!(|| "Computing sigma_q_opening");
-        //TODO: Remove the bellow line
         let sigma_q_opening_powers = powers_of_tau[0..max_degree + 1]
             .par_iter()
-            .map(|tau| *tau)
+            .copied()
             .collect::<Vec<_>>();
         let sigma_q_opening = table.batch_mul(&sigma_q_opening_powers);
         end_timer!(timer_sigma_q_opening);
         end_timer!(timer_opening_keys);
 
-        /////////////////////// Commiting keys ///////////////////////
+        /////////////////////// Commitment Keys ///////////////////////
+        let timer_commit_keys = start_timer!(|| "Computing Commitment Keys");
 
-        let timer_commit_keys = start_timer!(|| "Computing Committing Keys");
-        // Construct sigma, It's also denoted by sigma in the paper: step 6, fig 6, https://eprint.iacr.org/2024/1245.pdf
-        // Sigma = [((alpha a_i(tau)+ beta b_(tau))/delta_2).G]_{i=n+1}^k
-        let timer_sigma = start_timer!(|| "Computing sigma");
-        let sigma_powers = a[num_public_inputs..]
+        // Sigma_1: [(alpha*a_i(tau) + beta*b_i(tau))/delta_1 * G] for witness vars in partition 1
+        let timer_sigma_1 = start_timer!(|| "Computing sigma_1");
+        let sigma_1_powers = a[num_public_inputs..num_public_inputs + witness_split]
             .par_iter()
-            .zip(&b[num_public_inputs..])
-            .map(|(a_i, b_i)| *a_i * alpha_over_delta_two + *b_i * beta_over_delta_two)
-            // .map(|(a_i, b_i)|  *a_i * alpha_over_delta_two + *b_i * beta_over_delta_two)
+            .zip(&b[num_public_inputs..num_public_inputs + witness_split])
+            .map(|(a_i, b_i)| *a_i * alpha_over_delta_one + *b_i * beta_over_delta_one)
             .collect::<Vec<_>>();
-        let sigma = table.batch_mul(&sigma_powers);
-        end_timer!(timer_sigma);
+        let sigma_1 = table.batch_mul(&sigma_1_powers);
+        end_timer!(timer_sigma_1);
 
-        // Construct sigma_q_comm, It's denoted by sigma_q in the paper: step 6, fig 6, https://eprint.iacr.org/2024/1245.pdf
-        // sigma_q = [(tau^i/delta_2)G]_{i=1}^m
-        let timer_q_comm = start_timer!(|| "Computing sigma_q_comm");
-        let sigma_q_comm_powers = powers_of_tau[0..max_degree]
+        // Sigma_2: [(alpha*a_i(tau) + beta*b_i(tau))/delta_2 * G] for witness vars in partition 2
+        let timer_sigma_2 = start_timer!(|| "Computing sigma_2");
+        let sigma_2_powers = a[num_public_inputs + witness_split..]
             .par_iter()
-            .map(|tau| *tau * delta_two_inverse)
+            .zip(&b[num_public_inputs + witness_split..])
+            .map(|(a_i, b_i)| *a_i * alpha_over_delta_two + *b_i * beta_over_delta_two)
+            .collect::<Vec<_>>();
+        let sigma_2 = table.batch_mul(&sigma_2_powers);
+        end_timer!(timer_sigma_2);
+
+        // Sigma_Q_comm: [tau^i / delta_2 * G] for i = 0..m (m+1 entries for blinded quotient)
+        let timer_q_comm = start_timer!(|| "Computing sigma_q_comm");
+        let sigma_q_comm_powers = powers_of_tau[0..max_degree + 2]
+            .par_iter()
+            .map(|tau_pow| *tau_pow * delta_two_inverse)
             .collect::<Vec<_>>();
         let sigma_q_comm = table.batch_mul(&sigma_q_comm_powers);
         end_timer!(timer_q_comm);
         end_timer!(timer_commit_keys);
+
+        /////////////////////// ZK Commitment Keys ///////////////////////
+        let timer_zk_keys = start_timer!(|| "Computing ZK commitment keys");
+        let sigma_a_zk_1: E::G1Affine = (g * (alpha * v_k_at_tau * delta_one_inverse)).into();
+        let sigma_b_zk_1: E::G1Affine = (g * (beta * v_k_at_tau * delta_one_inverse)).into();
+        let sigma_a_zk_2: E::G1Affine = (g * (alpha * v_k_at_tau * delta_two_inverse)).into();
+        let sigma_b_zk_2: E::G1Affine = (g * (beta * v_k_at_tau * delta_two_inverse)).into();
+        end_timer!(timer_zk_keys);
+
+        /////////////////////// Hiding Elements ///////////////////////
+        let timer_hiding = start_timer!(|| "Computing hiding elements");
+        let gamma_over_delta_1_g: E::G1Affine = (g * (gamma * delta_one_inverse)).into();
+        let gamma_over_delta_2_g: E::G1Affine = (g * (gamma * delta_two_inverse)).into();
+        let gamma_g: E::G1Affine = (g * gamma).into();
+        end_timer!(timer_hiding);
+
         end_timer!(timer_pk_gen);
-        // Output the verifying key: step 8, fig 6, https://eprint.iacr.org/2024/1245.pdf
+
+        /////////////////////// Output keys ///////////////////////
         let vk = VerifyingKey {
             succinct_index,
             alpha_g: alpha_g.into(),
             beta_g: beta_g.into(),
+            gamma_h: gamma_h.into(),
+            gamma_h_prep: gamma_h.into().into(),
+            delta_one_h: delta_one_h.into(),
+            delta_one_h_prep: delta_one_h.into().into(),
             delta_two_h_prep: delta_two_h.into().into(),
             delta_two_h: delta_two_h.into(),
             tau_h: tau_h.into(),
@@ -187,13 +227,20 @@ impl<E: Pairing> Pari<E> {
             domain,
         };
 
-        // Output the proving key: step 8, fig 6, https://eprint.iacr.org/2024/1245.pdf
         let pk = ProvingKey {
-            sigma,
+            sigma_1,
+            sigma_2,
             sigma_a,
             sigma_b,
             sigma_q_comm,
             sigma_q_opening,
+            sigma_a_zk_1,
+            sigma_b_zk_1,
+            sigma_a_zk_2,
+            sigma_b_zk_2,
+            gamma_over_delta_1_g,
+            gamma_over_delta_2_g,
+            gamma_g,
             verifying_key: vk.clone(),
         };
 
@@ -208,7 +255,6 @@ impl<E: Pairing> Pari<E> {
         E::ScalarField: Field,
         E::ScalarField: std::convert::From<i32>,
     {
-        // Start up the constraint System and synthesize the circuit
         let timer_cs_startup = start_timer!(|| "Constraint System Startup");
         let cs: gr1cs::ConstraintSystemRef<E::ScalarField> = ConstraintSystem::new_ref();
         cs.set_mode(SynthesisMode::Setup);
@@ -224,7 +270,6 @@ impl<E: Pairing> Pari<E> {
         end_timer!(timer_synthesize_circuit);
 
         let timer_inlining = start_timer!(|| "Inlining constraints");
-        // sr1cs_cs.finalize();
         let mut sr1cs_inner = sr1cs_cs.into_inner().unwrap();
         let _ = sr1cs_inner.perform_instance_outlining(InstanceOutliner {
             pred_label: SR1CS_PREDICATE_LABEL.to_string(),
@@ -241,7 +286,6 @@ impl<E: Pairing> Pari<E> {
         new_cs: &ConstraintSystem<E::ScalarField>,
         domain: Radix2EvaluationDomain<E::ScalarField>,
     ) -> Result<(Vec<E::ScalarField>, Vec<E::ScalarField>), SynthesisError> {
-        // Compute all the lagrange polynomials
         let timer_eval_all_lagrange_polys = start_timer!(|| "Evaluating all Lagrange polys");
         let lagrange_polys_at_tau = domain.evaluate_all_lagrange_coefficients(tau);
         end_timer!(timer_eval_all_lagrange_polys);
@@ -266,7 +310,6 @@ impl<E: Pairing> Pari<E> {
                 b[index] += &(*u_i * coeff);
             }
         }
-        // write a sanity check, make up a z, check if MV product is correct
         end_timer!(timer_compute_a_b);
         Ok((a, b))
     }

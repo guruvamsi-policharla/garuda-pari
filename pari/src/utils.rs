@@ -7,12 +7,14 @@ use shared_utils::transcript::IOPTranscript;
 pub fn compute_chall<E: Pairing>(
     vk: &VerifyingKey<E>,
     public_input: &[E::ScalarField],
-    t_g: &E::G1Affine,
+    t_1: &E::G1Affine,
+    t_2: &E::G1Affine,
 ) -> E::ScalarField {
     let mut transcript = IOPTranscript::<E::ScalarField>::new(crate::Pari::<E>::SNARK_NAME);
     let _ = transcript.append_serializable_element(b"vk", vk);
     let _ = transcript.append_serializable_element(b"input", &public_input.to_vec());
-    let _ = transcript.append_serializable_element(b"comm", t_g);
+    let _ = transcript.append_serializable_element(b"comm1", t_1);
+    let _ = transcript.append_serializable_element(b"comm2", t_2);
     transcript.get_and_append_challenge("r".as_bytes()).unwrap()
 }
 
@@ -33,11 +35,13 @@ pub fn seed_transcript_with_vk<E: Pairing>(
 pub fn compute_chall_from_transcript<E: Pairing>(
     base_transcript: &IOPTranscript<E::ScalarField>,
     public_input: &[E::ScalarField],
-    t_g: &E::G1Affine,
+    t_1: &E::G1Affine,
+    t_2: &E::G1Affine,
 ) -> E::ScalarField {
     let mut transcript = base_transcript.clone();
     let _ = transcript.append_serializable_element(b"input", &public_input.to_vec());
-    let _ = transcript.append_serializable_element(b"comm", t_g);
+    let _ = transcript.append_serializable_element(b"comm1", t_1);
+    let _ = transcript.append_serializable_element(b"comm2", t_2);
     transcript.get_and_append_challenge("r".as_bytes()).unwrap()
 }
 
@@ -50,7 +54,8 @@ use ark_ff::PrimeField;
 pub fn compute_chall<E: Pairing>(
     vk: &VerifyingKey<E>,
     public_input: &[E::ScalarField],
-    t_g: &E::G1Affine,
+    t_1: &E::G1Affine,
+    t_2: &E::G1Affine,
 ) -> E::ScalarField
 where
     E::BaseField: PrimeField,
@@ -66,18 +71,30 @@ where
     let binding = vk.h.y().unwrap();
     let mut vk_h_y = binding.to_base_prime_field_elements();
 
+    let binding = vk.gamma_h.x().unwrap();
+    let mut vk_gamma_h_x = binding.to_base_prime_field_elements();
+    let binding = vk.gamma_h.y().unwrap();
+    let mut vk_gamma_h_y = binding.to_base_prime_field_elements();
+
+    let binding = vk.delta_one_h.x().unwrap();
+    let mut vk_delta_one_h_x = binding.to_base_prime_field_elements();
+    let binding = vk.delta_one_h.y().unwrap();
+    let mut vk_delta_one_h_y = binding.to_base_prime_field_elements();
+
     let binding = vk.delta_two_h.x().unwrap();
-    let mut vk_delta_h_x = binding.to_base_prime_field_elements();
+    let mut vk_delta_two_h_x = binding.to_base_prime_field_elements();
     let binding = vk.delta_two_h.y().unwrap();
-    let mut vk_delta_h_y = binding.to_base_prime_field_elements();
+    let mut vk_delta_two_h_y = binding.to_base_prime_field_elements();
 
     let binding = vk.tau_h.x().unwrap();
     let mut vk_tau_h_x = binding.to_base_prime_field_elements();
     let binding = vk.tau_h.y().unwrap();
     let mut vk_tau_h_y = binding.to_base_prime_field_elements();
 
-    hasher.update(&encode_packed(t_g.x().unwrap()));
-    hasher.update(&encode_packed(t_g.y().unwrap()));
+    hasher.update(&encode_packed(t_1.x().unwrap()));
+    hasher.update(&encode_packed(t_1.y().unwrap()));
+    hasher.update(&encode_packed(t_2.x().unwrap()));
+    hasher.update(&encode_packed(t_2.y().unwrap()));
     hasher.update(&encode_packed(E::ScalarField::from(1)));
     for elem in public_input.iter() {
         hasher.update(&encode_packed(*elem));
@@ -93,10 +110,18 @@ where
     hasher.update(&encode_packed(vk_h_x.next().unwrap()));
     hasher.update(&encode_packed(vk_h_y.next().unwrap()));
     hasher.update(&encode_packed(vk_h_y.next().unwrap()));
-    hasher.update(&encode_packed(vk_delta_h_x.next().unwrap()));
-    hasher.update(&encode_packed(vk_delta_h_x.next().unwrap()));
-    hasher.update(&encode_packed(vk_delta_h_y.next().unwrap()));
-    hasher.update(&encode_packed(vk_delta_h_y.next().unwrap()));
+    hasher.update(&encode_packed(vk_gamma_h_x.next().unwrap()));
+    hasher.update(&encode_packed(vk_gamma_h_x.next().unwrap()));
+    hasher.update(&encode_packed(vk_gamma_h_y.next().unwrap()));
+    hasher.update(&encode_packed(vk_gamma_h_y.next().unwrap()));
+    hasher.update(&encode_packed(vk_delta_one_h_x.next().unwrap()));
+    hasher.update(&encode_packed(vk_delta_one_h_x.next().unwrap()));
+    hasher.update(&encode_packed(vk_delta_one_h_y.next().unwrap()));
+    hasher.update(&encode_packed(vk_delta_one_h_y.next().unwrap()));
+    hasher.update(&encode_packed(vk_delta_two_h_x.next().unwrap()));
+    hasher.update(&encode_packed(vk_delta_two_h_x.next().unwrap()));
+    hasher.update(&encode_packed(vk_delta_two_h_y.next().unwrap()));
+    hasher.update(&encode_packed(vk_delta_two_h_y.next().unwrap()));
     hasher.update(&encode_packed(vk_tau_h_x.next().unwrap()));
     hasher.update(&encode_packed(vk_tau_h_x.next().unwrap()));
     hasher.update(&encode_packed(vk_tau_h_y.next().unwrap()));

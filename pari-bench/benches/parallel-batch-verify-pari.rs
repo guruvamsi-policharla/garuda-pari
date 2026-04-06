@@ -56,7 +56,7 @@ where
         a: Some(a_val),
         b: Some(b_val),
     };
-    let (pk, vk) = Pari::<E>::keygen(circuit, &mut rng);
+    let (pk, vk) = Pari::<E>::keygen(circuit, 0, &mut rng);
 
     let per_thread_sizes = [2, 32, 512, 8192, 65536];
     let max_chunk = *per_thread_sizes.iter().max().unwrap();
@@ -72,7 +72,7 @@ where
             a: Some(a),
             b: Some(b),
         };
-        let proof = Pari::prove(circuit, &pk).unwrap();
+        let proof = Pari::prove(circuit, &pk, &mut rng).unwrap();
         base_chunk.push((proof, vec![a * b]));
     }
     println!(

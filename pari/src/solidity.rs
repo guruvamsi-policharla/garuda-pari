@@ -642,10 +642,10 @@ contract PariGasTest is Test {{
     "#,
             v_a = self.proof.clone().unwrap().v_a,
             v_b = self.proof.clone().unwrap().v_b,
-            t_g_x = self.proof.clone().unwrap().t_g.x().unwrap(),
-            t_g_y = self.proof.clone().unwrap().t_g.y().unwrap(),
-            u_g_x = self.proof.clone().unwrap().u_g.x().unwrap(),
-            u_g_y = self.proof.clone().unwrap().u_g.y().unwrap(),
+            t_g_x = self.proof.clone().unwrap().t_1.x().unwrap(),
+            t_g_y = self.proof.clone().unwrap().t_1.y().unwrap(),
+            u_g_x = self.proof.clone().unwrap().u_1.x().unwrap(),
+            u_g_y = self.proof.clone().unwrap().u_1.y().unwrap(),
             input_str = input_str,
             input_size = input_size
         );

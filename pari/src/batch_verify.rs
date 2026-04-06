@@ -10,15 +10,11 @@ use ark_std::{ops::Neg, rand::RngCore};
 use shared_utils::{batch_inversion_and_mul, msm_bigint_wnaf, msm_pippenger};
 
 impl<E: Pairing> Pari<E> {
-    /// Batch verification of N Pari proofs using random linear combination.
+    /// Batch verification of N ZK-Pari proofs using random linear combination.
     ///
-    /// Reduces N independent pairing checks to a single 3-pairing check by
-    /// sampling random challenges rho <-$ F^N and accumulating proof elements:
-    ///   T_tilde = Sum rho_k * T^(k),  U_tilde = Sum rho_k * U^(k),  V_tilde = Sum (rho_k * r^(k)) * U^(k)
-    ///   va_tilde = Sum rho_k * v_a^(k),  vb_tilde = Sum rho_k * v_b^(k),  vq_tilde = Sum rho_k * v_q^(k)
-    ///
-    /// Then checks:
-    ///   e(T_tilde, [delta_2]_2) * e(U_tilde, [tau]_2) * e(va_tilde*[alpha]_1 + vb_tilde*[beta]_1 + vq_tilde*[1]_1 - V_tilde, [1]_2) = 1_T
+    /// Reduces N independent 5-pairing checks to a single 5-pairing check:
+    ///   e(T1_tilde, d1H) + e(T2_tilde, d2H) + e(-U1_tilde, tH)
+    ///     + e(-U2_tilde, gH) + e(V1_tilde - S_tilde, H) = 0
     pub fn batch_verify(
         proofs_and_inputs: &[(Proof<E>, Vec<E::ScalarField>)],
         vk: &VerifyingKey<E>,
@@ -45,15 +41,14 @@ impl<E: Pairing> Pari<E> {
                     crate::utils::compute_chall_from_transcript::<E>(
                         &base_transcript,
                         public_input,
-                        &proof.t_g,
+                        &proof.t_1,
+                        &proof.t_2,
                     )
                 })
                 .collect()
         };
 
-        /////////////////////// Per-proof computations ///////////////////////
-        // Batch-evaluate Lagrange coefficients: precompute shared constants once,
-        // batch-invert vanishing polynomial evaluations across all proofs
+        /////////////////////// Per-proof v_q computation ///////////////////////
         let instance_size = vk.succinct_index.instance_len;
         let r1cs_orig_num_cnstrs = vk.succinct_index.num_constraints - instance_size;
 
@@ -65,7 +60,6 @@ impl<E: Pairing> Pari<E> {
                 instance_size,
             );
 
-        // For each proof k: compute x_A^(k) and v_q^(k)
         let mut v_qs = Vec::with_capacity(n);
 
         for (((proof, public_input), lagrange_coeffs), vanishing_inv) in proofs_and_inputs
@@ -89,7 +83,6 @@ impl<E: Pairing> Pari<E> {
         }
 
         /////////////////////// Random linear combination ///////////////////////
-        // Sample 128-bit rho <-$ [0, 2^128)^N (sufficient for 2^-128 soundness)
         const SMALL_SCALAR_BITS: usize = 128;
         let rhos: Vec<E::ScalarField> = (0..n)
             .map(|_| {
@@ -101,27 +94,37 @@ impl<E: Pairing> Pari<E> {
         let rho_bigints: Vec<<E::ScalarField as PrimeField>::BigInt> =
             rhos.iter().map(|r| r.into_bigint()).collect();
 
-        let t_bases: Vec<E::G1Affine> = proofs_and_inputs.iter().map(|(p, _)| p.t_g).collect();
-        let u_bases: Vec<E::G1Affine> = proofs_and_inputs.iter().map(|(p, _)| p.u_g).collect();
+        let t1_bases: Vec<E::G1Affine> = proofs_and_inputs.iter().map(|(p, _)| p.t_1).collect();
+        let t2_bases: Vec<E::G1Affine> = proofs_and_inputs.iter().map(|(p, _)| p.t_2).collect();
+        let u1_bases: Vec<E::G1Affine> = proofs_and_inputs.iter().map(|(p, _)| p.u_1).collect();
+        let u2_bases: Vec<E::G1Affine> = proofs_and_inputs.iter().map(|(p, _)| p.u_2).collect();
 
-        // T_tilde = Sum_{k=1}^N rho_k * T^(k)  [128-bit MSM]
-        let t_tilde: E::G1Affine =
-            msm_pippenger::<E::G1>(&t_bases, &rho_bigints, SMALL_SCALAR_BITS).into();
+        // T1_tilde = Sum rho_k * T_1^(k)
+        let t1_tilde: E::G1Affine =
+            msm_pippenger::<E::G1>(&t1_bases, &rho_bigints, SMALL_SCALAR_BITS).into();
 
-        // U_tilde = Sum_{k=1}^N rho_k * U^(k)  [128-bit MSM]
-        let u_tilde: E::G1Affine =
-            msm_pippenger::<E::G1>(&u_bases, &rho_bigints, SMALL_SCALAR_BITS).into();
+        // T2_tilde = Sum rho_k * T_2^(k)
+        let t2_tilde: E::G1Affine =
+            msm_pippenger::<E::G1>(&t2_bases, &rho_bigints, SMALL_SCALAR_BITS).into();
 
-        // V_tilde = Sum_{k=1}^N (rho_k * r^(k)) * U^(k)  [full-size MSM]
+        // U1_tilde = Sum rho_k * U_1^(k)
+        let u1_tilde: E::G1Affine =
+            msm_pippenger::<E::G1>(&u1_bases, &rho_bigints, SMALL_SCALAR_BITS).into();
+
+        // U2_tilde = Sum rho_k * U_2^(k)
+        let u2_tilde: E::G1Affine =
+            msm_pippenger::<E::G1>(&u2_bases, &rho_bigints, SMALL_SCALAR_BITS).into();
+
+        // V1_tilde = Sum (rho_k * r^(k)) * U_1^(k)  [full-size MSM]
         let rho_r: Vec<E::ScalarField> = rhos
             .iter()
             .zip(&challenges)
             .map(|(rho, r)| *rho * *r)
             .collect();
-        let v_tilde: E::G1Affine =
-            <E::G1 as VariableBaseMSM>::msm_unchecked(&u_bases, &rho_r).into();
+        let v1_tilde: E::G1Affine =
+            <E::G1 as VariableBaseMSM>::msm_unchecked(&u1_bases, &rho_r).into();
 
-        // va_tilde = Sum_{k=1}^N rho_k * v_a^(k)
+        // Scalar sums
         let v_a_tilde = rhos
             .iter()
             .zip(proofs_and_inputs.iter())
@@ -129,7 +132,6 @@ impl<E: Pairing> Pari<E> {
                 acc + *rho * p.v_a
             });
 
-        // vb_tilde = Sum_{k=1}^N rho_k * v_b^(k)
         let v_b_tilde = rhos
             .iter()
             .zip(proofs_and_inputs.iter())
@@ -137,15 +139,15 @@ impl<E: Pairing> Pari<E> {
                 acc + *rho * p.v_b
             });
 
-        // vq_tilde = Sum_{k=1}^N rho_k * v_q^(k)
         let v_q_tilde = rhos
             .iter()
             .zip(&v_qs)
             .fold(E::ScalarField::zero(), |acc, (rho, vq)| acc + *rho * *vq);
-        /////////////////////// Final multi-pairing check ///////////////////////
 
-        let scalar_msm: E::G1Affine = msm_bigint_wnaf::<E::G1>(
-            &[vk.alpha_g, vk.beta_g, vk.g, -v_tilde],
+        /////////////////////// Final 5-pairing check ///////////////////////
+        // remainder = V1_tilde - va_tilde*alpha_g - vb_tilde*beta_g - vq_tilde*g
+        let s_tilde: E::G1Affine = msm_bigint_wnaf::<E::G1>(
+            &[-vk.alpha_g, -vk.beta_g, -vk.g, v1_tilde],
             &[
                 v_a_tilde.into(),
                 v_b_tilde.into(),
@@ -156,10 +158,12 @@ impl<E: Pairing> Pari<E> {
         .into();
 
         let result = E::multi_pairing(
-            [t_tilde, u_tilde, scalar_msm],
+            [t1_tilde, t2_tilde, -u1_tilde, -u2_tilde, s_tilde],
             [
+                vk.delta_one_h_prep.clone(),
                 vk.delta_two_h_prep.clone(),
                 vk.tau_h_prep.clone(),
+                vk.gamma_h_prep.clone(),
                 vk.h_prep.clone(),
             ],
         );
@@ -168,11 +172,7 @@ impl<E: Pairing> Pari<E> {
         true
     }
 
-    /// Batch variant of `eval_last_lagrange_coeffs`. Precomputes domain
-    /// constants and the geometric sequence once, then batch-inverts the
-    /// vanishing polynomial evaluations across all challenges.
-    ///
-    /// Returns `(lagrange_coeffs_per_proof, z_H_inv_per_proof)`.
+    /// Batch variant of `eval_last_lagrange_coeffs`.
     fn batch_eval_last_lagrange_coeffs<F: FftField>(
         domain: &Radix2EvaluationDomain<F>,
         challenges: &[F],
@@ -186,7 +186,6 @@ impl<E: Pairing> Pari<E> {
         let domain_size = domain.size_as_field_element();
         let start_gen = group_gen.pow([start_ind as u64]);
 
-        // neg_elems[i] = -omega^(start_ind + i), shared across all proofs
         let mut neg_elems = Vec::with_capacity(count);
         let mut neg_cur = -start_gen;
         for _ in 0..count {
@@ -194,7 +193,6 @@ impl<E: Pairing> Pari<E> {
             neg_cur *= &group_gen;
         }
 
-        // Evaluate z_H(tau_k) for all k
         let z_h_vals: Vec<F> = challenges
             .iter()
             .map(|tau| domain.evaluate_vanishing_polynomial(*tau))
@@ -203,10 +201,6 @@ impl<E: Pairing> Pari<E> {
             assert!(!z.is_zero());
         }
 
-        // Lagrange coefficients: L_j(tau) = omega^j * z_H(tau) / (N * (tau - omega^j)).
-        // z_H is in the numerator, so we build the denominators
-        // N * omega^(-j) * (tau - omega^j) and batch-invert them,
-        // folding in start_gen * z_H as the numerator constant.
         let mut all_lagrange_coeffs = Vec::with_capacity(n);
         for (tau, z_h) in challenges.iter().zip(&z_h_vals) {
             let mut l_i = domain_size;
@@ -219,7 +213,6 @@ impl<E: Pairing> Pari<E> {
             all_lagrange_coeffs.push(coeffs);
         }
 
-        // Batch-invert z_H values separately for v_q computation
         let mut z_h_inv = z_h_vals;
         batch_inversion_and_mul(&mut z_h_inv, &F::one());
 

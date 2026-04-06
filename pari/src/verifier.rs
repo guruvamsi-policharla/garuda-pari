@@ -12,6 +12,11 @@ use ark_std::{end_timer, ops::Neg, start_timer};
 use shared_utils::{batch_inversion_and_mul, msm_bigint_wnaf};
 
 impl<E: Pairing> Pari<E> {
+    /// Verify a ZK-Pari proof.
+    ///
+    /// Checks the 5-pairing equation:
+    ///   e(T_1, delta_1*H) * e(T_2, delta_2*H)
+    ///     = e(U_1, (tau-r)*H) * e(U_2, gamma*H) * e(v_a*alpha*G + v_b*beta*G + v_q*G, H)
     pub fn verify(proof: &Proof<E>, vk: &VerifyingKey<E>, public_input: &[E::ScalarField]) -> bool
     where
         <E::G1Affine as AffineRepr>::BaseField: PrimeField,
@@ -20,14 +25,21 @@ impl<E: Pairing> Pari<E> {
         let timer_verify =
             start_timer!(|| format!("Verification (|x|= {})", vk.succinct_index.instance_len));
         debug_assert_eq!(public_input.len(), vk.succinct_index.instance_len - 1);
-        let Proof { t_g, u_g, v_a, v_b } = proof;
+        let Proof {
+            t_1,
+            t_2,
+            u_1,
+            u_2,
+            v_a,
+            v_b,
+        } = proof;
 
         /////////////////////// Challenge Computation ///////////////////////
         let timer_transcript_init = start_timer!(|| "Computing Challenge");
-        let challenge = compute_chall::<E>(vk, public_input, t_g);
+        let challenge = compute_chall::<E>(vk, public_input, t_1, t_2);
         end_timer!(timer_transcript_init);
-        /////////////////////// Computing polynomials x_A ///////////////////////
 
+        /////////////////////// Computing x_A(r) ///////////////////////
         let timer_x_poly = start_timer!(|| "Compute x_a polynomial");
         let instance_size = vk.succinct_index.instance_len;
         let mut px_evaluations = Vec::with_capacity(instance_size);
@@ -44,29 +56,7 @@ impl<E: Pairing> Pari<E> {
                 vk.succinct_index.instance_len,
             );
         end_timer!(lag_coeffs_time);
-        #[cfg(feature = "sol")]
-        {
-            use crate::solidity::Solidifier;
-            let mut solidifier = Solidifier::<E>::new();
-            solidifier.set_vk(&vk);
-            solidifier.set_proof(&proof);
-            solidifier.set_input(public_input);
-            let (_, neg_h_i, nom_i) = Self::eval_last_lagrange_coeffs_traced::<E::ScalarField>(
-                &vk.domain,
-                challenge,
-                r1cs_orig_num_cnstrs,
-                vk.succinct_index.instance_len,
-            );
-            solidifier.coset_size = Some(vk.domain.size());
-            solidifier.coset_offset = Some(vk.domain.coset_offset());
-            solidifier.neg_h_gi = Some(neg_h_i);
-            solidifier.nom_i = Some(nom_i);
-            solidifier.minus_coset_offset_to_coset_size =
-                Some(-(vk.domain.coset_offset().pow([vk.domain.size() as u64])));
-            solidifier.coset_offset_to_coset_size_inverse =
-                Some(E::ScalarField::ONE / vk.domain.evaluate_vanishing_polynomial(challenge));
-            solidifier.solidify();
-        }
+
         let x_a = lagrange_coeffs
             .into_iter()
             .zip(px_evaluations)
@@ -74,33 +64,40 @@ impl<E: Pairing> Pari<E> {
         let z_a = x_a + v_a;
         end_timer!(timer_x_poly);
 
-        /////////////////////// Computing the quotient evaluation///////////////////////
-
+        /////////////////////// Computing the quotient evaluation ///////////////////////
         let timer_q = start_timer!(|| "Computing the quotient evaluation");
-
         let v_q = (z_a * z_a - v_b) * vanishing_poly_at_chall_inv;
         end_timer!(timer_q);
-        /////////////////////// Final Pairing///////////////////////
+
+        /////////////////////// 5-pairing check ///////////////////////
+        // e(T_1, d1H) + e(T_2, d2H) - e(U_1, tH) - e(U_2, gH) + e(r*U_1 - S, H) = 0
+        // where S = v_a*aG + v_b*bG + v_q*G
 
         let timer_scalar_mul = start_timer!(|| "Scalar mul");
-        let right_second_left = msm_bigint_wnaf::<E::G1>(
-            &[vk.alpha_g, vk.beta_g, vk.g, -*u_g],
-            &[(*v_a).into(), (*v_b).into(), v_q.into(), challenge.into()],
+        let remainder: E::G1Affine = msm_bigint_wnaf::<E::G1>(
+            &[-vk.alpha_g, -vk.beta_g, -vk.g, *u_1],
+            &[
+                (*v_a).into(),
+                (*v_b).into(),
+                v_q.into(),
+                challenge.into(),
+            ],
         )
         .into();
-
         end_timer!(timer_scalar_mul);
 
         let timer_pairing = start_timer!(|| "Final Pairing");
-        let right = E::multi_pairing(
-            [*t_g, *u_g, right_second_left],
+        let result = E::multi_pairing(
+            [*t_1, *t_2, -*u_1, -*u_2, remainder],
             [
+                vk.delta_one_h_prep.clone(),
                 vk.delta_two_h_prep.clone(),
                 vk.tau_h_prep.clone(),
+                vk.gamma_h_prep.clone(),
                 vk.h_prep.clone(),
             ],
         );
-        assert!(right.is_zero());
+        assert!(result.is_zero());
         end_timer!(timer_pairing);
         end_timer!(timer_verify);
         true

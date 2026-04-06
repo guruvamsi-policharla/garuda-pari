@@ -1,8 +1,5 @@
 #[cfg(test)]
-// use ark_bls12_381::{Bls12_381, Fr as Bls12_381_Fr};
 use ark_bn254::Bn254;
-// use ark_bls::{Bls12_381, Fr as Bls12_381_Fr};
-// use ark_bn254::{Bn254, Fr as Bn254_Fr};
 use crate::{
     data_structures::{Proof, ProvingKey, VerifyingKey},
     Pari,
@@ -19,17 +16,23 @@ use ark_relations::{
 use ark_std::ops::Neg;
 use ark_std::rand::{RngCore, SeedableRng};
 use ark_std::test_rng;
+
 #[test]
 fn run_test() {
-    let _ = test_circuit::<Bn254>();
+    let _ = test_circuit::<Bn254>(1);
+}
+
+#[test]
+fn run_test_split_zero() {
+    let _ = test_circuit::<Bn254>(0);
 }
 
 #[test]
 fn run_batch_test() {
-    let _ = test_batch_circuit::<Bn254>();
+    let _ = test_batch_circuit::<Bn254>(1);
 }
 
-fn test_circuit<E: Pairing>()
+fn test_circuit<E: Pairing>(witness_split: usize)
 where
     E::G1Affine: Neg<Output = E::G1Affine>,
     E: Pairing,
@@ -45,8 +48,9 @@ where
         a: Some(a_val),
         b: Some(b_val),
     };
-    let (pk, vk): (ProvingKey<E>, VerifyingKey<E>) = Pari::<E>::keygen(circuit.clone(), &mut rng);
-    let proof: Proof<E> = Pari::prove(circuit.clone(), &pk).unwrap();
+    let (pk, vk): (ProvingKey<E>, VerifyingKey<E>) =
+        Pari::<E>::keygen(circuit.clone(), witness_split, &mut rng);
+    let proof: Proof<E> = Pari::prove(circuit.clone(), &pk, &mut rng).unwrap();
     let input_assignment = [a_val * b_val];
     assert!(Pari::<E>::verify(&proof, &vk, &input_assignment));
 }
@@ -57,7 +61,7 @@ struct Circuit1<F: Field> {
     b: Option<F>,
 }
 
-fn test_batch_circuit<E: Pairing>()
+fn test_batch_circuit<E: Pairing>(witness_split: usize)
 where
     E::G1Affine: Neg<Output = E::G1Affine>,
     E: Pairing,
@@ -74,7 +78,8 @@ where
         a: Some(a_val),
         b: Some(b_val),
     };
-    let (pk, vk): (ProvingKey<E>, VerifyingKey<E>) = Pari::<E>::keygen(circuit.clone(), &mut rng);
+    let (pk, vk): (ProvingKey<E>, VerifyingKey<E>) =
+        Pari::<E>::keygen(circuit.clone(), witness_split, &mut rng);
 
     let n = 4;
     let mut proofs_and_inputs = Vec::with_capacity(n);
@@ -85,7 +90,7 @@ where
             a: Some(a),
             b: Some(b),
         };
-        let proof: Proof<E> = Pari::prove(circuit, &pk).unwrap();
+        let proof: Proof<E> = Pari::prove(circuit, &pk, &mut rng).unwrap();
         let input = vec![a * b];
         proofs_and_inputs.push((proof, input));
     }

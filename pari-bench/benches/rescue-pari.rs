@@ -66,7 +66,7 @@ where
         num_invocations,
     };
     let setup_circuit = circuit.clone();
-    let (mut pk, mut vk) = Pari::<E>::keygen(setup_circuit, &mut rng);
+    let (mut pk, mut vk) = Pari::<E>::keygen(setup_circuit, 0, &mut rng);
     for _ in 0..num_keygen_iterations {
         let start = ark_std::time::Instant::now();
         let _cs = Pari::<E>::circuit_to_keygen_cs(circuit.clone()).unwrap();
@@ -74,20 +74,20 @@ where
 
         let setup_circuit = circuit.clone();
         let start = ark_std::time::Instant::now();
-        (pk, vk) = Pari::<E>::keygen(setup_circuit, &mut rng);
+        (pk, vk) = Pari::<E>::keygen(setup_circuit, 0, &mut rng);
         keygen_time += start.elapsed();
     }
     let pk_size = pk.serialized_size(ark_serialize::Compress::Yes);
     let vk_size = vk.serialized_size(ark_serialize::Compress::Yes);
     let prover_circuit = circuit.clone();
-    let mut proof = Pari::<E>::prove(prover_circuit, &pk).unwrap();
+    let mut proof = Pari::<E>::prove(prover_circuit, &pk, &mut rng).unwrap();
     for _ in 0..num_prover_iterations {
         let start = ark_std::time::Instant::now();
         let _cs = Pari::<E>::circuit_to_prover_cs(circuit.clone()).unwrap();
         prover_prep_time += start.elapsed();
         let prover_circuit = circuit.clone();
         let start = ark_std::time::Instant::now();
-        proof = Pari::<E>::prove(prover_circuit, &pk).unwrap();
+        proof = Pari::<E>::prove(prover_circuit, &pk, &mut rng).unwrap();
         prover_time += start.elapsed();
     }
     let proof_size = proof.serialized_size(ark_serialize::Compress::Yes);

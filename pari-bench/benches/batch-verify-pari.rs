@@ -47,7 +47,7 @@ where
         a: Some(a_val),
         b: Some(b_val),
     };
-    let (pk, vk) = Pari::<E>::keygen(circuit, &mut rng);
+    let (pk, vk) = Pari::<E>::keygen(circuit, 0, &mut rng);
 
     let batch_sizes = [2, 32, 512, 8192, 65536];
     let max_n = *batch_sizes.last().unwrap();
@@ -62,7 +62,7 @@ where
             a: Some(a),
             b: Some(b),
         };
-        let proof = Pari::prove(circuit, &pk).unwrap();
+        let proof = Pari::prove(circuit, &pk, &mut rng).unwrap();
         proofs_and_inputs.push((proof, vec![a * b]));
     }
     println!(
