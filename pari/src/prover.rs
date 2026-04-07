@@ -260,11 +260,18 @@ impl<E: Pairing> Pari<E> {
         let timer_inlining = start_timer!(|| "Inlining constraints");
         cs.finalize();
         end_timer!(timer_inlining);
-        let sr1cs_timer = start_timer!(|| "Convert to SR1CS");
-        let sr1cs_cs =
-            Sr1csAdapter::r1cs_to_sr1cs_with_assignment(&mut cs.into_inner().unwrap()).unwrap();
 
-        let mut sr1cs_inner = sr1cs_cs.into_inner().unwrap();
+        let sr1cs_timer = start_timer!(|| "Convert to SR1CS");
+        let native_sr1cs = cs.has_predicate(SR1CS_PREDICATE_LABEL);
+        let mut sr1cs_inner = if native_sr1cs {
+            cs.into_inner().unwrap()
+        } else {
+            let sr1cs_cs =
+                Sr1csAdapter::r1cs_to_sr1cs_with_assignment(&mut cs.into_inner().unwrap())
+                    .unwrap();
+            sr1cs_cs.into_inner().unwrap()
+        };
+
         let _ = sr1cs_inner.perform_instance_outlining(InstanceOutliner {
             pred_label: SR1CS_PREDICATE_LABEL.to_string(),
             func: Rc::new(outline_sr1cs),

@@ -261,16 +261,16 @@ impl<E: Pairing> Pari<E> {
         cs.set_optimization_goal(OptimizationGoal::Constraints);
         circuit.generate_constraints(cs.clone())?;
         cs.finalize();
-        let sr1cs_cs = Sr1csAdapter::r1cs_to_sr1cs(&cs).unwrap();
-        sr1cs_cs.set_instance_outliner(InstanceOutliner {
-            pred_label: SR1CS_PREDICATE_LABEL.to_string(),
-            func: Rc::new(outline_sr1cs),
-        });
-        let timer_synthesize_circuit = start_timer!(|| "Synthesize Circuit");
-        end_timer!(timer_synthesize_circuit);
 
         let timer_inlining = start_timer!(|| "Inlining constraints");
-        let mut sr1cs_inner = sr1cs_cs.into_inner().unwrap();
+        let native_sr1cs = cs.has_predicate(SR1CS_PREDICATE_LABEL);
+        let mut sr1cs_inner = if native_sr1cs {
+            cs.into_inner().unwrap()
+        } else {
+            let sr1cs_cs = Sr1csAdapter::r1cs_to_sr1cs(&cs).unwrap();
+            sr1cs_cs.into_inner().unwrap()
+        };
+
         let _ = sr1cs_inner.perform_instance_outlining(InstanceOutliner {
             pred_label: SR1CS_PREDICATE_LABEL.to_string(),
             func: Rc::new(outline_sr1cs),
