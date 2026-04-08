@@ -1,7 +1,10 @@
 use ark_ec::pairing::Pairing;
+use ark_ec::VariableBaseMSM;
 use ark_ff::Field;
 use ark_poly::Radix2EvaluationDomain;
 use ark_serialize::CanonicalSerialize;
+use ark_std::rand::RngCore;
+use core::ops::Sub;
 
 /// The proving key for ZK-Pari.
 ///
@@ -26,14 +29,10 @@ where
     /// Quotient opening key: [tau^i * G]
     pub sigma_q_opening: Vec<E::G1Affine>,
 
-    /// ZK commitment key: alpha*v_K(tau)/delta_1 * G
-    pub sigma_a_zk_1: E::G1Affine,
-    /// ZK commitment key: beta*v_K(tau)/delta_1 * G
-    pub sigma_b_zk_1: E::G1Affine,
     /// ZK commitment key: alpha*v_K(tau)/delta_2 * G
-    pub sigma_a_zk_2: E::G1Affine,
+    pub sigma_a_zk: E::G1Affine,
     /// ZK commitment key: beta*v_K(tau)/delta_2 * G
-    pub sigma_b_zk_2: E::G1Affine,
+    pub sigma_b_zk: E::G1Affine,
 
     /// Hiding element: (gamma/delta_1)*G
     pub gamma_over_delta_1_g: E::G1Affine,
@@ -128,4 +127,57 @@ pub struct Proof<E: Pairing> {
     pub v_a: E::ScalarField,
     /// Masked evaluation of witness-B polynomial at challenge
     pub v_b: E::ScalarField,
+}
+
+/// Opening for the Pedersen commitment embedded in T1.
+///
+/// In the simplified construction all vanishing-polynomial masking lives in T2,
+/// so T1 = Σ w_i · Σ_1[i] + zeta_1 · (γ/δ_1)·G — a standard 2-generator
+/// Pedersen commitment with a single blinding scalar.
+#[derive(Clone, Debug)]
+pub struct PedersenOpening<F: Field> {
+    pub zeta_1: F,
+}
+
+impl<F: Field> PedersenOpening<F> {
+    pub fn rand<R: RngCore>(rng: &mut R) -> Self {
+        Self {
+            zeta_1: F::rand(rng),
+        }
+    }
+}
+
+impl<F: Field> Sub for &PedersenOpening<F> {
+    type Output = PedersenOpening<F>;
+
+    fn sub(self, rhs: Self) -> PedersenOpening<F> {
+        PedersenOpening {
+            zeta_1: self.zeta_1 - rhs.zeta_1,
+        }
+    }
+}
+
+impl<E: Pairing> ProvingKey<E> {
+    /// Compute the Pedersen commitment for a single value under sigma_1.
+    ///
+    /// Returns the G1 point:
+    ///   value * Sigma1[0] + opening.zeta_1 * (gamma/delta_1)*G
+    ///
+    /// This matches T1 produced by the prover when `witness_split=1` and the
+    /// same opening is supplied via `prove_with_pedersen_opening`.
+    pub fn pedersen_commit(
+        &self,
+        value: E::ScalarField,
+        opening: &PedersenOpening<E::ScalarField>,
+    ) -> E::G1Affine {
+        assert!(
+            !self.sigma_1.is_empty(),
+            "sigma_1 must have at least one element (witness_split >= 1)"
+        );
+        E::G1::msm_unchecked(
+            &[self.sigma_1[0], self.gamma_over_delta_1_g],
+            &[value, opening.zeta_1],
+        )
+        .into()
+    }
 }

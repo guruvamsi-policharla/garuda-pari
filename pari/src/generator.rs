@@ -79,8 +79,6 @@ impl<E: Pairing> Pari<E> {
         let delta_one_inverse = delta_one.inverse().unwrap();
         let delta_two_inverse = delta_two.inverse().unwrap();
 
-        let alpha_over_delta_one = alpha * delta_one_inverse;
-        let beta_over_delta_one = beta * delta_one_inverse;
         let alpha_over_delta_two = alpha * delta_two_inverse;
         let beta_over_delta_two = beta * delta_two_inverse;
         end_timer!(timer_trapdoor_gen);
@@ -163,6 +161,8 @@ impl<E: Pairing> Pari<E> {
 
         // Sigma_1: [(alpha*a_i(tau) + beta*b_i(tau))/delta_1 * G] for witness vars in partition 1
         let timer_sigma_1 = start_timer!(|| "Computing sigma_1");
+        let alpha_over_delta_one = alpha * delta_one_inverse;
+        let beta_over_delta_one = beta * delta_one_inverse;
         let sigma_1_powers = a[num_public_inputs..num_public_inputs + witness_split]
             .par_iter()
             .zip(&b[num_public_inputs..num_public_inputs + witness_split])
@@ -193,10 +193,8 @@ impl<E: Pairing> Pari<E> {
 
         /////////////////////// ZK Commitment Keys ///////////////////////
         let timer_zk_keys = start_timer!(|| "Computing ZK commitment keys");
-        let sigma_a_zk_1: E::G1Affine = (g * (alpha * v_k_at_tau * delta_one_inverse)).into();
-        let sigma_b_zk_1: E::G1Affine = (g * (beta * v_k_at_tau * delta_one_inverse)).into();
-        let sigma_a_zk_2: E::G1Affine = (g * (alpha * v_k_at_tau * delta_two_inverse)).into();
-        let sigma_b_zk_2: E::G1Affine = (g * (beta * v_k_at_tau * delta_two_inverse)).into();
+        let sigma_a_zk: E::G1Affine = (g * (alpha * v_k_at_tau * delta_two_inverse)).into();
+        let sigma_b_zk: E::G1Affine = (g * (beta * v_k_at_tau * delta_two_inverse)).into();
         end_timer!(timer_zk_keys);
 
         /////////////////////// Hiding Elements ///////////////////////
@@ -234,10 +232,8 @@ impl<E: Pairing> Pari<E> {
             sigma_b,
             sigma_q_comm,
             sigma_q_opening,
-            sigma_a_zk_1,
-            sigma_b_zk_1,
-            sigma_a_zk_2,
-            sigma_b_zk_2,
+            sigma_a_zk,
+            sigma_b_zk,
             gamma_over_delta_1_g,
             gamma_over_delta_2_g,
             gamma_g,

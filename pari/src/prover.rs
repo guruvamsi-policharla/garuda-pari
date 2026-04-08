@@ -2,7 +2,7 @@ use std::{ops::Neg, rc::Rc};
 
 use crate::utils::compute_chall;
 use crate::{
-    data_structures::{Proof, ProvingKey},
+    data_structures::{PedersenOpening, Proof, ProvingKey},
     Pari,
 };
 use ark_ec::AffineRepr;
@@ -31,6 +31,42 @@ impl<E: Pairing> Pari<E> {
     pub fn prove<C: ConstraintSynthesizer<E::ScalarField>, R: RngCore>(
         circuit: C,
         pk: &ProvingKey<E>,
+        rng: &mut R,
+    ) -> Result<Proof<E>, SynthesisError>
+    where
+        E::G1Affine: Neg<Output = E::G1Affine>,
+        E: Pairing,
+        E::ScalarField: Field,
+        E::ScalarField: std::convert::From<i32>,
+        E::BaseField: PrimeField,
+        <<E as Pairing>::G1Affine as AffineRepr>::BaseField: PrimeField,
+    {
+        Self::prove_inner(circuit, pk, None, rng)
+    }
+
+    /// Prove with a caller-supplied Pedersen opening so that the resulting
+    /// `proof.t_1` equals the commitment produced by `pk.pedersen_commit(value, opening)`.
+    pub fn prove_with_pedersen_opening<C: ConstraintSynthesizer<E::ScalarField>, R: RngCore>(
+        circuit: C,
+        pk: &ProvingKey<E>,
+        opening: &PedersenOpening<E::ScalarField>,
+        rng: &mut R,
+    ) -> Result<Proof<E>, SynthesisError>
+    where
+        E::G1Affine: Neg<Output = E::G1Affine>,
+        E: Pairing,
+        E::ScalarField: Field,
+        E::ScalarField: std::convert::From<i32>,
+        E::BaseField: PrimeField,
+        <<E as Pairing>::G1Affine as AffineRepr>::BaseField: PrimeField,
+    {
+        Self::prove_inner(circuit, pk, Some(opening.clone()), rng)
+    }
+
+    fn prove_inner<C: ConstraintSynthesizer<E::ScalarField>, R: RngCore>(
+        circuit: C,
+        pk: &ProvingKey<E>,
+        pedersen_opening: Option<PedersenOpening<E::ScalarField>>,
         rng: &mut R,
     ) -> Result<Proof<E>, SynthesisError>
     where
@@ -71,15 +107,14 @@ impl<E: Pairing> Pari<E> {
 
         /////////////////////// Sample blinding randomness ///////////////////////
         let timer_sample_blinding = start_timer!(|| "Sampling blinding randomness");
-        let eta_a_1 = E::ScalarField::rand(rng);
-        let eta_a_2 = E::ScalarField::rand(rng);
-        let eta_b_1 = E::ScalarField::rand(rng);
-        let eta_b_2 = E::ScalarField::rand(rng);
-        let zeta_1 = E::ScalarField::rand(rng);
+        let eta_a = E::ScalarField::rand(rng);
+        let eta_b = E::ScalarField::rand(rng);
+        let zeta_1 = match pedersen_opening {
+            Some(ref o) => o.zeta_1,
+            None => E::ScalarField::rand(rng),
+        };
         let zeta_2 = E::ScalarField::rand(rng);
         let s = E::ScalarField::rand(rng);
-        let eta_a = eta_a_1 + eta_a_2;
-        let eta_b = eta_b_1 + eta_b_2;
         end_timer!(timer_sample_blinding);
 
         /////////////////////// Computing polynomials z_A, z_B, w_A, w_B ///////////////////////
@@ -134,27 +169,16 @@ impl<E: Pairing> Pari<E> {
         let w_part2 = &witness_assignment[witness_split..];
 
         let timer_t1 = start_timer!(|| "Computing T_1");
-        let t_1_witness = <E::G1 as VariableBaseMSM>::msm_unchecked(&pk.sigma_1, w_part1);
-        let t_1_zk = E::G1::msm_unchecked(
-            &[
-                pk.sigma_a_zk_1,
-                pk.sigma_b_zk_1,
-                pk.gamma_over_delta_1_g,
-            ],
-            &[eta_a_1, eta_b_1, zeta_1],
-        );
-        let t_1: E::G1Affine = (t_1_witness + t_1_zk).into();
+        let t_1_base = <E::G1 as VariableBaseMSM>::msm_unchecked(&pk.sigma_1, w_part1);
+        let t_1: E::G1Affine =
+            (t_1_base + E::G1::from(pk.gamma_over_delta_1_g) * zeta_1).into();
         end_timer!(timer_t1);
 
         let timer_t2 = start_timer!(|| "Computing T_2");
         let t_2_witness = <E::G1 as VariableBaseMSM>::msm_unchecked(&pk.sigma_2, w_part2);
         let t_2_zk = E::G1::msm_unchecked(
-            &[
-                pk.sigma_a_zk_2,
-                pk.sigma_b_zk_2,
-                pk.gamma_over_delta_2_g,
-            ],
-            &[eta_a_2, eta_b_2, zeta_2],
+            &[pk.sigma_a_zk, pk.sigma_b_zk, pk.gamma_over_delta_2_g],
+            &[eta_a, eta_b, zeta_2],
         );
         let t_q = <E::G1 as VariableBaseMSM>::msm_unchecked(&pk.sigma_q_comm, &q_tilde.coeffs);
         let t_2: E::G1Affine = (t_2_witness + t_2_zk + t_q).into();
