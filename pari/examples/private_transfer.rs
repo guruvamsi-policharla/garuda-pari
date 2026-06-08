@@ -7,7 +7,7 @@
 //!
 //! Run with: cargo run --example private_transfer -p pari
 
-use ark_bn254::Bn254;
+use ark_bls12_381::Bls12_381;
 use ark_ec::pairing::Pairing;
 use ark_ec::{AffineRepr, CurveGroup};
 use ark_ff::Field;
@@ -98,7 +98,7 @@ struct Account<E: Pairing> {
 // ---------------------------------------------------------------------------
 
 fn main() {
-    type E = Bn254;
+    type E = Bls12_381;
     type Fr = <E as Pairing>::ScalarField;
 
     let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(2026_04_06);
@@ -256,11 +256,71 @@ fn main() {
     println!("   Alice: {} tokens  (com changed: {})", alice.balance, old_alice_com != alice.commitment);
     println!("   Bob  : {} tokens  (com changed: {})\n", bob.balance, old_bob_com != bob.commitment);
 
-    // ── 6. Summary ───────────────────────────────────────────────────────
+    let alice_pre_transfer_com = old_alice_com;
+
+    // ── 6. Batch Verification of Full Transfers at Scale ───────────────
+    //
+    // Each transfer requires:
+    //   a) Two range proof verifications (delta + remaining)
+    //   b) T1 consistency: proof_delta.t_1 == com_delta, proof_remaining.t_1 == com_remaining
+    //   c) Balance conservation: proof_delta.t_1 + proof_remaining.t_1 == sender_commitment
+    println!("6. Batch Verification of Full Transfers at Scale");
+    println!("   (each transfer = 2 range proofs + commitment checks)\n");
+
+    for num_transfers in [512, 4096, 8192, 16384, 32768] {
+        let transfers: Vec<_> = (0..num_transfers)
+            .map(|_| {
+                (
+                    alice_pre_transfer_com,
+                    proof_delta.clone(),
+                    proof_remaining.clone(),
+                )
+            })
+            .collect();
+
+        // --- Individual: verify each transfer one by one ---
+        let indiv_start = Instant::now();
+        for (sender_com, p_delta, p_rem) in &transfers {
+            assert!(Pari::<E>::verify(p_delta, &vk, &[]));
+            assert!(Pari::<E>::verify(p_rem, &vk, &[]));
+            let sum = (p_delta.t_1.into_group() + p_rem.t_1.into_group()).into_affine();
+            assert_eq!(sum, *sender_com);
+        }
+        let indiv_ms = indiv_start.elapsed().as_secs_f64() * 1000.0;
+
+        // --- Batch: batch-verify all range proofs, then check commitments ---
+        let batch_start = Instant::now();
+
+        let proofs_and_inputs: Vec<_> = transfers
+            .iter()
+            .flat_map(|(_, p_delta, p_rem)| {
+                vec![(p_delta.clone(), vec![]), (p_rem.clone(), vec![])]
+            })
+            .collect();
+        assert!(Pari::<E>::batch_verify(&proofs_and_inputs, &vk, &mut rng));
+
+        for (sender_com, p_delta, p_rem) in &transfers {
+            let sum = (p_delta.t_1.into_group() + p_rem.t_1.into_group()).into_affine();
+            assert_eq!(sum, *sender_com);
+        }
+
+        let batch_ms = batch_start.elapsed().as_secs_f64() * 1000.0;
+
+        println!(
+            "   {num_transfers:>5} transfers │ indiv {indiv_ms:>9.1} ms ({:.3} ms/tx) │ batch {batch_ms:>9.1} ms ({:.3} ms/tx) │ {:.1}x",
+            indiv_ms / num_transfers as f64,
+            batch_ms / num_transfers as f64,
+            indiv_ms / batch_ms,
+        );
+    }
+    println!();
+
+    // ── 7. Summary ───────────────────────────────────────────────────────
     println!("╔══════════════════════════════════════════════════════════════╗");
     println!("║  Transfer complete. Validators verified:                     ║");
     println!("║    - Both amounts are non-negative (range proofs)            ║");
     println!("║    - Amounts are consistent with the sender's balance        ║");
     println!("║    - No amounts were revealed at any point                   ║");
+    println!("║    - Batch verification gives significant speedup            ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
 }
