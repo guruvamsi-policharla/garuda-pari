@@ -1,5 +1,0 @@
-/target
-*.csv
-*.bin
-Cargo.lock
-/out
