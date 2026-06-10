@@ -66,12 +66,12 @@ impl<F: PrimeField> IOPTranscript<F> {
     }
 
     // Append the message to the transcript.
-    pub fn append_serializable_element<S: CanonicalSerialize>(
+    pub fn append_serializable_element<S: CanonicalSerialize + ?Sized>(
         &mut self,
         label: &'static [u8],
-        group_elem: S,
+        group_elem: &S,
     ) -> Result<(), TranscriptError> {
-        self.append_message(label, &to_bytes!(&group_elem)?)
+        self.append_message(label, &to_bytes!(group_elem)?)
     }
 
     // Generate the challenge from the current transcript
