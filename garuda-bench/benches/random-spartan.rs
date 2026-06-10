@@ -127,8 +127,8 @@ where
     }
 }
 
-const MIN_LOG2_CONSTRAINTS: usize = 15;
-const MAX_LOG2_CONSTRAINTS: usize = 25;
+const MIN_LOG2_CONSTRAINTS: usize = 10;
+const MAX_LOG2_CONSTRAINTS: usize = 15;
 const NUM_KEYGEN_ITERATIONS: u32 = 1;
 const NUM_PROVER_ITERATIONS: u32 = 1;
 const NUM_VERIFIER_ITERATIONS: u32 = 1;
