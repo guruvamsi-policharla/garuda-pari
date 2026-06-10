@@ -51,6 +51,11 @@ name = "parallel-batch-verify-pari"
 path = "benches/parallel-batch-verify-pari.rs"
 harness = false
 
+[[bench]]
+name = "prove-verify-compare"
+path = "benches/prove-verify-compare.rs"
+harness = false
+
 [features]
 default = ["std", "parallel"]
 std = ["ark-ff/std", "ark-poly/std", "ark-relations/std", "ark-std/std", "ark-serialize/std"]
@@ -62,3 +67,14 @@ parallel = [
     "ark-poly/parallel",
     "ark-std/parallel",
 ]
+################################ Patches #######################################
+
+# The algebra crates are patched to a pinned post-0.5 revision of the arkworks
+# master: its MSM is ~17% faster than the published 0.5.0
+[patch.crates-io]
+ark-ff = { git = "https://github.com/arkworks-rs/algebra.git", rev = "8de9a9d9ba52566b1ba5637fbd1b3ce98dad17e8" }
+ark-ec = { git = "https://github.com/arkworks-rs/algebra.git", rev = "8de9a9d9ba52566b1ba5637fbd1b3ce98dad17e8" }
+ark-poly = { git = "https://github.com/arkworks-rs/algebra.git", rev = "8de9a9d9ba52566b1ba5637fbd1b3ce98dad17e8" }
+ark-serialize = { git = "https://github.com/arkworks-rs/algebra.git", rev = "8de9a9d9ba52566b1ba5637fbd1b3ce98dad17e8" }
+ark-bls12-381 = { git = "https://github.com/arkworks-rs/algebra.git", rev = "8de9a9d9ba52566b1ba5637fbd1b3ce98dad17e8" }
+ark-bn254 = { git = "https://github.com/arkworks-rs/algebra.git", rev = "8de9a9d9ba52566b1ba5637fbd1b3ce98dad17e8" }

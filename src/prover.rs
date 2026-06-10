@@ -258,23 +258,22 @@ impl<E: Pairing> ZkPari<E> {
                 is_committed[w] = true;
             }
         }
-        let mut t_scalars: Vec<E::ScalarField> = witness_assignment
+        let ordinary_witnesses: Vec<E::ScalarField> = witness_assignment
             .iter()
             .zip(&is_committed)
             .filter(|(_, committed)| !**committed)
             .map(|(value, _)| *value)
             .collect();
-        debug_assert_eq!(t_scalars.len(), pk.sigma_w.len());
-        let mut t_bases: Vec<E::G1Affine> =
-            Vec::with_capacity(pk.sigma_w.len() + 2 + q_tilde.coeffs.len());
-        t_bases.extend_from_slice(&pk.sigma_w);
-        t_bases.push(pk.sigma_mask_const);
-        t_bases.push(pk.sigma_mask_linear);
-        t_bases.extend_from_slice(&pk.sigma_q_comm[..q_tilde.coeffs.len()]);
-        t_scalars.push(eta_1);
-        t_scalars.push(eta_2);
-        t_scalars.extend_from_slice(&q_tilde.coeffs);
-        let t: E::G1Affine = E::G1::msm_unchecked(&t_bases, &t_scalars).into();
+        debug_assert_eq!(ordinary_witnesses.len(), pk.sigma_w.len());
+        // Separate MSMs over the SRS slices (avoids copying the bases)
+        let t_w = E::G1::msm_unchecked(&pk.sigma_w, &ordinary_witnesses);
+        let t_mask = E::G1::msm_unchecked(
+            &[pk.sigma_mask_const, pk.sigma_mask_linear],
+            &[eta_1, eta_2],
+        );
+        let t_q =
+            E::G1::msm_unchecked(&pk.sigma_q_comm[..q_tilde.coeffs.len()], &q_tilde.coeffs);
+        let t: E::G1Affine = (t_w + t_mask + t_q).into();
         end_timer!(timer_batch_commit);
 
         /////////////////////// Computing the challenge ///////////////////////
@@ -335,17 +334,16 @@ impl<E: Pairing> ZkPari<E> {
         let witness_r = (&r_poly - &v_r_poly) / &chall_vanishing_poly;
         end_timer!(timer_open_poly);
 
-        // U = sum_i W_A[i] Sigma_A[i] + sum_i W_R[i] Sigma_R[i], as one MSM
+        // U = sum_i W_A[i] Sigma_A[i] + sum_i W_R[i] Sigma_R[i]
+        // Two MSMs directly over the SRS slices: merging them into one call
+        // costs a ~150MB base-vector copy at large sizes, which outweighs the
+        // bucket amortization.
         let timer_msms = start_timer!(|| "Computing the opening MSMs");
         debug_assert!(witness_a.coeffs.len() <= pk.sigma_a.len());
         debug_assert!(witness_r.coeffs.len() <= pk.sigma_r.len());
-        let mut u_bases: Vec<E::G1Affine> =
-            Vec::with_capacity(witness_a.coeffs.len() + witness_r.coeffs.len());
-        u_bases.extend_from_slice(&pk.sigma_a[..witness_a.coeffs.len()]);
-        u_bases.extend_from_slice(&pk.sigma_r[..witness_r.coeffs.len()]);
-        let mut u_scalars = witness_a.coeffs;
-        u_scalars.extend_from_slice(&witness_r.coeffs);
-        let u: E::G1Affine = E::G1::msm_unchecked(&u_bases, &u_scalars).into();
+        let w_a_proof = E::G1::msm_unchecked(&pk.sigma_a[..witness_a.coeffs.len()], &witness_a.coeffs);
+        let w_r_proof = E::G1::msm_unchecked(&pk.sigma_r[..witness_r.coeffs.len()], &witness_r.coeffs);
+        let u: E::G1Affine = (w_a_proof + w_r_proof).into();
         end_timer!(timer_msms);
         end_timer!(timer_opening);
 
