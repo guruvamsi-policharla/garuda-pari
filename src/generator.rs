@@ -288,10 +288,12 @@ impl<E: Pairing> ZkPari<E> {
             });
             sr1cs_cs.into_inner().unwrap()
         };
-        let _ = sr1cs_inner.perform_instance_outlining(InstanceOutliner {
-            pred_label: SR1CS_PREDICATE_LABEL.to_string(),
-            func: Rc::new(outline_sr1cs),
-        });
+        sr1cs_inner
+            .perform_instance_outlining(InstanceOutliner {
+                pred_label: SR1CS_PREDICATE_LABEL.to_string(),
+                func: Rc::new(outline_sr1cs),
+            })
+            .expect("instance outlining failed");
         end_timer!(timer_inlining);
         end_timer!(timer_cs_startup);
         Ok((sr1cs_inner, block_indices))

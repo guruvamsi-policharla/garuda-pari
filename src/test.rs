@@ -398,6 +398,42 @@ fn committed_input_pedersen_consistency() {
     assert!(ZkPari::<E>::verify(&proof2, &vk2, &[a_val * b_val]));
 }
 
+/// A serialized proof must deserialize and verify; verification must reject
+/// (not panic on) malformed statements.
+#[test]
+fn proof_serialization_roundtrip_and_malformed_inputs() {
+    use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+
+    let mut rng = rng();
+    let a_val = Fr::rand(&mut rng);
+    let b_val = Fr::rand(&mut rng);
+    let circuit = MulCircuit {
+        a: Some(a_val),
+        b: Some(b_val),
+        spec: CommitSpec::A,
+    };
+    let (pk, vk) = ZkPari::<E>::keygen(circuit.clone(), &mut rng);
+    let proof = ZkPari::<E>::prove(circuit, &pk, &mut rng).unwrap();
+
+    // Round-trip through the wire format (with validation)
+    let mut bytes = Vec::new();
+    proof.serialize_compressed(&mut bytes).unwrap();
+    let parsed = Proof::<E>::deserialize_compressed(&bytes[..]).unwrap();
+    assert_eq!(parsed, proof);
+    assert!(ZkPari::<E>::verify(&parsed, &vk, &[a_val * b_val]));
+
+    // Wrong public-input length: rejected, not panicked on
+    assert!(!ZkPari::<E>::verify(&proof, &vk, &[]));
+    assert!(!ZkPari::<E>::verify(&proof, &vk, &[a_val * b_val, a_val]));
+    let batch = vec![(proof.clone(), vec![])];
+    assert!(!ZkPari::<E>::batch_verify(&batch, &vk, &mut rng));
+
+    // Wrong number of block commitments: rejected
+    let mut truncated = proof.clone();
+    truncated.c_ci.clear();
+    assert!(!ZkPari::<E>::verify(&truncated, &vk, &[a_val * b_val]));
+}
+
 /// Proofs must be randomized: two proofs of the same statement with the same
 /// key must differ in every randomized component.
 #[test]

@@ -30,8 +30,11 @@ impl<E: Pairing> ZkPari<E> {
     {
         let timer_verify =
             start_timer!(|| format!("Verification (|x|= {})", vk.succinct_index.instance_len));
-        debug_assert_eq!(public_input.len(), vk.succinct_index.instance_len - 1);
         let Proof { c_ci, t_g, u_g, v_a } = proof;
+        // Malformed statements and proofs are rejected, not panicked on
+        if public_input.len() != vk.succinct_index.instance_len - 1 {
+            return false;
+        }
         // One commitment per committed-input block
         if c_ci.len() != vk.delta_h_prep.len() {
             return false;
@@ -49,15 +52,14 @@ impl<E: Pairing> ZkPari<E> {
         let r1cs_orig_num_cnstrs = vk.succinct_index.num_constraints - instance_size;
 
         px_evaluations.push(E::ScalarField::ONE);
-        px_evaluations.extend_from_slice(&public_input[..(instance_size - 1)]);
+        px_evaluations.extend_from_slice(public_input);
         let lag_coeffs_time = start_timer!(|| "Computing last lagrange coefficients");
-        let (lagrange_coeffs, _vanishing_poly_at_chall_inv) =
-            Self::eval_last_lagrange_coeffs::<E::ScalarField>(
-                &vk.domain,
-                challenge,
-                r1cs_orig_num_cnstrs,
-                vk.succinct_index.instance_len,
-            );
+        let lagrange_coeffs = Self::eval_last_lagrange_coeffs::<E::ScalarField>(
+            &vk.domain,
+            challenge,
+            r1cs_orig_num_cnstrs,
+            vk.succinct_index.instance_len,
+        );
         end_timer!(lag_coeffs_time);
         let x_a = lagrange_coeffs
             .into_iter()
@@ -101,7 +103,7 @@ impl<E: Pairing> ZkPari<E> {
         tau: F,
         start_ind: usize,
         count: usize,
-    ) -> (Vec<F>, F) {
+    ) -> Vec<F> {
         let z_h_at_tau: F = domain.evaluate_vanishing_polynomial(tau);
         let group_gen: F = domain.group_gen();
 
@@ -121,6 +123,6 @@ impl<E: Pairing> ZkPari<E> {
             negative_cur_elem *= &group_gen;
         }
         batch_inversion_and_mul(lagrange_coefficients_inverse.as_mut_slice(), &start_gen);
-        (lagrange_coefficients_inverse, z_h_at_tau_inv)
+        lagrange_coefficients_inverse
     }
 }

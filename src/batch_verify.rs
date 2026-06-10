@@ -41,10 +41,12 @@ impl<E: Pairing> ZkPari<E> {
         if n == 1 {
             return Self::verify(&proofs_and_inputs[0].0, vk, &proofs_and_inputs[0].1);
         }
+        // Malformed statements and proofs are rejected, not panicked on
         let num_blocks = vk.delta_h_prep.len();
+        let instance_len = vk.succinct_index.instance_len;
         if proofs_and_inputs
             .iter()
-            .any(|(p, _)| p.c_ci.len() != num_blocks)
+            .any(|(p, x)| p.c_ci.len() != num_blocks || x.len() != instance_len - 1)
         {
             return false;
         }
@@ -69,27 +71,21 @@ impl<E: Pairing> ZkPari<E> {
         let instance_size = vk.succinct_index.instance_len;
         let r1cs_orig_num_cnstrs = vk.succinct_index.num_constraints - instance_size;
 
-        let (all_lagrange_coeffs, _z_h_inv) =
-            Self::batch_eval_last_lagrange_coeffs::<E::ScalarField>(
-                &vk.domain,
-                &challenges,
-                r1cs_orig_num_cnstrs,
-                instance_size,
-            );
+        let all_lagrange_coeffs = Self::batch_eval_last_lagrange_coeffs::<E::ScalarField>(
+            &vk.domain,
+            &challenges,
+            r1cs_orig_num_cnstrs,
+            instance_size,
+        );
 
         // For each proof k: compute x_A^(k)(r) and v_R^(k) = (x_A + v_a)^2
         let mut v_rs = Vec::with_capacity(n);
         for ((proof, public_input), lagrange_coeffs) in
             proofs_and_inputs.iter().zip(all_lagrange_coeffs)
         {
-            debug_assert_eq!(public_input.len(), instance_size - 1);
-
             let x_a = lagrange_coeffs
                 .into_iter()
-                .zip(
-                    core::iter::once(E::ScalarField::ONE)
-                        .chain(public_input[..(instance_size - 1)].iter().copied()),
-                )
+                .zip(core::iter::once(E::ScalarField::ONE).chain(public_input.iter().copied()))
                 .fold(E::ScalarField::zero(), |acc, (l, x)| acc + l * x);
             v_rs.push((x_a + proof.v_a).square());
         }
@@ -172,15 +168,15 @@ impl<E: Pairing> ZkPari<E> {
 
     /// Batch variant of `eval_last_lagrange_coeffs`. Precomputes domain
     /// constants and the geometric sequence once, then batch-inverts the
-    /// vanishing polynomial evaluations across all challenges.
+    /// denominators across all challenges.
     ///
-    /// Returns `(lagrange_coeffs_per_proof, z_H_inv_per_proof)`.
+    /// Returns the Lagrange coefficients per proof.
     pub(crate) fn batch_eval_last_lagrange_coeffs<F: FftField>(
         domain: &Radix2EvaluationDomain<F>,
         challenges: &[F],
         start_ind: usize,
         count: usize,
-    ) -> (Vec<Vec<F>>, Vec<F>) {
+    ) -> Vec<Vec<F>> {
         let n = challenges.len();
 
         let group_gen = domain.group_gen();
@@ -221,10 +217,6 @@ impl<E: Pairing> ZkPari<E> {
             all_lagrange_coeffs.push(coeffs);
         }
 
-        // Batch-invert z_H values separately
-        let mut z_h_inv = z_h_vals;
-        batch_inversion_and_mul(&mut z_h_inv, &F::one());
-
-        (all_lagrange_coeffs, z_h_inv)
+        all_lagrange_coeffs
     }
 }

@@ -5,7 +5,7 @@ use crate::data_structures::{CommittedInputOpening, Proof, ProvingKey};
 use crate::utils::compute_chall;
 use crate::ZkPari;
 use ark_ec::{pairing::Pairing, VariableBaseMSM};
-use ark_ff::{Field, Zero};
+use ark_ff::{AdditiveGroup, Field, Zero};
 use ark_poly::{
     univariate::DensePolynomial, DenseUVPolynomial, EvaluationDomain, Evaluations,
     GeneralEvaluationDomain, Polynomial,
@@ -123,9 +123,11 @@ impl<E: Pairing> ZkPari<E> {
             .fold(E::ScalarField::zero(), |acc, o| acc + o.rho);
         end_timer!(timer_masks);
 
-        /////////////////////// Computing polynomials z_A, z_B, w_A, w_B ///////////////////////
-        let timer_compute_za_zb_wa_wb = start_timer!(|| "Computing vectors z_A, z_B, w_A, w_B");
-        let ((z_a, z_b), (w_a, w_b)) = Self::compute_wa_wb_za_zb(
+        /////////////////////// Computing polynomials z_A, z_B, w_A ///////////////////////
+        // After instance outlining, w_B == z_B (the B matrix has no instance
+        // columns), so only three vectors are needed.
+        let timer_compute_za_zb_wa = start_timer!(|| "Computing vectors z_A, z_B, w_A");
+        let (z_a, z_b, w_a) = Self::compute_za_zb_wa(
             domain,
             &matrices[0],
             &matrices[1],
@@ -134,22 +136,89 @@ impl<E: Pairing> ZkPari<E> {
             num_constraints,
         )
         .unwrap();
-        end_timer!(timer_compute_za_zb_wa_wb);
+        end_timer!(timer_compute_za_zb_wa);
 
         //////////////////////// Interpolating polynomials ///////////////////////
-        let timer_interp = start_timer!(|| "Interpolating z_a, z_b, w_a, w_b polynomials");
+        let timer_interp = start_timer!(|| "Interpolating z_a, z_b, w_a polynomials");
         let z_a_hat = Evaluations::from_vec_and_domain(z_a, domain).interpolate();
         let z_b_hat = Evaluations::from_vec_and_domain(z_b, domain).interpolate();
         let w_a_hat = Evaluations::from_vec_and_domain(w_a, domain).interpolate();
-        let w_b_hat = Evaluations::from_vec_and_domain(w_b, domain).interpolate();
         end_timer!(timer_interp);
 
+        // x_A(r) is needed for the debug consistency check below; the masks on
+        // z_A and w_A are identical, so the unmasked difference already equals
+        // x_A.
+        #[cfg(debug_assertions)]
+        let (z_a_hat_check, z_b_hat_check) = (z_a_hat.clone(), z_b_hat.clone());
+
+        /////////////////////// Computing the quotient polynomial ///////////////////////
+        // The masked quotient is computed by expansion, never squaring the
+        // masked (degree m+1) polynomial. With z := z_A^orig, b := z_B^orig,
+        // h := eta_1 + eta_2 X and v := v_K = X^m - 1:
+        //
+        //   (z + h v)^2 - (b + rho v) = (z^2 - b) + v (2 h z + h^2 v - rho)
+        //
+        // so q~ = q_orig + 2 h z + h^2 v - rho with q_orig = (z^2 - b)/v_K.
+        // This keeps every FFT at size <= 2m (squaring degree m+1 would round
+        // the multiplication domain up to 4m).
+        let timer_quotient = start_timer!(|| "Computing the quotient polynomial");
+        let (q_orig, _remainder) =
+            (&z_a_hat * &z_a_hat - &z_b_hat).divide_by_vanishing_poly(domain);
+        #[cfg(debug_assertions)]
+        assert!(_remainder.is_zero(), "constraint system is not satisfied");
+
+        let mut q_coeffs = q_orig.coeffs;
+        q_coeffs.resize(domain_size + 3, E::ScalarField::zero());
+        // + 2 h z
+        let two_eta_1 = eta_1.double();
+        let two_eta_2 = eta_2.double();
+        for (i, z_i) in z_a_hat.coeffs.iter().enumerate() {
+            q_coeffs[i] += two_eta_1 * z_i;
+            q_coeffs[i + 1] += two_eta_2 * z_i;
+        }
+        // + h^2 v_K = (eta_1^2 + 2 eta_1 eta_2 X + eta_2^2 X^2)(X^m - 1), - rho
+        let eta_1_sq = eta_1.square();
+        let eta_cross = (eta_1 * eta_2).double();
+        let eta_2_sq = eta_2.square();
+        q_coeffs[0] -= eta_1_sq + rho_ci;
+        q_coeffs[1] -= eta_cross;
+        q_coeffs[2] -= eta_2_sq;
+        q_coeffs[domain_size] += eta_1_sq;
+        q_coeffs[domain_size + 1] += eta_cross;
+        q_coeffs[domain_size + 2] += eta_2_sq;
+        let q_tilde = DensePolynomial::from_coefficients_vec(q_coeffs);
+
+        // Cross-check the expansion against the definitional computation
+        #[cfg(debug_assertions)]
+        {
+            let mask_poly = |poly: &DensePolynomial<E::ScalarField>,
+                             c0: E::ScalarField,
+                             c1: E::ScalarField| {
+                let mut coeffs = poly.coeffs.clone();
+                coeffs.resize(coeffs.len().max(domain_size + 2), E::ScalarField::zero());
+                coeffs[0] -= c0;
+                coeffs[1] -= c1;
+                coeffs[domain_size] += c0;
+                coeffs[domain_size + 1] += c1;
+                DensePolynomial::from_coefficients_vec(coeffs)
+            };
+            let z_a_masked = mask_poly(&z_a_hat_check, eta_1, eta_2);
+            let z_b_masked = mask_poly(&z_b_hat_check, rho_ci, E::ScalarField::zero());
+            let (q_check, rem) =
+                (&z_a_masked * &z_a_masked - &z_b_masked).divide_by_vanishing_poly(domain);
+            assert!(rem.is_zero());
+            assert_eq!(q_tilde, q_check, "expanded quotient mismatch");
+        }
+        end_timer!(timer_quotient);
+
         /////////////////////// Applying the vanishing-polynomial masks ///////////////////////
-        // z_A(X) = z_A^orig(X) + (eta_1 + eta_2 X) v_K(X), with v_K(X) = X^m - 1
-        // z_B(X) = z_B^orig(X) + rho_ci v_K(X)
+        // w_A(X) += (eta_1 + eta_2 X) v_K(X); the B-side mask is folded into
+        // R(X) below.
         let timer_masking = start_timer!(|| "Masking the polynomials");
-        let apply_a_mask = |poly: &DensePolynomial<E::ScalarField>| {
-            let mut coeffs = poly.coeffs.clone();
+        #[cfg(debug_assertions)]
+        let x_a_poly_check = &z_a_hat - &w_a_hat;
+        let w_a_masked = {
+            let mut coeffs = w_a_hat.coeffs;
             coeffs.resize(coeffs.len().max(domain_size + 2), E::ScalarField::zero());
             coeffs[0] -= eta_1;
             coeffs[1] -= eta_2;
@@ -157,27 +226,7 @@ impl<E: Pairing> ZkPari<E> {
             coeffs[domain_size + 1] += eta_2;
             DensePolynomial::from_coefficients_vec(coeffs)
         };
-        let apply_b_mask = |poly: &DensePolynomial<E::ScalarField>| {
-            let mut coeffs = poly.coeffs.clone();
-            coeffs.resize(coeffs.len().max(domain_size + 1), E::ScalarField::zero());
-            coeffs[0] -= rho_ci;
-            coeffs[domain_size] += rho_ci;
-            DensePolynomial::from_coefficients_vec(coeffs)
-        };
-        let z_a_masked = apply_a_mask(&z_a_hat);
-        let z_b_masked = apply_b_mask(&z_b_hat);
-        let w_a_masked = apply_a_mask(&w_a_hat);
-        let w_b_masked = apply_b_mask(&w_b_hat);
         end_timer!(timer_masking);
-
-        /////////////////////// Computing the quotient polynomial ///////////////////////
-        // q~(X) = (z_A(X)^2 - z_B(X)) / v_K(X), of degree <= m+2
-        let timer_quotient = start_timer!(|| "Computing the quotient polynomial");
-        let (q_tilde, _remainder) =
-            (&z_a_masked * &z_a_masked - &z_b_masked).divide_by_vanishing_poly(domain);
-        #[cfg(debug_assertions)]
-        assert!(_remainder.is_zero());
-        end_timer!(timer_quotient);
 
         /////////////////////// Computing the commitments (C_ci_j, T) ///////////////////////
         let timer_batch_commit = start_timer!(|| "Batch commitment");
@@ -201,27 +250,31 @@ impl<E: Pairing> ZkPari<E> {
         // T = sum_j w_j Sigma_W[j] + eta_1 Sigma_W[k+2] + eta_2 Sigma_W[k+3]
         //     + sum_i q~[i] Sigma_Q^comm[i]
         // where the sum ranges over the ordinary (non-committed) witnesses in
-        // ascending index order, matching Sigma_W
+        // ascending index order, matching Sigma_W. Computed as one MSM to
+        // amortize the Pippenger buckets.
         let mut is_committed = vec![false; witness_assignment.len()];
         for block in &block_indices {
             for &w in block {
                 is_committed[w] = true;
             }
         }
-        let ordinary_witnesses: Vec<E::ScalarField> = witness_assignment
+        let mut t_scalars: Vec<E::ScalarField> = witness_assignment
             .iter()
             .zip(&is_committed)
             .filter(|(_, committed)| !**committed)
             .map(|(value, _)| *value)
             .collect();
-        debug_assert_eq!(ordinary_witnesses.len(), pk.sigma_w.len());
-        let t_w = E::G1::msm_unchecked(&pk.sigma_w, &ordinary_witnesses);
-        let t_mask = E::G1::msm_unchecked(
-            &[pk.sigma_mask_const, pk.sigma_mask_linear],
-            &[eta_1, eta_2],
-        );
-        let t_q = E::G1::msm_unchecked(&pk.sigma_q_comm, &q_tilde.coeffs);
-        let t: E::G1Affine = (t_w + t_mask + t_q).into();
+        debug_assert_eq!(t_scalars.len(), pk.sigma_w.len());
+        let mut t_bases: Vec<E::G1Affine> =
+            Vec::with_capacity(pk.sigma_w.len() + 2 + q_tilde.coeffs.len());
+        t_bases.extend_from_slice(&pk.sigma_w);
+        t_bases.push(pk.sigma_mask_const);
+        t_bases.push(pk.sigma_mask_linear);
+        t_bases.extend_from_slice(&pk.sigma_q_comm[..q_tilde.coeffs.len()]);
+        t_scalars.push(eta_1);
+        t_scalars.push(eta_2);
+        t_scalars.extend_from_slice(&q_tilde.coeffs);
+        let t: E::G1Affine = E::G1::msm_unchecked(&t_bases, &t_scalars).into();
         end_timer!(timer_batch_commit);
 
         /////////////////////// Computing the challenge ///////////////////////
@@ -244,12 +297,16 @@ impl<E: Pairing> ZkPari<E> {
         let timer_opening = start_timer!(|| "Batch Opening");
         let timer_open_poly = start_timer!(|| "Computing the opening polynomials");
 
-        // R(X) = z_B(X) - x_B(X) + v_K(X) q~(X) = w_B^masked(X) + v_K(X) q~(X)
-        let mut r_coeffs = w_b_masked.coeffs.clone();
+        // R(X) = z_B(X) - x_B(X) + v_K(X) q~(X)
+        //      = z_B^orig(X) + rho_ci v_K(X) + v_K(X) q~(X)
+        // (x_B = 0 after instance outlining, and w_B == z_B)
+        let mut r_coeffs = z_b_hat.coeffs;
         r_coeffs.resize(
-            r_coeffs.len().max(q_tilde.coeffs.len() + domain_size),
+            (domain_size + 1).max(q_tilde.coeffs.len() + domain_size),
             E::ScalarField::zero(),
         );
+        r_coeffs[0] -= rho_ci;
+        r_coeffs[domain_size] += rho_ci;
         for (i, q_i) in q_tilde.coeffs.iter().enumerate() {
             r_coeffs[i] -= q_i;
             r_coeffs[i + domain_size] += q_i;
@@ -260,13 +317,12 @@ impl<E: Pairing> ZkPari<E> {
         let v_r = r_poly.evaluate(&challenge);
         #[cfg(debug_assertions)]
         {
-            let x_a_at_r = z_a_masked.evaluate(&challenge) - v_a;
-            let x_b_at_r = z_b_hat.evaluate(&challenge) - w_b_hat.evaluate(&challenge);
-            assert!(
-                x_b_at_r.is_zero(),
-                "x_B(r) must vanish after SR1CS instance outlining"
+            let x_a_at_r = x_a_poly_check.evaluate(&challenge);
+            assert_eq!(
+                v_r,
+                (v_a + x_a_at_r).square(),
+                "v_R must equal (v_a + x_A(r))^2"
             );
-            assert_eq!(v_r, (v_a + x_a_at_r).square() - x_b_at_r);
         }
 
         // W_A(X) = (z_A(X) - x_A(X) - v_a)/(X - r), of degree <= m
@@ -279,13 +335,17 @@ impl<E: Pairing> ZkPari<E> {
         let witness_r = (&r_poly - &v_r_poly) / &chall_vanishing_poly;
         end_timer!(timer_open_poly);
 
-        // U = sum_i W_A[i] Sigma_A[i] + sum_i W_R[i] Sigma_R[i]
+        // U = sum_i W_A[i] Sigma_A[i] + sum_i W_R[i] Sigma_R[i], as one MSM
         let timer_msms = start_timer!(|| "Computing the opening MSMs");
         debug_assert!(witness_a.coeffs.len() <= pk.sigma_a.len());
         debug_assert!(witness_r.coeffs.len() <= pk.sigma_r.len());
-        let w_a_proof = E::G1::msm_unchecked(&pk.sigma_a, &witness_a.coeffs);
-        let w_r_proof = E::G1::msm_unchecked(&pk.sigma_r, &witness_r.coeffs);
-        let u: E::G1Affine = (w_a_proof + w_r_proof).into();
+        let mut u_bases: Vec<E::G1Affine> =
+            Vec::with_capacity(witness_a.coeffs.len() + witness_r.coeffs.len());
+        u_bases.extend_from_slice(&pk.sigma_a[..witness_a.coeffs.len()]);
+        u_bases.extend_from_slice(&pk.sigma_r[..witness_r.coeffs.len()]);
+        let mut u_scalars = witness_a.coeffs;
+        u_scalars.extend_from_slice(&witness_r.coeffs);
+        let u: E::G1Affine = E::G1::msm_unchecked(&u_bases, &u_scalars).into();
         end_timer!(timer_msms);
         end_timer!(timer_opening);
 
@@ -337,17 +397,29 @@ impl<E: Pairing> ZkPari<E> {
             sr1cs_cs.into_inner().unwrap()
         };
 
-        let _ = sr1cs_inner.perform_instance_outlining(InstanceOutliner {
-            pred_label: SR1CS_PREDICATE_LABEL.to_string(),
-            func: Rc::new(outline_sr1cs),
-        });
+        sr1cs_inner
+            .perform_instance_outlining(InstanceOutliner {
+                pred_label: SR1CS_PREDICATE_LABEL.to_string(),
+                func: Rc::new(outline_sr1cs),
+            })
+            .expect("instance outlining failed");
         end_timer!(sr1cs_timer);
         end_timer!(timer_cs_startup);
         Ok((sr1cs_inner, block_indices))
     }
 
+    /// Evaluate the constraint rows once over the full assignment, returning
+    /// `(z_A, z_B, w_A)`.
+    ///
+    /// After instance outlining the instance variables appear only in the
+    /// last `instance_len` rows, each as `(x_i - w_copy_i)` on the A-side
+    /// with an empty B-side. Hence the punctured ("instance zeroed")
+    /// evaluations need no second pass:
+    /// - `w_B == z_B` (no instance column in B),
+    /// - `w_A == z_A` except on the outlining rows, where removing the
+    ///   instance contribution subtracts `x_i`.
     #[allow(clippy::type_complexity)]
-    pub(crate) fn compute_wa_wb_za_zb(
+    pub(crate) fn compute_za_zb_wa(
         domain: GeneralEvaluationDomain<E::ScalarField>,
         a_mat: &Matrix<E::ScalarField>,
         b_mat: &Matrix<E::ScalarField>,
@@ -356,16 +428,14 @@ impl<E: Pairing> ZkPari<E> {
         num_constraints: usize,
     ) -> Result<
         (
-            (Vec<E::ScalarField>, Vec<E::ScalarField>),
-            (Vec<E::ScalarField>, Vec<E::ScalarField>),
+            Vec<E::ScalarField>,
+            Vec<E::ScalarField>,
+            Vec<E::ScalarField>,
         ),
         SynthesisError,
     > {
         let mut assignment: Vec<E::ScalarField> = instance_assignment.to_vec();
-        let mut punctured_assignment: Vec<E::ScalarField> =
-            vec![E::ScalarField::zero(); assignment.len()];
         assignment.extend_from_slice(witness_assignment);
-        punctured_assignment.extend_from_slice(witness_assignment);
 
         let domain_size = domain.size();
         let mut z_a = vec![E::ScalarField::zero(); domain_size];
@@ -380,24 +450,34 @@ impl<E: Pairing> ZkPari<E> {
                 *b = Sr1csAdapter::<E::ScalarField>::evaluate_constraint(bt_i, &assignment);
             });
 
-        let mut w_a = vec![E::ScalarField::zero(); domain_size];
-        let mut w_b = vec![E::ScalarField::zero(); domain_size];
+        let instance_len = instance_assignment.len();
+        let outline_start = num_constraints - instance_len;
+        let mut w_a = z_a.clone();
+        for (i, x_i) in instance_assignment.iter().enumerate() {
+            w_a[outline_start + i] -= x_i;
+        }
 
-        cfg_iter_mut!(w_a[..num_constraints])
-            .zip(&mut w_b[..num_constraints])
-            .zip(a_mat)
-            .zip(b_mat)
-            .for_each(|(((a, b), at_i), bt_i)| {
-                *a = Sr1csAdapter::<E::ScalarField>::evaluate_constraint(
+        // Validate the outlining structure against the definitional
+        // (punctured-assignment) evaluation
+        #[cfg(debug_assertions)]
+        {
+            let mut punctured_assignment: Vec<E::ScalarField> =
+                vec![E::ScalarField::zero(); instance_len];
+            punctured_assignment.extend_from_slice(witness_assignment);
+            for (row, (at_i, bt_i)) in a_mat.iter().zip(b_mat).enumerate() {
+                let w_a_row: E::ScalarField = Sr1csAdapter::<E::ScalarField>::evaluate_constraint(
                     at_i,
                     &punctured_assignment,
                 );
-                *b = Sr1csAdapter::<E::ScalarField>::evaluate_constraint(
+                let w_b_row: E::ScalarField = Sr1csAdapter::<E::ScalarField>::evaluate_constraint(
                     bt_i,
                     &punctured_assignment,
                 );
-            });
+                assert_eq!(w_a_row, w_a[row], "instance column outside outlining rows");
+                assert_eq!(w_b_row, z_b[row], "instance column in the B matrix");
+            }
+        }
 
-        Ok(((z_a, z_b), (w_a, w_b)))
+        Ok((z_a, z_b, w_a))
     }
 }

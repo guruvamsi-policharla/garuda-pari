@@ -2,7 +2,7 @@ use ark_ec::pairing::Pairing;
 use ark_ec::VariableBaseMSM;
 use ark_ff::Field;
 use ark_poly::Radix2EvaluationDomain;
-use ark_serialize::CanonicalSerialize;
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::rand::RngCore;
 use core::ops::{Add, Sub};
 
@@ -124,7 +124,7 @@ impl SuccinctIndex {
 /// (e.g. an aggregate of ledger commitments) need not be transmitted: the
 /// verifier reassembles the proof with the recomputed point. The transmitted
 /// material is then `2 G1 + 1 F` plus one `G1` per *fresh* block commitment.
-#[derive(CanonicalSerialize, Clone, Debug, PartialEq, Eq)]
+#[derive(CanonicalSerialize, CanonicalDeserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Proof<E: Pairing> {
     /// Per-block committed-input commitments `C_ci_j` (hiding Pedersen vector
     /// commitments).
