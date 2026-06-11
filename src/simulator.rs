@@ -47,22 +47,7 @@ impl<E: Pairing> ZkPari<E> {
         public_input: &[E::ScalarField],
         rng: &mut impl RngCore,
     ) -> Proof<E> {
-        Self::simulate_inner(trapdoor, vk, c_ci, public_input, 0, rng)
-    }
-
-    /// Like [`Self::simulate`], but the last `num_derived_tail` commitments
-    /// are excluded from the Fiat-Shamir challenge, matching
-    /// [`Self::prove_with_openings_derived`] and the `*_derived` verifiers.
-    /// See `prove_with_openings_derived` for the soundness contract.
-    pub fn simulate_derived(
-        trapdoor: &Trapdoor<E>,
-        vk: &VerifyingKey<E>,
-        c_ci: &[E::G1Affine],
-        public_input: &[E::ScalarField],
-        num_derived_tail: usize,
-        rng: &mut impl RngCore,
-    ) -> Proof<E> {
-        Self::simulate_inner(trapdoor, vk, c_ci, public_input, num_derived_tail, rng)
+        Self::simulate_inner(trapdoor, vk, c_ci, public_input, rng)
     }
 
     fn simulate_inner(
@@ -70,17 +55,12 @@ impl<E: Pairing> ZkPari<E> {
         vk: &VerifyingKey<E>,
         c_ci: &[E::G1Affine],
         public_input: &[E::ScalarField],
-        num_derived_tail: usize,
         rng: &mut impl RngCore,
     ) -> Proof<E> {
         assert_eq!(
             c_ci.len(),
             trapdoor.deltas.len(),
             "one committed-input commitment per block"
-        );
-        assert!(
-            num_derived_tail <= c_ci.len(),
-            "cannot derive more blocks than exist"
         );
         assert_eq!(
             public_input.len(),
@@ -123,12 +103,7 @@ impl<E: Pairing> ZkPari<E> {
 
         // Challenge: identical Fiat-Shamir derivation to the verifier. T does
         // not depend on r, so deriving r here is consistent.
-        let r = compute_chall::<E>(
-            vk,
-            public_input,
-            &c_ci[..c_ci.len() - num_derived_tail],
-            &t_g,
-        );
+        let r = compute_chall::<E>(vk, public_input, c_ci, &t_g);
         assert_ne!(
             r, trapdoor.tau,
             "Fiat-Shamir challenge collided with the trapdoor tau"

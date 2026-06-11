@@ -1,14 +1,14 @@
 //! Phase-by-phase cost of private-transfer block processing.
 //!
 //! Drives the standalone [`zkpari::ledger`] pipeline — the chain's block
-//! verification hot path — over BLS12-381 at several block sizes and reports
+//! verification hot path — over BN254 at several block sizes and reports
 //! wall-clock per phase:
 //!
-//! - decode:  wire bytes -> transactions (5 validated uncompressed point
-//!            reads per transfer: on-curve + subgroup, no sqrt)
-//! - collect: theta transcripts + derived-tail claim assembly
-//! - verify:  one RLC batch verification (MSMs + a 5-pairing product)
-//! - apply:   commitment-chain checks + homomorphic updates
+//! - decode: wire bytes -> transactions (6 validated uncompressed point
+//!   reads per transfer: on-curve + subgroup, no sqrt)
+//! - collect: two range-proof claims per transfer
+//! - verify: one RLC batch verification (MSMs + a 4-pairing product)
+//! - apply: commitment-chain checks + homomorphic updates
 //!
 //! Run with:
 //!
@@ -16,13 +16,13 @@
 //! cargo bench --bench ledger-block            # release profile
 //! ```
 
-use ark_bls12_381::Bls12_381;
+use ark_bn254::Bn254;
 use ark_std::rand::rngs::StdRng;
 use ark_std::rand::SeedableRng;
 use std::time::Instant;
 use zkpari::ledger::{decode_block, encode_block, Fixture, LedgerParams};
 
-type E = Bls12_381;
+type E = Bn254;
 
 const SIZES: &[usize] = &[64, 256, 512];
 const ITERATIONS: usize = 5;

@@ -41,7 +41,7 @@ impl<E: Pairing> ZkPari<E> {
         let openings: Vec<CommittedInputOpening<E::ScalarField>> = (0..pk.sigma_ci.len())
             .map(|_| CommittedInputOpening::rand(rng))
             .collect();
-        Self::prove_inner(circuit, pk, &openings, 0, rng)
+        Self::prove_inner(circuit, pk, &openings, rng)
     }
 
     /// Produce a proof with caller-supplied openings `rho_ci_j` (one per
@@ -61,40 +61,13 @@ impl<E: Pairing> ZkPari<E> {
     where
         E::ScalarField: Field,
     {
-        Self::prove_inner(circuit, pk, openings, 0, rng)
-    }
-
-    /// Like [`Self::prove_with_openings`], but the last `num_derived_tail`
-    /// committed-input commitments are **excluded from the Fiat-Shamir
-    /// challenge**, matching [`Self::verify_derived`] /
-    /// [`Self::batch_verify_derived_tail`] on the verifier side.
-    ///
-    /// # Soundness contract
-    ///
-    /// Excluding a commitment from the challenge is sound **only** when that
-    /// commitment is a binding, deterministic function of material that *is*
-    /// absorbed (the public input and the remaining commitments) — e.g. the
-    /// verifier recomputes it as a linear combination of ledger commitments
-    /// with coefficients fixed by a public input that was itself derived by
-    /// hashing those commitments. The caller owns that binding argument.
-    pub fn prove_with_openings_derived<C: ZkPariCircuit<E::ScalarField>, R: RngCore>(
-        circuit: C,
-        pk: &ProvingKey<E>,
-        openings: &[CommittedInputOpening<E::ScalarField>],
-        num_derived_tail: usize,
-        rng: &mut R,
-    ) -> Result<Proof<E>, SynthesisError>
-    where
-        E::ScalarField: Field,
-    {
-        Self::prove_inner(circuit, pk, openings, num_derived_tail, rng)
+        Self::prove_inner(circuit, pk, openings, rng)
     }
 
     fn prove_inner<C: ZkPariCircuit<E::ScalarField>, R: RngCore>(
         circuit: C,
         pk: &ProvingKey<E>,
         openings: &[CommittedInputOpening<E::ScalarField>],
-        num_derived_tail: usize,
         rng: &mut R,
     ) -> Result<Proof<E>, SynthesisError>
     where
@@ -306,17 +279,10 @@ impl<E: Pairing> ZkPari<E> {
 
         /////////////////////// Computing the challenge ///////////////////////
         let timer_init_transcript = start_timer!(|| "Computing Challenge");
-        // Derived-tail commitments are bound transitively by the caller (see
-        // `prove_with_openings_derived`) and excluded from the transcript.
-        assert!(
-            num_derived_tail <= c_cis.len(),
-            "cannot derive more blocks than exist"
-        );
-        let absorbed = c_cis.len() - num_derived_tail;
         let challenge = compute_chall::<E>(
             &pk.verifying_key,
             &instance_assignment[1..].to_vec(),
-            &c_cis[..absorbed],
+            &c_cis,
             &t,
         );
         end_timer!(timer_init_transcript);

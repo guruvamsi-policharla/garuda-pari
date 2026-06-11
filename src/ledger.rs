@@ -11,14 +11,12 @@
 //! 1. **decode** — deserialize transactions, validating every G1 point
 //!    (canonical encoding, on-curve, prime-order subgroup). Points travel
 //!    uncompressed so decoding pays no square root.
-//! 2. **collect** — derive each proof's Fiat-Shamir aggregation challenge
-//!    `theta` and assemble the batch-verification claims. The block-2
-//!    commitment `com_theta = (1 - theta) * amount + theta * input` is a
-//!    *derived tail*: it is never materialized, entering the batched check as
-//!    MSM terms (see [`ZkPari::batch_verify_derived_tail`]).
+//! 2. **collect** — assemble two range-proof claims per transfer: one for the
+//!    amount commitment and one for the homomorphically derived remaining
+//!    balance commitment.
 //! 3. **verify** — one random-linear-combination batch verification of every
-//!    proof in the block: a handful of size-`n` MSMs and a single 5-pairing
-//!    product.
+//!    proof in the block: a handful of size-`n` MSMs and a single 4-pairing
+//!    product for the one-committed-input relation.
 //! 4. **apply** — check each sender's declared commitment against ledger
 //!    state, then update commitments homomorphically: transfers subtract the
 //!    amount commitment from the sender's `private` and add it to the
@@ -30,9 +28,11 @@
 //! untouched.
 //!
 //! Known deltas from constantinople (cost attribution, not cost amount):
-//! - Constantinople validates the two payload commitments at transaction
-//!   decode and the three proof points at claim collection; here all five
-//!   validate at decode. Same total work, different phase.
+//! - This simplified ledger uses two independent single-value range proofs per
+//!   transfer instead of the chain's aggregated one-recipient range relation.
+//! - Constantinople validates payload commitments at transaction decode and
+//!   proof points at claim collection; here all transmitted points validate at
+//!   decode. Same total work, different phase.
 //! - Constantinople re-serializes a 48-byte compressed cache after every
 //!   commitment update (its state codec); [`apply`](Ledger::process_block)
 //!   here stops at the affine point.
@@ -52,11 +52,10 @@
 //! `benches/ledger-block.rs` for a phase-by-phase cost breakdown.
 
 use crate::data_structures::{CommittedInputOpening, Proof, ProvingKey, Trapdoor, VerifyingKey};
-use crate::utils::transcript::IOPTranscript;
 use crate::{ZkPari, ZkPariCircuit};
 use ark_ec::pairing::Pairing;
 use ark_ec::{AffineRepr, CurveGroup};
-use ark_ff::{Field, One, Zero};
+use ark_ff::Field;
 use ark_relations::gr1cs::{
     predicate::{polynomial_constraint::SR1CS_PREDICATE_LABEL, PredicateConstraintSystem},
     ConstraintSystemRef, SynthesisError, Variable, R1CS_PREDICATE_LABEL,
@@ -69,34 +68,22 @@ use ark_std::rand::RngCore;
 use ark_std::vec::Vec;
 use std::time::Instant;
 
-/// One recipient per transfer: the batched circuit's `B`.
-const BATCH_SIZE: usize = 1;
-
-/// CRS block index of the payment basis ledger commitments live in (block 2
-/// of the batched circuit: `[claimed values]`, then `[aggregate]`).
-const LEDGER_BLOCK: usize = 1;
-
-/// Fiat-Shamir domain for the aggregation challenge `theta`. Byte-identical
-/// to constantinople's so transcripts can be cross-checked between the two.
-const THETA_DOMAIN: &[u8] = b"constantinople-private-transfer-theta";
+/// CRS block index of the payment basis ledger commitments live in: the
+/// single committed-input block of the range-proof circuit.
+const LEDGER_BLOCK: usize = 0;
 
 // ---------------------------------------------------------------------------
-// Batched range circuit (B = 1), identical to constantinople's: range-checks
-// the claimed amount and the remaining balance (block 1) and enforces the
-// Horner aggregation `amount + theta * remaining = v_theta` against the
-// block-2 committed aggregate, with `theta` a public input.
+// Range circuit: range-checks one 64-bit committed value.
 // ---------------------------------------------------------------------------
 
-/// The one-recipient batched range circuit; public so callers can keygen
-/// against the exact relation this module proves.
+/// The payment range circuit; public so callers can keygen against the exact
+/// relation this module proves.
 #[derive(Clone)]
-pub struct BatchedRangeCircuit<F: Field> {
-    pub theta: Option<F>,
-    pub amount: Option<u64>,
-    pub remaining: Option<u64>,
+pub struct RangeProofCircuit {
+    pub value: Option<u64>,
 }
 
-impl<F: Field> ZkPariCircuit<F> for BatchedRangeCircuit<F> {
+impl<F: Field> ZkPariCircuit<F> for RangeProofCircuit {
     fn synthesize(self, cs: ConstraintSystemRef<F>) -> Result<Vec<Vec<Variable>>, SynthesisError> {
         cs.remove_predicate(R1CS_PREDICATE_LABEL);
         let _ = cs.register_predicate(
@@ -105,110 +92,46 @@ impl<F: Field> ZkPariCircuit<F> for BatchedRangeCircuit<F> {
                 .map_err(|_| SynthesisError::Unsatisfiable)?,
         );
 
-        let theta = self.theta;
-        let raw_values: Option<[u64; BATCH_SIZE + 1]> = match (self.amount, self.remaining) {
-            (Some(amount), Some(remaining)) => Some([amount, remaining]),
-            _ => None,
-        };
-        let values: Option<Vec<F>> = raw_values
-            .as_ref()
-            .map(|raw| raw.iter().map(|v| F::from(*v)).collect());
+        let value = self.value;
+        let value_var = cs.new_witness_variable(|| {
+            let val = value.ok_or(SynthesisError::AssignmentMissing)?;
+            Ok(F::from(val))
+        })?;
 
-        // Block 1 (committed inputs): amount, remaining.
-        let mut value_vars = Vec::with_capacity(BATCH_SIZE + 1);
-        for i in 0..=BATCH_SIZE {
-            let vals = values.clone();
-            let v = cs.new_witness_variable(move || {
-                vals.ok_or(SynthesisError::AssignmentMissing).map(|v| v[i])
+        let mut bit_vars = Vec::with_capacity(64);
+        for bit in 0..64u32 {
+            let bv = cs.new_witness_variable(|| {
+                let val = value.ok_or(SynthesisError::AssignmentMissing)?;
+                Ok(if (val >> bit) & 1 == 1 {
+                    F::ONE
+                } else {
+                    F::ZERO
+                })
             })?;
-            value_vars.push(v);
+            bit_vars.push(bv);
+        }
+        let mut recon_minus_v = lc!() - value_var;
+        let mut coeff = F::ONE;
+        for &b in &bit_vars {
+            recon_minus_v += (coeff, b);
+            coeff.double_in_place();
+        }
+        let zero_lc = lc!() + value_var - value_var;
+        cs.enforce_sr1cs_constraint(|| recon_minus_v, || zero_lc)?;
+        for &b in &bit_vars {
+            cs.enforce_sr1cs_constraint(|| lc!() + b, || lc!() + b)?;
         }
 
-        // Block 2 (single committed input): v_theta = amount + theta * remaining.
-        let v_theta_value: Option<F> = match (values.as_ref(), theta) {
-            (Some(vals), Some(th)) => Some(vals[0] + th * vals[1]),
-            _ => None,
-        };
-        let v_theta_var =
-            cs.new_witness_variable(|| v_theta_value.ok_or(SynthesisError::AssignmentMissing))?;
-
-        // theta is an ordinary public input.
-        let theta_var = cs.new_input_variable(|| theta.ok_or(SynthesisError::AssignmentMissing))?;
-
-        // 64-bit range check for every committed value.
-        for (i, &v) in value_vars.iter().enumerate() {
-            let mut bit_vars = Vec::with_capacity(64);
-            for bit in 0..64u32 {
-                let raw = raw_values;
-                let bv = cs.new_witness_variable(move || {
-                    let raw = raw.ok_or(SynthesisError::AssignmentMissing)?;
-                    Ok(if (raw[i] >> bit) & 1 == 1 {
-                        F::ONE
-                    } else {
-                        F::ZERO
-                    })
-                })?;
-                bit_vars.push(bv);
-            }
-            let mut recon_minus_v = lc!() - v;
-            let mut coeff = F::ONE;
-            for &b in &bit_vars {
-                recon_minus_v = recon_minus_v + (coeff, b);
-                coeff.double_in_place();
-            }
-            let zero_lc = lc!() + v - v;
-            cs.enforce_sr1cs_constraint(|| recon_minus_v, || zero_lc)?;
-            for &b in &bit_vars {
-                cs.enforce_sr1cs_constraint(|| lc!() + b, || lc!() + b)?;
-            }
-        }
-
-        // Horner aggregation (identical to the chain's circuit, B = 1):
-        // acc = remaining; acc = acc * theta + amount. Each product
-        // acc * theta is enforced with two squares:
-        //   (acc + theta)^2 = s_plus,  (acc - theta)^2 = s_minus,
-        //   acc * theta = (s_plus - s_minus)/4
-        let quarter = F::from(4u64).inverse().expect("4 is invertible");
-        let mut acc_lc = lc!() + value_vars[BATCH_SIZE];
-        let mut acc_val: Option<F> = values.as_ref().map(|vals| vals[BATCH_SIZE]);
-        for i in (0..BATCH_SIZE).rev() {
-            let (av, th) = (acc_val, theta);
-            let s_plus = cs.new_witness_variable(move || {
-                let a = av.ok_or(SynthesisError::AssignmentMissing)?;
-                let t = th.ok_or(SynthesisError::AssignmentMissing)?;
-                Ok((a + t).square())
-            })?;
-            let s_minus = cs.new_witness_variable(move || {
-                let a = av.ok_or(SynthesisError::AssignmentMissing)?;
-                let t = th.ok_or(SynthesisError::AssignmentMissing)?;
-                Ok((a - t).square())
-            })?;
-            let lhs_plus = acc_lc.clone() + theta_var;
-            let lhs_minus = acc_lc.clone() - theta_var;
-            cs.enforce_sr1cs_constraint(|| lhs_plus, || lc!() + s_plus)?;
-            cs.enforce_sr1cs_constraint(|| lhs_minus, || lc!() + s_minus)?;
-            acc_lc = lc!() + (quarter, s_plus) + (-quarter, s_minus) + value_vars[i];
-            acc_val = match (acc_val, theta, values.as_ref()) {
-                (Some(a), Some(t), Some(vals)) => Some(a * t + vals[i]),
-                _ => None,
-            };
-        }
-
-        // (acc - v_theta)^2 = 0
-        let final_lhs = acc_lc - v_theta_var;
-        let zero_lc = lc!() + value_vars[0] - value_vars[0];
-        cs.enforce_sr1cs_constraint(|| final_lhs, || zero_lc)?;
-
-        Ok(vec![value_vars, vec![v_theta_var]])
+        Ok(vec![vec![value_var]])
     }
 }
 
 // ---------------------------------------------------------------------------
-// Parameters, commitments, theta
+// Parameters and commitments
 // ---------------------------------------------------------------------------
 
 /// Proving/verifying keys (and the setup trapdoor, retained for cheap
-/// simulated fixtures) for the one-recipient transfer relation.
+/// simulated fixtures) for the range-proof relation.
 pub struct LedgerParams<E: Pairing> {
     pub pk: ProvingKey<E>,
     pub vk: VerifyingKey<E>,
@@ -219,11 +142,7 @@ impl<E: Pairing> LedgerParams<E> {
     /// Runs the (demo-grade, trapdoor-retaining) setup for the transfer
     /// relation.
     pub fn setup(rng: &mut impl RngCore) -> Self {
-        let circuit = BatchedRangeCircuit {
-            theta: Some(E::ScalarField::from(7u64)),
-            amount: Some(0),
-            remaining: Some(0),
-        };
+        let circuit = RangeProofCircuit { value: Some(0) };
         let (pk, vk, trapdoor) = ZkPari::<E>::keygen_with_trapdoor(circuit, rng);
         Self { pk, vk, trapdoor }
     }
@@ -251,28 +170,6 @@ impl<E: Pairing> LedgerParams<E> {
     }
 }
 
-/// Fiat-Shamir aggregation challenge bound to everything an adversary could
-/// vary before it is drawn: the sender's declared commitment, the amount
-/// commitment, and the block-1 commitment to the claimed values.
-///
-/// This binding is load-bearing for the derived-tail batch verification:
-/// `theta` enters the proof-system challenge as the public input, and
-/// `com_theta` is a deterministic function of `(theta, input, amount)`, so the
-/// derived commitment is fixed before the challenge is revealed.
-pub fn derive_theta<E: Pairing>(
-    input: &E::G1Affine,
-    amount: &E::G1Affine,
-    c_ci_1: &E::G1Affine,
-) -> E::ScalarField {
-    let mut transcript = IOPTranscript::<E::ScalarField>::new(THETA_DOMAIN);
-    let _ = transcript.append_serializable_element(b"com_sender", input);
-    let _ = transcript.append_serializable_element(b"com_amount", amount);
-    let _ = transcript.append_serializable_element(b"c_ci_1", c_ci_1);
-    transcript
-        .get_and_append_challenge(b"theta")
-        .expect("transcript challenge")
-}
-
 // ---------------------------------------------------------------------------
 // Transactions
 // ---------------------------------------------------------------------------
@@ -281,10 +178,10 @@ pub fn derive_theta<E: Pairing>(
 /// hash-map cost profile while staying simple.
 pub type AccountId = u64;
 
-/// The transmitted proof material: `3 G1 + 1 F`, points uncompressed.
+/// The transmitted range-proof body. The committed-input commitment `C_ci` is
+/// not transmitted here: validators reconstruct it from ledger commitments.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TransferProof<E: Pairing> {
-    pub c_ci_1: E::G1Affine,
+pub struct RangeProof<E: Pairing> {
     pub t_g: E::G1Affine,
     pub u_g: E::G1Affine,
     pub v_a: E::ScalarField,
@@ -308,15 +205,16 @@ pub enum Transaction<E: Pairing> {
         recipient: AccountId,
         sender_commitment: E::G1Affine,
         amount_commitment: E::G1Affine,
-        proof: TransferProof<E>,
+        amount_proof: RangeProof<E>,
+        remaining_proof: RangeProof<E>,
     },
-    /// Moves `value` back to the public side; reuses the transfer proof to
-    /// range-check the remaining balance (the "amount" is `commit(value)`).
+    /// Moves `value` back to the public side; range-checks the remaining
+    /// private balance.
     Burn {
         sender: AccountId,
         value: u64,
         sender_commitment: E::G1Affine,
-        proof: TransferProof<E>,
+        remaining_proof: RangeProof<E>,
     },
 }
 
@@ -331,8 +229,6 @@ pub enum LedgerError {
     Malformed,
     /// invalid group element encoding (non-canonical, off-curve, or outside the prime-order subgroup)
     InvalidPoint,
-    /// degenerate aggregation challenge
-    DegenerateTheta,
     /// batched proof verification failed
     InvalidProof,
     /// account {0} declared a commitment that does not match ledger state
@@ -365,9 +261,8 @@ fn read_u64(bytes: &mut &[u8]) -> Result<u64, LedgerError> {
     Ok(u64::from_le_bytes(head.try_into().expect("8 bytes")))
 }
 
-impl<E: Pairing> TransferProof<E> {
+impl<E: Pairing> RangeProof<E> {
     fn write(&self, out: &mut Vec<u8>) {
-        write_point::<E>(out, &self.c_ci_1);
         write_point::<E>(out, &self.t_g);
         write_point::<E>(out, &self.u_g);
         self.v_a
@@ -377,12 +272,20 @@ impl<E: Pairing> TransferProof<E> {
 
     fn read(bytes: &mut &[u8]) -> Result<Self, LedgerError> {
         Ok(Self {
-            c_ci_1: read_point::<E>(bytes)?,
             t_g: read_point::<E>(bytes)?,
             u_g: read_point::<E>(bytes)?,
             v_a: E::ScalarField::deserialize_compressed(&mut *bytes)
                 .map_err(|_| LedgerError::Malformed)?,
         })
+    }
+
+    fn to_zkpari_proof(&self, commitment: E::G1Affine) -> Proof<E> {
+        Proof {
+            c_ci: vec![commitment],
+            t_g: self.t_g,
+            u_g: self.u_g,
+            v_a: self.v_a,
+        }
     }
 }
 
@@ -407,26 +310,28 @@ pub fn encode_block<E: Pairing>(transactions: &[Transaction<E>]) -> Vec<u8> {
                 recipient,
                 sender_commitment,
                 amount_commitment,
-                proof,
+                amount_proof,
+                remaining_proof,
             } => {
                 out.push(TAG_TRANSFER);
                 write_u64(&mut out, *sender);
                 write_u64(&mut out, *recipient);
                 write_point::<E>(&mut out, sender_commitment);
                 write_point::<E>(&mut out, amount_commitment);
-                proof.write(&mut out);
+                amount_proof.write(&mut out);
+                remaining_proof.write(&mut out);
             }
             Transaction::Burn {
                 sender,
                 value,
                 sender_commitment,
-                proof,
+                remaining_proof,
             } => {
                 out.push(TAG_BURN);
                 write_u64(&mut out, *sender);
                 write_u64(&mut out, *value);
                 write_point::<E>(&mut out, sender_commitment);
-                proof.write(&mut out);
+                remaining_proof.write(&mut out);
             }
         }
     }
@@ -434,7 +339,7 @@ pub fn encode_block<E: Pairing>(transactions: &[Transaction<E>]) -> Vec<u8> {
 }
 
 /// Deserializes a block, validating every group element (the **decode**
-/// phase: per transfer, five subgroup-checked uncompressed point reads).
+/// phase: per transfer, six subgroup-checked uncompressed point reads).
 pub fn decode_block<E: Pairing>(mut bytes: &[u8]) -> Result<Vec<Transaction<E>>, LedgerError> {
     let count = read_u64(&mut bytes)? as usize;
     // Each transaction is at least a fund (tag + two u64s + one point); cap
@@ -458,13 +363,14 @@ pub fn decode_block<E: Pairing>(mut bytes: &[u8]) -> Result<Vec<Transaction<E>>,
                 recipient: read_u64(&mut bytes)?,
                 sender_commitment: read_point::<E>(&mut bytes)?,
                 amount_commitment: read_point::<E>(&mut bytes)?,
-                proof: TransferProof::read(&mut bytes)?,
+                amount_proof: RangeProof::read(&mut bytes)?,
+                remaining_proof: RangeProof::read(&mut bytes)?,
             },
             TAG_BURN => Transaction::Burn {
                 sender: read_u64(&mut bytes)?,
                 value: read_u64(&mut bytes)?,
                 sender_commitment: read_point::<E>(&mut bytes)?,
-                proof: TransferProof::read(&mut bytes)?,
+                remaining_proof: RangeProof::read(&mut bytes)?,
             },
             _ => return Err(LedgerError::Malformed),
         };
@@ -533,62 +439,51 @@ impl<E: Pairing> Ledger<E> {
     }
 
     /// Assembles the batch-verification claims for every proof-carrying
-    /// transaction (the **collect** phase): per claim, one theta transcript
-    /// plus the derived-tail MSM terms
-    /// `com_theta = (1 - theta) * amount + theta * input`.
-    ///
-    /// Burns materialize their public amount commitment `commit(value)` here,
-    /// mirroring the chain.
-    #[allow(clippy::type_complexity)]
+    /// transaction (the **collect** phase). Each transfer contributes two
+    /// single-value range proofs: the amount commitment and the remaining
+    /// balance commitment implied by `sender_commitment - amount_commitment`.
+    /// Burns contribute one proof for the remaining private balance.
     pub fn collect_claims(
         params: &LedgerParams<E>,
         transactions: &[Transaction<E>],
-    ) -> Result<
-        (
-            Vec<(Proof<E>, Vec<E::ScalarField>)>,
-            Vec<Vec<(E::G1Affine, E::ScalarField)>>,
-        ),
-        LedgerError,
-    > {
-        let mut proofs = Vec::with_capacity(transactions.len());
-        let mut derived = Vec::with_capacity(transactions.len());
+    ) -> Result<Vec<(Proof<E>, Vec<E::ScalarField>)>, LedgerError> {
+        let mut proofs = Vec::with_capacity(transactions.len() * 2);
         for transaction in transactions {
-            let (input, amount, proof) = match transaction {
+            match transaction {
                 Transaction::Fund { .. } => continue,
                 Transaction::Transfer {
                     sender_commitment,
                     amount_commitment,
-                    proof,
+                    amount_proof,
+                    remaining_proof,
                     ..
-                } => (sender_commitment, *amount_commitment, proof),
+                } => {
+                    let remaining_commitment = g1_sub::<E>(sender_commitment, amount_commitment);
+                    proofs.push((
+                        amount_proof.to_zkpari_proof(*amount_commitment),
+                        Vec::new(),
+                    ));
+                    proofs.push((
+                        remaining_proof.to_zkpari_proof(remaining_commitment),
+                        Vec::new(),
+                    ));
+                }
                 Transaction::Burn {
                     sender_commitment,
                     value,
-                    proof,
+                    remaining_proof,
                     ..
-                } => (sender_commitment, params.commit(*value), proof),
-            };
-            let theta = derive_theta::<E>(input, &amount, &proof.c_ci_1);
-            // Defense-in-depth: degenerate challenges collapse the Horner
-            // aggregation; a 192-bit hash never produces them honestly.
-            if theta.is_zero() || theta.is_one() {
-                return Err(LedgerError::DegenerateTheta);
+                } => {
+                    let amount = params.commit(*value);
+                    let remaining_commitment = g1_sub::<E>(sender_commitment, &amount);
+                    proofs.push((
+                        remaining_proof.to_zkpari_proof(remaining_commitment),
+                        Vec::new(),
+                    ));
+                }
             }
-            proofs.push((
-                Proof {
-                    c_ci: vec![proof.c_ci_1],
-                    t_g: proof.t_g,
-                    u_g: proof.u_g,
-                    v_a: proof.v_a,
-                },
-                vec![theta],
-            ));
-            derived.push(vec![
-                (amount, E::ScalarField::one() - theta),
-                (*input, theta),
-            ]);
         }
-        Ok((proofs, derived))
+        Ok(proofs)
     }
 
     /// Checks declared sender commitments against ledger state and applies
@@ -693,13 +588,11 @@ impl<E: Pairing> Ledger<E> {
         let mut timings = PhaseTimings::default();
 
         let started = Instant::now();
-        let (proofs, derived) = Self::collect_claims(params, transactions)?;
+        let proofs = Self::collect_claims(params, transactions)?;
         timings.collect_us = started.elapsed().as_micros();
 
         let started = Instant::now();
-        if !proofs.is_empty()
-            && !ZkPari::<E>::batch_verify_derived_tail(&proofs, &derived, &params.vk, rng)
-        {
+        if !proofs.is_empty() && !ZkPari::<E>::batch_verify(&proofs, &params.vk, rng) {
             return Err(LedgerError::InvalidProof);
         }
         timings.verify_us = started.elapsed().as_micros();
@@ -776,66 +669,31 @@ impl<E: Pairing> ClientBalance<E> {
     }
 }
 
-/// Builds the transmitted proof for a transfer/burn, honestly or via the
-/// setup trapdoor (simulation: cheap fixtures for load generation; transcript
-/// distribution matches honest proofs).
-#[allow(clippy::too_many_arguments)]
-fn build_proof<E: Pairing>(
+/// Builds the transmitted range-proof body for a committed value, honestly or
+/// via the setup trapdoor (simulation: cheap fixtures for load generation;
+/// transcript distribution matches honest proofs).
+fn build_range_proof<E: Pairing>(
     params: &LedgerParams<E>,
-    input: &E::G1Affine,
-    amount: u64,
-    amount_com: &E::G1Affine,
-    r_amount: &CommittedInputOpening<E::ScalarField>,
-    remaining: u64,
-    r_remaining: &CommittedInputOpening<E::ScalarField>,
+    value: u64,
+    commitment: E::G1Affine,
+    opening: &CommittedInputOpening<E::ScalarField>,
     simulate: bool,
     rng: &mut impl RngCore,
-) -> TransferProof<E> {
-    let rho_1 = CommittedInputOpening::<E::ScalarField>::rand(rng);
-    let c_ci_1 = params.pk.pedersen_commit(
-        0,
-        &[
-            E::ScalarField::from(amount),
-            E::ScalarField::from(remaining),
-        ],
-        &rho_1,
-    );
-    let theta = derive_theta::<E>(input, amount_com, &c_ci_1);
-
+) -> RangeProof<E> {
     let proof = if simulate {
-        // com_theta = (1 - theta) * amount + theta * input, materialized only
-        // here (the verifier folds it as MSM terms instead).
-        let com_theta = (amount_com.into_group() * (E::ScalarField::one() - theta)
-            + input.into_group() * theta)
-            .into_affine();
-        ZkPari::<E>::simulate_derived(
-            &params.trapdoor,
-            &params.vk,
-            &[c_ci_1, com_theta],
-            &[theta],
-            1,
-            rng,
-        )
+        ZkPari::<E>::simulate(&params.trapdoor, &params.vk, &[commitment], &[], rng)
     } else {
-        let rho_2 = CommittedInputOpening {
-            rho: r_amount.rho + theta * r_remaining.rho,
-        };
-        ZkPari::<E>::prove_with_openings_derived(
-            BatchedRangeCircuit {
-                theta: Some(theta),
-                amount: Some(amount),
-                remaining: Some(remaining),
-            },
+        ZkPari::<E>::prove_with_openings(
+            RangeProofCircuit { value: Some(value) },
             &params.pk,
-            &[rho_1, rho_2],
-            1,
+            core::slice::from_ref(opening),
             rng,
         )
         .expect("range proof synthesis cannot fail for in-range values")
     };
+    debug_assert_eq!(proof.c_ci[0], commitment);
 
-    TransferProof {
-        c_ci_1: proof.c_ci[0],
+    RangeProof {
         t_g: proof.t_g,
         u_g: proof.u_g,
         v_a: proof.v_a,
@@ -894,13 +752,19 @@ impl<'a, E: Pairing> Fixture<'a, E> {
                 .split(amount, rng)
                 .expect("fixture accounts hold enough balance");
             let amount_com = self.params.commit_with(amount, &r_amount);
-            let proof = build_proof(
+            let remaining_com = self.params.commit_with(remaining, &r_remaining);
+            let amount_proof = build_range_proof(
                 self.params,
-                &input,
                 amount,
-                &amount_com,
+                amount_com,
                 &r_amount,
+                simulate,
+                rng,
+            );
+            let remaining_proof = build_range_proof(
+                self.params,
                 remaining,
+                remaining_com,
                 &r_remaining,
                 simulate,
                 rng,
@@ -910,7 +774,8 @@ impl<'a, E: Pairing> Fixture<'a, E> {
                 recipient: ((sender + 1) % n) as u64,
                 sender_commitment: input,
                 amount_commitment: amount_com,
-                proof,
+                amount_proof,
+                remaining_proof,
             });
         }
         transactions
@@ -934,13 +799,11 @@ impl<'a, E: Pairing> Fixture<'a, E> {
         let r_remaining = client.opening.clone();
         client.value = remaining;
         let amount_com = self.params.commit(value);
-        let proof = build_proof(
+        let remaining_com = g1_sub::<E>(&input, &amount_com);
+        let remaining_proof = build_range_proof(
             self.params,
-            &input,
-            value,
-            &amount_com,
-            &CommittedInputOpening::zero(),
             remaining,
+            remaining_com,
             &r_remaining,
             simulate,
             rng,
@@ -949,7 +812,7 @@ impl<'a, E: Pairing> Fixture<'a, E> {
             sender,
             value,
             sender_commitment: input,
-            proof,
+            remaining_proof,
         }
     }
 
@@ -1045,6 +908,47 @@ mod tests {
             fixture.ledger.accounts[&1].private,
             fixture.clients[1].commitment(fixture.params)
         );
+    }
+
+    #[test]
+    fn block_processing_end_to_end_timings() {
+        const SIZES: &[usize] = &[64, 256, 512];
+
+        let mut rng = test_rng();
+        eprintln!(
+            "{:>6}  {:>11} {:>11} {:>11} {:>11}  {:>11}  {:>8}  {:>9}",
+            "txs", "decode_us", "collect_us", "verify_us", "apply_us", "total_us", "us/tx", "tx/s"
+        );
+
+        for &size in SIZES {
+            let mut fixture = fixture(size);
+            let block = fixture.transfer_block(3, true, &mut rng);
+            let bytes = encode_block(&block);
+
+            let started = Instant::now();
+            let decoded = decode_block::<E>(&bytes).expect("valid block bytes");
+            let decode_us = started.elapsed().as_micros();
+            assert_eq!(decoded.len(), size);
+
+            let timings = fixture
+                .ledger
+                .process_block_timed(fixture.params, &decoded, &mut rng)
+                .expect("valid block");
+
+            let total_us =
+                decode_us + timings.collect_us + timings.verify_us + timings.apply_us;
+            eprintln!(
+                "{:>6}  {:>11} {:>11} {:>11} {:>11}  {:>11}  {:>8.1}  {:>9.0}",
+                size,
+                decode_us,
+                timings.collect_us,
+                timings.verify_us,
+                timings.apply_us,
+                total_us,
+                total_us as f64 / size as f64,
+                size as f64 / (total_us as f64 / 1e6),
+            );
+        }
     }
 
     #[test]

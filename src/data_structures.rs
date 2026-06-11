@@ -171,7 +171,7 @@ pub struct Proof<E: Pairing> {
 /// `C_ci_j = sum_i x_i Sigma_ci_j[i] + rho_ci_j Gamma_ci_j`.
 ///
 /// If the proof creates a fresh commitment, `rho_ci_j` is sampled by the
-/// prover; if `C_ci_j` is (derived from) public state, the opening is
+/// prover; if the application already fixes `C_ci_j`, the matching opening is
 /// supplied as auxiliary input via [`crate::ZkPari::prove_with_openings`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommittedInputOpening<F: Field> {

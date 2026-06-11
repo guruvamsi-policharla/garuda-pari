@@ -2,7 +2,6 @@
 *.bin
 Cargo.lock
 .DS_Store
-garuda-bench/circuits/aptos/
 *.pdf
 *.wasm
 *.r1cs

@@ -1,6 +1,6 @@
 use crate::data_structures::{CommittedInputOpening, Proof, ProvingKey, VerifyingKey};
 use crate::{Uncommitted, ZkPari, ZkPariCircuit};
-use ark_bn254::Bn254;
+use ark_bls12_381::Bls12_381;
 use ark_ec::pairing::Pairing;
 use ark_ec::{AffineRepr, CurveGroup};
 use ark_ff::{Field, UniformRand};
@@ -13,8 +13,8 @@ use ark_std::rand::{RngCore, SeedableRng};
 use ark_std::test_rng;
 use ark_std::Zero;
 
-type E = Bn254;
-type Fr = <Bn254 as Pairing>::ScalarField;
+type E = Bls12_381;
+type Fr = <Bls12_381 as Pairing>::ScalarField;
 
 // ---------------------------------------------------------------------------
 // Test circuits
@@ -394,88 +394,6 @@ fn committed_input_pedersen_consistency() {
         pk2.pedersen_commit(1, &[b_val], &openings[1])
     );
     assert!(ZkPari::<E>::verify(&proof2, &vk2, &[a_val * b_val]));
-}
-
-/// Derived-tail flow: the last block's commitment is excluded from the
-/// challenge on both sides, the batch verifier folds it from caller-supplied
-/// MSM terms, and a wrong derived commitment is rejected.
-#[test]
-fn derived_tail_block_roundtrip_and_binding() {
-    let mut rng = rng();
-    let make = |a: u64, b: u64| MulCircuit {
-        a: Some(Fr::from(a)),
-        b: Some(Fr::from(b)),
-        spec: CommitSpec::BlocksAThenB,
-    };
-
-    let (pk, vk) = ZkPari::<E>::keygen(make(3, 5), &mut rng);
-
-    let prove = |a: u64, b: u64, rng: &mut _| {
-        let openings = [
-            CommittedInputOpening::<Fr>::rand(rng),
-            CommittedInputOpening::<Fr>::rand(rng),
-        ];
-        let proof =
-            ZkPari::<E>::prove_with_openings_derived(make(a, b), &pk, &openings, 1, rng).unwrap();
-        let x = vec![Fr::from(a) * Fr::from(b)];
-        (proof, x)
-    };
-
-    let (full_one, x_one) = prove(3, 5, &mut rng);
-    let (full_two, x_two) = prove(7, 11, &mut rng);
-
-    // The full proof verifies with the derived-tail challenge, and NOT with
-    // the standard challenge (the transcripts must actually differ).
-    assert!(ZkPari::<E>::verify_derived(&full_one, &vk, &x_one, 1));
-    assert!(!ZkPari::<E>::verify(&full_one, &vk, &x_one));
-
-    // Strip the derived tail for transmission.
-    let strip = |proof: &Proof<E>| Proof {
-        c_ci: vec![proof.c_ci[0]],
-        ..proof.clone()
-    };
-    let tail_one = full_one.c_ci[1];
-    let tail_two = full_two.c_ci[1];
-
-    // n == 1 derived batch (delegates to verify_derived).
-    assert!(ZkPari::<E>::batch_verify_derived_tail(
-        &[(strip(&full_one), x_one.clone())],
-        &[vec![(tail_one, Fr::ONE)]],
-        &vk,
-        &mut rng,
-    ));
-
-    // Multi-proof batch; the second term list expresses the same commitment
-    // as 2*C - C to exercise multi-term folding with non-trivial coefficients.
-    let claims = vec![
-        (strip(&full_one), x_one.clone()),
-        (strip(&full_two), x_two.clone()),
-    ];
-    assert!(ZkPari::<E>::batch_verify_derived_tail(
-        &claims,
-        &[
-            vec![(tail_one, Fr::ONE)],
-            vec![(tail_two, Fr::from(2u64)), (tail_two, -Fr::ONE)],
-        ],
-        &vk,
-        &mut rng,
-    ));
-
-    // Binding: a wrong derived commitment must be rejected (tails swapped).
-    assert!(!ZkPari::<E>::batch_verify_derived_tail(
-        &claims,
-        &[vec![(tail_two, Fr::ONE)], vec![(tail_one, Fr::ONE)]],
-        &vk,
-        &mut rng,
-    ));
-
-    // Shape mismatches are rejected, not panicked on.
-    assert!(!ZkPari::<E>::batch_verify_derived_tail(
-        &claims,
-        &[vec![(tail_one, Fr::ONE)]],
-        &vk,
-        &mut rng,
-    ));
 }
 
 /// A serialized proof must deserialize and verify; verification must reject
