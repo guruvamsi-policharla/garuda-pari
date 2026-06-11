@@ -52,7 +52,7 @@
 //! `benches/ledger-block.rs` for a phase-by-phase cost breakdown.
 
 use crate::data_structures::{CommittedInputOpening, Proof, ProvingKey, Trapdoor, VerifyingKey};
-use crate::{ZkPari, ZkPariCircuit};
+use crate::{BatchVerifyTimings, ZkPari, ZkPariCircuit};
 use ark_ec::pairing::Pairing;
 use ark_ec::{AffineRepr, CurveGroup};
 use ark_ff::Field;
@@ -409,6 +409,7 @@ impl<E: Pairing> Default for AccountState<E> {
 pub struct PhaseTimings {
     pub collect_us: u128,
     pub verify_us: u128,
+    pub verify_breakdown: BatchVerifyTimings,
     pub apply_us: u128,
 }
 
@@ -459,10 +460,7 @@ impl<E: Pairing> Ledger<E> {
                     ..
                 } => {
                     let remaining_commitment = g1_sub::<E>(sender_commitment, amount_commitment);
-                    proofs.push((
-                        amount_proof.to_zkpari_proof(*amount_commitment),
-                        Vec::new(),
-                    ));
+                    proofs.push((amount_proof.to_zkpari_proof(*amount_commitment), Vec::new()));
                     proofs.push((
                         remaining_proof.to_zkpari_proof(remaining_commitment),
                         Vec::new(),
@@ -592,8 +590,17 @@ impl<E: Pairing> Ledger<E> {
         timings.collect_us = started.elapsed().as_micros();
 
         let started = Instant::now();
-        if !proofs.is_empty() && !ZkPari::<E>::batch_verify(&proofs, &params.vk, rng) {
-            return Err(LedgerError::InvalidProof);
+        if !proofs.is_empty() {
+            let (accepted, verify_breakdown) = ZkPari::<E>::batch_verify_partitioned_timed(
+                &proofs,
+                &params.vk,
+                rng,
+                rayon::current_num_threads(),
+            );
+            timings.verify_breakdown = verify_breakdown;
+            if !accepted {
+                return Err(LedgerError::InvalidProof);
+            }
         }
         timings.verify_us = started.elapsed().as_micros();
 
@@ -753,14 +760,8 @@ impl<'a, E: Pairing> Fixture<'a, E> {
                 .expect("fixture accounts hold enough balance");
             let amount_com = self.params.commit_with(amount, &r_amount);
             let remaining_com = self.params.commit_with(remaining, &r_remaining);
-            let amount_proof = build_range_proof(
-                self.params,
-                amount,
-                amount_com,
-                &r_amount,
-                simulate,
-                rng,
-            );
+            let amount_proof =
+                build_range_proof(self.params, amount, amount_com, &r_amount, simulate, rng);
             let remaining_proof = build_range_proof(
                 self.params,
                 remaining,
@@ -912,7 +913,7 @@ mod tests {
 
     #[test]
     fn block_processing_end_to_end_timings() {
-        const SIZES: &[usize] = &[64, 256, 512];
+        const SIZES: &[usize] = &[64, 256, 512, 2048, 8192];
 
         let mut rng = test_rng();
         eprintln!(
@@ -935,8 +936,7 @@ mod tests {
                 .process_block_timed(fixture.params, &decoded, &mut rng)
                 .expect("valid block");
 
-            let total_us =
-                decode_us + timings.collect_us + timings.verify_us + timings.apply_us;
+            let total_us = decode_us + timings.collect_us + timings.verify_us + timings.apply_us;
             eprintln!(
                 "{:>6}  {:>11} {:>11} {:>11} {:>11}  {:>11}  {:>8.1}  {:>9.0}",
                 size,

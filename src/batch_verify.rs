@@ -5,7 +5,48 @@ use ark_ec::pairing::Pairing;
 use ark_ec::VariableBaseMSM;
 use ark_ff::{FftField, Field, PrimeField, Zero};
 use ark_poly::{EvaluationDomain, Radix2EvaluationDomain};
-use ark_std::{ops::Neg, rand::RngCore};
+use ark_std::{
+    ops::Neg,
+    rand::{rngs::StdRng, RngCore, SeedableRng},
+};
+use rayon::prelude::*;
+use std::time::Instant;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BatchVerifyTimings {
+    /// Number of independent batch-verification chunks. Timed sub-phases are
+    /// summed across chunks when this is greater than one.
+    pub partitions: usize,
+    pub challenge_us: u128,
+    pub lagrange_us: u128,
+    pub instance_us: u128,
+    pub sample_rhos_us: u128,
+    pub small_msm_us: u128,
+    pub c_msm_us: u128,
+    pub t_msm_us: u128,
+    pub u_msm_us: u128,
+    pub full_msm_us: u128,
+    pub scalar_accum_us: u128,
+    pub last_left_us: u128,
+    pub pairing_us: u128,
+}
+
+impl BatchVerifyTimings {
+    fn add_assign(&mut self, other: Self) {
+        self.challenge_us += other.challenge_us;
+        self.lagrange_us += other.lagrange_us;
+        self.instance_us += other.instance_us;
+        self.sample_rhos_us += other.sample_rhos_us;
+        self.small_msm_us += other.small_msm_us;
+        self.c_msm_us += other.c_msm_us;
+        self.t_msm_us += other.t_msm_us;
+        self.u_msm_us += other.u_msm_us;
+        self.full_msm_us += other.full_msm_us;
+        self.scalar_accum_us += other.scalar_accum_us;
+        self.last_left_us += other.last_left_us;
+        self.pairing_us += other.pairing_us;
+    }
+}
 
 impl<E: Pairing> ZkPari<E> {
     /// Batch verification of N proofs using a random linear combination.
@@ -34,9 +75,106 @@ impl<E: Pairing> ZkPari<E> {
     where
         E::G1Affine: Neg<Output = E::G1Affine>,
     {
+        Self::batch_verify_inner(proofs_and_inputs, vk, rng, None)
+    }
+
+    /// [`Self::batch_verify`] plus coarse wall-clock timings for profiling.
+    pub fn batch_verify_timed(
+        proofs_and_inputs: &[(Proof<E>, Vec<E::ScalarField>)],
+        vk: &VerifyingKey<E>,
+        rng: &mut impl RngCore,
+    ) -> (bool, BatchVerifyTimings)
+    where
+        E::G1Affine: Neg<Output = E::G1Affine>,
+    {
+        let mut timings = BatchVerifyTimings::default();
+        let accepted = Self::batch_verify_inner(proofs_and_inputs, vk, rng, Some(&mut timings));
+        (accepted, timings)
+    }
+
+    /// Split the claims into up to `num_partitions` contiguous chunks and
+    /// batch-verify those chunks independently in parallel.
+    ///
+    /// This trades one global batch check for several smaller checks: it pays
+    /// one final pairing per non-empty chunk, but lets the per-chunk MSMs run
+    /// concurrently.
+    pub fn batch_verify_partitioned(
+        proofs_and_inputs: &[(Proof<E>, Vec<E::ScalarField>)],
+        vk: &VerifyingKey<E>,
+        rng: &mut impl RngCore,
+        num_partitions: usize,
+    ) -> bool
+    where
+        E::G1Affine: Neg<Output = E::G1Affine>,
+        Proof<E>: Sync,
+        VerifyingKey<E>: Sync,
+    {
+        Self::batch_verify_partitioned_timed(proofs_and_inputs, vk, rng, num_partitions).0
+    }
+
+    /// [`Self::batch_verify_partitioned`] plus per-chunk timing totals.
+    pub fn batch_verify_partitioned_timed(
+        proofs_and_inputs: &[(Proof<E>, Vec<E::ScalarField>)],
+        vk: &VerifyingKey<E>,
+        rng: &mut impl RngCore,
+        num_partitions: usize,
+    ) -> (bool, BatchVerifyTimings)
+    where
+        E::G1Affine: Neg<Output = E::G1Affine>,
+        Proof<E>: Sync,
+        VerifyingKey<E>: Sync,
+    {
+        let n = proofs_and_inputs.len();
+        if n == 0 {
+            return (true, BatchVerifyTimings::default());
+        }
+        let partitions = num_partitions.clamp(1, n);
+        if partitions == 1 {
+            return Self::batch_verify_timed(proofs_and_inputs, vk, rng);
+        }
+
+        let chunk_size = n.div_ceil(partitions);
+        let chunks: Vec<_> = proofs_and_inputs.chunks(chunk_size).collect();
+        let mut seeds = vec![[0u8; 32]; chunks.len()];
+        for seed in &mut seeds {
+            rng.fill_bytes(seed);
+        }
+
+        let results: Vec<_> = chunks
+            .into_par_iter()
+            .zip(seeds.into_par_iter())
+            .map(|(chunk, seed)| {
+                let mut chunk_rng = StdRng::from_seed(seed);
+                Self::batch_verify_timed(chunk, vk, &mut chunk_rng)
+            })
+            .collect();
+
+        let accepted = results.iter().all(|(accepted, _)| *accepted);
+        let mut timings = BatchVerifyTimings {
+            partitions: results.len(),
+            ..BatchVerifyTimings::default()
+        };
+        for (_, chunk_timings) in results {
+            timings.add_assign(chunk_timings);
+        }
+        (accepted, timings)
+    }
+
+    fn batch_verify_inner(
+        proofs_and_inputs: &[(Proof<E>, Vec<E::ScalarField>)],
+        vk: &VerifyingKey<E>,
+        rng: &mut impl RngCore,
+        mut timings: Option<&mut BatchVerifyTimings>,
+    ) -> bool
+    where
+        E::G1Affine: Neg<Output = E::G1Affine>,
+    {
         let n = proofs_and_inputs.len();
         if n == 0 {
             return true;
+        }
+        if let Some(timings) = timings.as_deref_mut() {
+            timings.partitions = 1;
         }
         // Malformed statements and proofs are rejected, not panicked on
         let num_blocks = vk.delta_h_prep.len();
@@ -52,6 +190,7 @@ impl<E: Pairing> ZkPari<E> {
         }
 
         /////////////////////// Challenge computation ///////////////////////
+        let started = timings.as_ref().map(|_| Instant::now());
         let challenges: Vec<E::ScalarField> = {
             let base_transcript = crate::utils::seed_transcript_with_vk::<E>(vk);
             proofs_and_inputs
@@ -66,19 +205,27 @@ impl<E: Pairing> ZkPari<E> {
                 })
                 .collect()
         };
+        if let (Some(timings), Some(started)) = (timings.as_deref_mut(), started) {
+            timings.challenge_us = started.elapsed().as_micros();
+        }
 
         /////////////////////// Per-proof computations ///////////////////////
         let instance_size = vk.succinct_index.instance_len;
         let r1cs_orig_num_cnstrs = vk.succinct_index.num_constraints - instance_size;
 
+        let started = timings.as_ref().map(|_| Instant::now());
         let all_lagrange_coeffs = Self::batch_eval_last_lagrange_coeffs::<E::ScalarField>(
             &vk.domain,
             &challenges,
             r1cs_orig_num_cnstrs,
             instance_size,
         );
+        if let (Some(timings), Some(started)) = (timings.as_deref_mut(), started) {
+            timings.lagrange_us = started.elapsed().as_micros();
+        }
 
         // For each proof k: compute x_A^(k)(r) and v_R^(k) = (x_A + v_a)^2
+        let started = timings.as_ref().map(|_| Instant::now());
         let mut v_rs = Vec::with_capacity(n);
         for ((proof, public_input), lagrange_coeffs) in
             proofs_and_inputs.iter().zip(all_lagrange_coeffs)
@@ -89,10 +236,14 @@ impl<E: Pairing> ZkPari<E> {
                 .fold(E::ScalarField::zero(), |acc, (l, x)| acc + l * x);
             v_rs.push((x_a + proof.v_a).square());
         }
+        if let (Some(timings), Some(started)) = (timings.as_deref_mut(), started) {
+            timings.instance_us = started.elapsed().as_micros();
+        }
 
         /////////////////////// Random linear combination ///////////////////////
         // Sample 128-bit rho <-$ [0, 2^128)^N (sufficient for 2^-128 soundness)
         const SMALL_SCALAR_BITS: usize = 128;
+        let started = timings.as_ref().map(|_| Instant::now());
         let rhos: Vec<E::ScalarField> = (0..n)
             .map(|_| {
                 let mut bytes = [0u8; 16];
@@ -102,11 +253,15 @@ impl<E: Pairing> ZkPari<E> {
             .collect();
         let rho_bigints: Vec<<E::ScalarField as PrimeField>::BigInt> =
             rhos.iter().map(|r| r.into_bigint()).collect();
+        if let (Some(timings), Some(started)) = (timings.as_deref_mut(), started) {
+            timings.sample_rhos_us = started.elapsed().as_micros();
+        }
 
         let t_bases: Vec<E::G1Affine> = proofs_and_inputs.iter().map(|(p, _)| p.t_g).collect();
         let u_bases: Vec<E::G1Affine> = proofs_and_inputs.iter().map(|(p, _)| p.u_g).collect();
 
         // Per block j: C~_j = Sum rho_k * C_ci_j^(k)  [128-bit MSM]
+        let started = timings.as_ref().map(|_| Instant::now());
         let c_tildes: Vec<E::G1Affine> = (0..num_blocks)
             .map(|j| {
                 let c_bases: Vec<E::G1Affine> =
@@ -114,14 +269,28 @@ impl<E: Pairing> ZkPari<E> {
                 msm_pippenger::<E::G1>(&c_bases, &rho_bigints, SMALL_SCALAR_BITS).into()
             })
             .collect();
+        if let (Some(timings), Some(started)) = (timings.as_deref_mut(), started) {
+            timings.c_msm_us = started.elapsed().as_micros();
+        }
 
         // T~, U~ = Sum rho_k * {T, U}^(k)  [128-bit MSMs]
+        let started = timings.as_ref().map(|_| Instant::now());
         let t_tilde: E::G1Affine =
             msm_pippenger::<E::G1>(&t_bases, &rho_bigints, SMALL_SCALAR_BITS).into();
+        if let (Some(timings), Some(started)) = (timings.as_deref_mut(), started) {
+            timings.t_msm_us = started.elapsed().as_micros();
+        }
+
+        let started = timings.as_ref().map(|_| Instant::now());
         let u_tilde: E::G1Affine =
             msm_pippenger::<E::G1>(&u_bases, &rho_bigints, SMALL_SCALAR_BITS).into();
+        if let (Some(timings), Some(started)) = (timings.as_deref_mut(), started) {
+            timings.u_msm_us = started.elapsed().as_micros();
+            timings.small_msm_us = timings.c_msm_us + timings.t_msm_us + timings.u_msm_us;
+        }
 
         // V~ = Sum (rho_k * r^(k)) * U^(k)  [full-size MSM]
+        let started = timings.as_ref().map(|_| Instant::now());
         let rho_r: Vec<E::ScalarField> = rhos
             .iter()
             .zip(&challenges)
@@ -129,8 +298,12 @@ impl<E: Pairing> ZkPari<E> {
             .collect();
         let v_tilde: E::G1Affine =
             <E::G1 as VariableBaseMSM>::msm_unchecked(&u_bases, &rho_r).into();
+        if let (Some(timings), Some(started)) = (timings.as_deref_mut(), started) {
+            timings.full_msm_us = started.elapsed().as_micros();
+        }
 
         // va~ = Sum rho_k * v_a^(k),  vR~ = Sum rho_k * v_R^(k)
+        let started = timings.as_ref().map(|_| Instant::now());
         let v_a_tilde = rhos
             .iter()
             .zip(proofs_and_inputs.iter())
@@ -141,8 +314,12 @@ impl<E: Pairing> ZkPari<E> {
             .iter()
             .zip(&v_rs)
             .fold(E::ScalarField::zero(), |acc, (rho, vr)| acc + *rho * *vr);
+        if let (Some(timings), Some(started)) = (timings.as_deref_mut(), started) {
+            timings.scalar_accum_us = started.elapsed().as_micros();
+        }
 
         /////////////////////// Final multi-pairing check ///////////////////////
+        let started = timings.as_ref().map(|_| Instant::now());
         let last_left: E::G1Affine = msm_bigint_wnaf::<E::G1>(
             &[v_tilde, -vk.alpha_g, -vk.beta_g],
             &[
@@ -152,6 +329,9 @@ impl<E: Pairing> ZkPari<E> {
             ],
         )
         .into();
+        if let (Some(timings), Some(started)) = (timings.as_deref_mut(), started) {
+            timings.last_left_us = started.elapsed().as_micros();
+        }
 
         let mut g1_terms: Vec<E::G1Affine> = c_tildes;
         g1_terms.extend([t_tilde, -u_tilde, last_left]);
@@ -161,7 +341,11 @@ impl<E: Pairing> ZkPari<E> {
             vk.tau_h_prep.clone(),
             vk.h_prep.clone(),
         ]);
+        let started = timings.as_ref().map(|_| Instant::now());
         let result = E::multi_pairing(g1_terms, g2_terms);
+        if let (Some(timings), Some(started)) = (timings.as_deref_mut(), started) {
+            timings.pairing_us = started.elapsed().as_micros();
+        }
 
         result.is_zero()
     }

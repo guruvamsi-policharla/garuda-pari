@@ -52,6 +52,19 @@ fn main() {
         let mut collect_us = Vec::with_capacity(ITERATIONS);
         let mut verify_us = Vec::with_capacity(ITERATIONS);
         let mut apply_us = Vec::with_capacity(ITERATIONS);
+        let mut challenge_us = Vec::with_capacity(ITERATIONS);
+        let mut partitions = Vec::with_capacity(ITERATIONS);
+        let mut lagrange_us = Vec::with_capacity(ITERATIONS);
+        let mut instance_us = Vec::with_capacity(ITERATIONS);
+        let mut sample_rhos_us = Vec::with_capacity(ITERATIONS);
+        let mut small_msm_us = Vec::with_capacity(ITERATIONS);
+        let mut c_msm_us = Vec::with_capacity(ITERATIONS);
+        let mut t_msm_us = Vec::with_capacity(ITERATIONS);
+        let mut u_msm_us = Vec::with_capacity(ITERATIONS);
+        let mut full_msm_us = Vec::with_capacity(ITERATIONS);
+        let mut scalar_accum_us = Vec::with_capacity(ITERATIONS);
+        let mut last_left_us = Vec::with_capacity(ITERATIONS);
+        let mut pairing_us = Vec::with_capacity(ITERATIONS);
         for _ in 0..ITERATIONS {
             let mut ledger = pristine.clone();
 
@@ -65,6 +78,19 @@ fn main() {
             collect_us.push(timings.collect_us);
             verify_us.push(timings.verify_us);
             apply_us.push(timings.apply_us);
+            challenge_us.push(timings.verify_breakdown.challenge_us);
+            partitions.push(timings.verify_breakdown.partitions as u128);
+            lagrange_us.push(timings.verify_breakdown.lagrange_us);
+            instance_us.push(timings.verify_breakdown.instance_us);
+            sample_rhos_us.push(timings.verify_breakdown.sample_rhos_us);
+            small_msm_us.push(timings.verify_breakdown.small_msm_us);
+            c_msm_us.push(timings.verify_breakdown.c_msm_us);
+            t_msm_us.push(timings.verify_breakdown.t_msm_us);
+            u_msm_us.push(timings.verify_breakdown.u_msm_us);
+            full_msm_us.push(timings.verify_breakdown.full_msm_us);
+            scalar_accum_us.push(timings.verify_breakdown.scalar_accum_us);
+            last_left_us.push(timings.verify_breakdown.last_left_us);
+            pairing_us.push(timings.verify_breakdown.pairing_us);
         }
 
         let decode = median(&mut decode_us);
@@ -82,6 +108,24 @@ fn main() {
             total,
             total as f64 / size as f64,
             size as f64 / (total as f64 / 1e6),
+        );
+        println!(
+            "        verify: partitions={:>2} challenge={:>7} lagrange={:>7} instance={:>7} rhos={:>6} \
+             msm128={:>7} (c={:>6} t={:>6} u={:>6}) msm_full={:>7} \
+             scalars={:>6} last={:>6} pairing={:>7}",
+            median(&mut partitions),
+            median(&mut challenge_us),
+            median(&mut lagrange_us),
+            median(&mut instance_us),
+            median(&mut sample_rhos_us),
+            median(&mut small_msm_us),
+            median(&mut c_msm_us),
+            median(&mut t_msm_us),
+            median(&mut u_msm_us),
+            median(&mut full_msm_us),
+            median(&mut scalar_accum_us),
+            median(&mut last_left_us),
+            median(&mut pairing_us),
         );
     }
 }

@@ -17,9 +17,9 @@
 //!   independent randomness at the verifier challenge and at the SRS trapdoor.
 //! - A single Glock-style opening proof accounts for both the ordinary Pari
 //!   commitment and the exposed committed-input commitments, so a proof is
-//!   `(2 + #blocks) G1 + 1 F` elements — and any block commitment the
-//!   verifier can recompute from public state (e.g. an aggregate of ledger
-//!   commitments) need not be transmitted.
+//!   `(2 + #blocks) G1 + 1 F` elements. Applications may use slimmer wire
+//!   formats when a commitment is recomputable, but must reconstruct the full
+//!   `Proof` before verification.
 //!
 //! The scheme is statistically honest-verifier zero-knowledge with simulation
 //! distance at most `1 / (|F| - |K|)`.
@@ -46,16 +46,13 @@
 //!
 //! # Batched private transfers
 //!
-//! Two blocks enable the batched one-to-many transfer of the ZK-Pari note:
-//! the claimed amounts live in block 1 (size `B+1`, transmitted), while block
-//! 2 holds a single random-linear-combination aggregate `v_theta` whose
-//! commitment `com_theta = sum_i theta^{i-1} com_i` the verifier recomputes
-//! from the ledger commitments. The circuit enforces
-//! `sum_i theta^{i-1} v^_i = v_theta` for a Fiat-Shamir challenge `theta`
+//! The batched-transfer example uses two committed-input blocks: the claimed
+//! amounts live in block 1 (size `B+1`), while block 2 holds a single
+//! random-linear-combination aggregate `v_theta`. The circuit enforces
+//! `sum_i theta^{i-1} v_i = v_theta` for a Fiat-Shamir challenge `theta`
 //! bound to the ledger commitments and block-1 commitment, which guarantees
 //! (w.h.p.) that the range-checked claimed amounts equal the committed ledger
-//! amounts. One proof of `3 G1 + 1 F` then covers `B+1` range proofs,
-//! independent of `B`. See `examples/batched_private_transfer.rs`.
+//! amounts. See `examples/batched_private_transfer.rs`.
 
 use ark_ec::pairing::Pairing;
 
@@ -75,6 +72,7 @@ mod verifier;
 #[cfg(test)]
 mod test;
 
+pub use batch_verify::BatchVerifyTimings;
 pub use circuit::{Uncommitted, ZkPariCircuit};
 pub use data_structures::{
     CommittedInputOpening, Proof, ProvingKey, SuccinctIndex, Trapdoor, VerifyingKey,
