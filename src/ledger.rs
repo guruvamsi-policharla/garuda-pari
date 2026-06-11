@@ -36,6 +36,14 @@
 //! - Constantinople re-serializes a 48-byte compressed cache after every
 //!   commitment update (its state codec); [`apply`](Ledger::process_block)
 //!   here stops at the affine point.
+//! - Public `u64` balances are not modeled: the chain additionally rejects
+//!   funds exceeding the sender's public balance and burns overflowing it
+//!   (two integer comparisons — no crypto cost).
+//!
+//! [`decode_block`] is the validating entry point: every point it returns is
+//! subgroup-checked. Callers constructing [`Transaction`]s directly are
+//! responsible for only using validated group elements (fixture-built blocks
+//! are).
 //!
 //! # Fixtures
 //!
@@ -58,8 +66,8 @@ use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::collections::HashMap;
 use ark_std::ops::Neg;
 use ark_std::rand::RngCore;
-use std::time::Instant;
 use ark_std::vec::Vec;
+use std::time::Instant;
 
 /// One recipient per transfer: the batched circuit's `B`.
 const BATCH_SIZE: usize = 1;
@@ -429,9 +437,10 @@ pub fn encode_block<E: Pairing>(transactions: &[Transaction<E>]) -> Vec<u8> {
 /// phase: per transfer, five subgroup-checked uncompressed point reads).
 pub fn decode_block<E: Pairing>(mut bytes: &[u8]) -> Result<Vec<Transaction<E>>, LedgerError> {
     let count = read_u64(&mut bytes)? as usize;
-    // Each transaction is at least 17 bytes (fund tag + ids); cap the
-    // allocation against malformed lengths.
-    if count > bytes.len() / 17 + 1 {
+    // Each transaction is at least a fund (tag + two u64s + one point); cap
+    // the allocation against malformed length prefixes.
+    let min_transaction = 17 + E::G1Affine::zero().uncompressed_size();
+    if count > bytes.len() / min_transaction + 1 {
         return Err(LedgerError::Malformed);
     }
     let mut transactions = Vec::with_capacity(count);
@@ -504,15 +513,16 @@ pub struct Ledger<E: Pairing> {
     pub accounts: HashMap<AccountId, AccountState<E>>,
 }
 
-/// `a + b` in affine, mirroring the chain's per-update normalization cost
-/// (one field inversion per operation).
+/// `a + b` in affine, mirroring the chain's per-update cost exactly: full
+/// projective+projective addition followed by normalization (one field
+/// inversion per operation).
 fn g1_add<E: Pairing>(a: &E::G1Affine, b: &E::G1Affine) -> E::G1Affine {
-    (a.into_group() + b).into_affine()
+    (a.into_group() + b.into_group()).into_affine()
 }
 
 /// `a - b` in affine.
 fn g1_sub<E: Pairing>(a: &E::G1Affine, b: &E::G1Affine) -> E::G1Affine {
-    (a.into_group() - b).into_affine()
+    (a.into_group() - b.into_group()).into_affine()
 }
 
 impl<E: Pairing> Ledger<E> {
@@ -733,7 +743,10 @@ impl<E: Pairing> ClientBalance<E> {
     /// Funding adds a zero-blinding public commitment: value moves, the
     /// opening is unchanged.
     pub fn fund(&mut self, value: u64) {
-        self.value += value;
+        self.value = self
+            .value
+            .checked_add(value)
+            .expect("client balance must stay within the 64-bit range invariant");
     }
 
     /// Splits off `amount` with fresh blinding, leaving the remainder. The
@@ -914,7 +927,10 @@ impl<'a, E: Pairing> Fixture<'a, E> {
         let client = &mut self.clients[sender as usize];
         let input = client.commitment(self.params);
         // A burn's "amount" is the public commit(value): zero blinding.
-        let remaining = client.value - value;
+        let remaining = client
+            .value
+            .checked_sub(value)
+            .expect("fixture burn must not exceed the client balance");
         let r_remaining = client.opening.clone();
         client.value = remaining;
         let amount_com = self.params.commit(value);

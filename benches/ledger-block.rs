@@ -24,7 +24,7 @@ use zkpari::ledger::{decode_block, encode_block, Fixture, LedgerParams};
 
 type E = Bls12_381;
 
-const SIZES: &[usize] = &[64, 256, 1024, 4096];
+const SIZES: &[usize] = &[64, 256, 512];
 const ITERATIONS: usize = 5;
 
 fn main() {

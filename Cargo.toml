@@ -24,37 +24,6 @@ rayon = { version = "1.5.2" }
 # Curves for tests, examples, and benchmarks
 ark-bls12-381 = { version = "^0.5.0", default-features = false, features = ["curve"] }
 ark-bn254 = { version = "^0.5.0", default-features = false, features = ["curve"] }
-# Rescue circuit for the benchmarks
-ark-crypto-primitives = { git = "https://github.com/arkworks-rs/crypto-primitives.git", default-features = false, features = [
-    "constraints",
-    "snark",
-    "crh",
-] }
-ark-r1cs-std = { git = "https://github.com/arkworks-rs/r1cs-std.git", default-features = false, features = ["std"] }
-num-bigint = "0.4"
-# Benchmark result CSV output
-csv = "1.2"
-serde_json = "1.0"
-
-[[bench]]
-name = "rescue-pari"
-path = "benches/rescue-pari.rs"
-harness = false
-
-[[bench]]
-name = "batch-verify-pari"
-path = "benches/batch-verify-pari.rs"
-harness = false
-
-[[bench]]
-name = "parallel-batch-verify-pari"
-path = "benches/parallel-batch-verify-pari.rs"
-harness = false
-
-[[bench]]
-name = "prove-verify-compare"
-path = "benches/prove-verify-compare.rs"
-harness = false
 
 [[bench]]
 name = "ledger-block"
