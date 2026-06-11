@@ -1,11 +1,11 @@
 use crate::data_structures::{Proof, VerifyingKey};
+use crate::utils::{batch_inversion_and_mul, msm_bigint_wnaf, msm_pippenger};
 use crate::ZkPari;
 use ark_ec::pairing::Pairing;
 use ark_ec::VariableBaseMSM;
 use ark_ff::{FftField, Field, PrimeField, Zero};
 use ark_poly::{EvaluationDomain, Radix2EvaluationDomain};
 use ark_std::{ops::Neg, rand::RngCore};
-use crate::utils::{batch_inversion_and_mul, msm_bigint_wnaf, msm_pippenger};
 
 impl<E: Pairing> ZkPari<E> {
     /// Batch verification of N proofs using a random linear combination.
@@ -34,21 +34,86 @@ impl<E: Pairing> ZkPari<E> {
     where
         E::G1Affine: Neg<Output = E::G1Affine>,
     {
+        Self::batch_verify_inner(proofs_and_inputs, None, vk, rng)
+    }
+
+    /// Like [`Self::batch_verify`], but the **last** committed-input block of
+    /// every proof is *derived*: it is not transmitted (each `proof.c_ci`
+    /// holds only the first `num_blocks - 1` commitments), it is excluded
+    /// from the per-proof Fiat-Shamir challenge, and the verifier supplies it
+    /// as a linear combination `sum_i coeff_i * base_i` per proof. Its
+    /// contribution to the batched pairing is folded into a single MSM across
+    /// all proofs:
+    ///
+    /// ```text
+    /// C~_last = sum_k rho_k * (sum_i coeff_{k,i} * base_{k,i})
+    /// ```
+    ///
+    /// so the derived commitments are never materialized as points.
+    ///
+    /// # Soundness contract
+    ///
+    /// The caller MUST compute `derived_terms` itself from material that is
+    /// absorbed into the challenge (public inputs and transmitted
+    /// commitments), bound through a collision-resistant hash — never accept
+    /// the terms or coefficients from the prover directly. The bases must be
+    /// validated prime-order subgroup elements. Under that contract the
+    /// derived commitment is fixed before the challenge is revealed, exactly
+    /// as if it had been absorbed, and the random linear combination keeps
+    /// the standard `2^-128` batching soundness.
+    pub fn batch_verify_derived_tail(
+        proofs_and_inputs: &[(Proof<E>, Vec<E::ScalarField>)],
+        derived_terms: &[Vec<(E::G1Affine, E::ScalarField)>],
+        vk: &VerifyingKey<E>,
+        rng: &mut impl RngCore,
+    ) -> bool
+    where
+        E::G1Affine: Neg<Output = E::G1Affine>,
+    {
+        Self::batch_verify_inner(proofs_and_inputs, Some(derived_terms), vk, rng)
+    }
+
+    fn batch_verify_inner(
+        proofs_and_inputs: &[(Proof<E>, Vec<E::ScalarField>)],
+        derived_terms: Option<&[Vec<(E::G1Affine, E::ScalarField)>]>,
+        vk: &VerifyingKey<E>,
+        rng: &mut impl RngCore,
+    ) -> bool
+    where
+        E::G1Affine: Neg<Output = E::G1Affine>,
+    {
         let n = proofs_and_inputs.len();
         if n == 0 {
             return true;
         }
-        if n == 1 {
-            return Self::verify(&proofs_and_inputs[0].0, vk, &proofs_and_inputs[0].1);
-        }
         // Malformed statements and proofs are rejected, not panicked on
         let num_blocks = vk.delta_h_prep.len();
+        let transmitted_blocks = num_blocks - usize::from(derived_terms.is_some());
         let instance_len = vk.succinct_index.instance_len;
         if proofs_and_inputs
             .iter()
-            .any(|(p, x)| p.c_ci.len() != num_blocks || x.len() != instance_len - 1)
+            .any(|(p, x)| p.c_ci.len() != transmitted_blocks || x.len() != instance_len - 1)
         {
             return false;
+        }
+        if derived_terms.is_some_and(|terms| terms.len() != n) {
+            return false;
+        }
+        if n == 1 {
+            return match derived_terms {
+                None => Self::verify(&proofs_and_inputs[0].0, vk, &proofs_and_inputs[0].1),
+                Some(terms) => {
+                    // Materialize the single derived commitment and check the
+                    // full pairing equation with the derived-tail challenge.
+                    let (bases, coeffs): (Vec<E::G1Affine>, Vec<E::ScalarField>) =
+                        terms[0].iter().copied().unzip();
+                    let derived: E::G1Affine =
+                        <E::G1 as VariableBaseMSM>::msm_unchecked(&bases, &coeffs).into();
+                    let mut proof = proofs_and_inputs[0].0.clone();
+                    proof.c_ci.push(derived);
+                    Self::verify_derived(&proof, vk, &proofs_and_inputs[0].1, 1)
+                }
+            };
         }
 
         /////////////////////// Challenge computation ///////////////////////
@@ -106,14 +171,30 @@ impl<E: Pairing> ZkPari<E> {
         let t_bases: Vec<E::G1Affine> = proofs_and_inputs.iter().map(|(p, _)| p.t_g).collect();
         let u_bases: Vec<E::G1Affine> = proofs_and_inputs.iter().map(|(p, _)| p.u_g).collect();
 
-        // Per block j: C~_j = Sum rho_k * C_ci_j^(k)  [128-bit MSM]
-        let c_tildes: Vec<E::G1Affine> = (0..num_blocks)
+        // Per transmitted block j: C~_j = Sum rho_k * C_ci_j^(k)  [128-bit MSM]
+        let mut c_tildes: Vec<E::G1Affine> = (0..transmitted_blocks)
             .map(|j| {
                 let c_bases: Vec<E::G1Affine> =
                     proofs_and_inputs.iter().map(|(p, _)| p.c_ci[j]).collect();
                 msm_pippenger::<E::G1>(&c_bases, &rho_bigints, SMALL_SCALAR_BITS).into()
             })
             .collect();
+
+        // Derived last block: C~_last = Sum_k rho_k * (Sum_i coeff_i base_i),
+        // folded into ONE full-width MSM over every proof's terms instead of
+        // materializing each derived commitment with its own scalar mul.
+        if let Some(terms) = derived_terms {
+            let total: usize = terms.iter().map(Vec::len).sum();
+            let mut bases = Vec::with_capacity(total);
+            let mut scalars = Vec::with_capacity(total);
+            for (rho, proof_terms) in rhos.iter().zip(terms) {
+                for (base, coeff) in proof_terms {
+                    bases.push(*base);
+                    scalars.push(*rho * *coeff);
+                }
+            }
+            c_tildes.push(<E::G1 as VariableBaseMSM>::msm_unchecked(&bases, &scalars).into());
+        }
 
         // T~, U~ = Sum rho_k * {T, U}^(k)  [128-bit MSMs]
         let t_tilde: E::G1Affine =

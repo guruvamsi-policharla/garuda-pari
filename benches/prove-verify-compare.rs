@@ -58,8 +58,7 @@ fn main() {
         let start = Instant::now();
         let mut proof = None;
         for _ in 0..prove_iters {
-            proof =
-                Some(ZkPari::<E>::prove(Uncommitted(circuit.clone()), &pk, &mut rng).unwrap());
+            proof = Some(ZkPari::<E>::prove(Uncommitted(circuit.clone()), &pk, &mut rng).unwrap());
         }
         let prove_ms = start.elapsed().as_secs_f64() * 1000.0 / prove_iters as f64;
         let proof = proof.unwrap();

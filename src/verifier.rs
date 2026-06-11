@@ -1,11 +1,11 @@
 use crate::data_structures::{Proof, VerifyingKey};
 use crate::utils::compute_chall;
+use crate::utils::{batch_inversion_and_mul, msm_bigint_wnaf};
 use crate::ZkPari;
 use ark_ec::pairing::Pairing;
 use ark_ff::{FftField, Field, Zero};
 use ark_poly::{EvaluationDomain, Radix2EvaluationDomain};
 use ark_std::{end_timer, ops::Neg, start_timer};
-use crate::utils::{batch_inversion_and_mul, msm_bigint_wnaf};
 
 impl<E: Pairing> ZkPari<E> {
     /// Verify a proof against the ordinary public input.
@@ -28,9 +28,50 @@ impl<E: Pairing> ZkPari<E> {
     where
         E::G1Affine: Neg<Output = E::G1Affine>,
     {
+        Self::verify_inner(proof, vk, public_input, 0)
+    }
+
+    /// Like [`Self::verify`], but the last `num_derived_tail` commitments in
+    /// `proof.c_ci` are excluded from the Fiat-Shamir challenge (they still
+    /// participate in the pairing equation). Use with proofs produced by
+    /// [`Self::prove_with_openings_derived`] / [`Self::simulate_derived`].
+    ///
+    /// # Soundness contract
+    ///
+    /// The caller MUST have computed the derived commitments itself from
+    /// material that is absorbed into the challenge (the public input and the
+    /// transmitted commitments), bound through a collision-resistant hash —
+    /// never taken them from the prover. Otherwise a prover could choose them
+    /// after seeing the challenge and Fiat-Shamir soundness is lost.
+    pub fn verify_derived(
+        proof: &Proof<E>,
+        vk: &VerifyingKey<E>,
+        public_input: &[E::ScalarField],
+        num_derived_tail: usize,
+    ) -> bool
+    where
+        E::G1Affine: Neg<Output = E::G1Affine>,
+    {
+        Self::verify_inner(proof, vk, public_input, num_derived_tail)
+    }
+
+    fn verify_inner(
+        proof: &Proof<E>,
+        vk: &VerifyingKey<E>,
+        public_input: &[E::ScalarField],
+        num_derived_tail: usize,
+    ) -> bool
+    where
+        E::G1Affine: Neg<Output = E::G1Affine>,
+    {
         let timer_verify =
             start_timer!(|| format!("Verification (|x|= {})", vk.succinct_index.instance_len));
-        let Proof { c_ci, t_g, u_g, v_a } = proof;
+        let Proof {
+            c_ci,
+            t_g,
+            u_g,
+            v_a,
+        } = proof;
         // Malformed statements and proofs are rejected, not panicked on
         if public_input.len() != vk.succinct_index.instance_len - 1 {
             return false;
@@ -39,10 +80,18 @@ impl<E: Pairing> ZkPari<E> {
         if c_ci.len() != vk.delta_h_prep.len() {
             return false;
         }
+        if num_derived_tail > c_ci.len() {
+            return false;
+        }
 
         /////////////////////// Challenge Computation ///////////////////////
         let timer_transcript_init = start_timer!(|| "Computing Challenge");
-        let challenge = compute_chall::<E>(vk, public_input, c_ci, t_g);
+        let challenge = compute_chall::<E>(
+            vk,
+            public_input,
+            &c_ci[..c_ci.len() - num_derived_tail],
+            t_g,
+        );
         end_timer!(timer_transcript_init);
 
         /////////////////////// Computing x_A(r) ///////////////////////

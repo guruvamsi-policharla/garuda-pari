@@ -66,7 +66,9 @@ mod batch_verify;
 mod circuit;
 pub mod data_structures;
 mod generator;
+pub mod ledger;
 mod prover;
+mod simulator;
 pub mod utils;
 mod verifier;
 
@@ -74,7 +76,9 @@ mod verifier;
 mod test;
 
 pub use circuit::{Uncommitted, ZkPariCircuit};
-pub use data_structures::{CommittedInputOpening, Proof, ProvingKey, SuccinctIndex, VerifyingKey};
+pub use data_structures::{
+    CommittedInputOpening, Proof, ProvingKey, SuccinctIndex, Trapdoor, VerifyingKey,
+};
 
 /// The ZK-Pari SNARK.
 pub struct ZkPari<E: Pairing> {

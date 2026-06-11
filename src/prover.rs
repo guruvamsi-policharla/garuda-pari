@@ -1,6 +1,9 @@
 use std::rc::Rc;
 
-use crate::circuit::{blocks_to_witness_indices, ZkPariCircuit};
+use crate::circuit::{
+    blocks_to_witness_indices, r1cs_conversion_witness_map, remap_blocks_through_conversion,
+    ZkPariCircuit,
+};
 use crate::data_structures::{CommittedInputOpening, Proof, ProvingKey};
 use crate::utils::compute_chall;
 use crate::ZkPari;
@@ -15,7 +18,7 @@ use ark_relations::{
         self,
         instance_outliner::{outline_sr1cs, InstanceOutliner},
         predicate::polynomial_constraint::SR1CS_PREDICATE_LABEL,
-        ConstraintSystem, Matrix, OptimizationGoal, SynthesisError,
+        ConstraintSystem, Matrix, OptimizationGoal, SynthesisError, R1CS_PREDICATE_LABEL,
     },
     sr1cs::Sr1csAdapter,
 };
@@ -38,7 +41,7 @@ impl<E: Pairing> ZkPari<E> {
         let openings: Vec<CommittedInputOpening<E::ScalarField>> = (0..pk.sigma_ci.len())
             .map(|_| CommittedInputOpening::rand(rng))
             .collect();
-        Self::prove_inner(circuit, pk, &openings, rng)
+        Self::prove_inner(circuit, pk, &openings, 0, rng)
     }
 
     /// Produce a proof with caller-supplied openings `rho_ci_j` (one per
@@ -58,13 +61,40 @@ impl<E: Pairing> ZkPari<E> {
     where
         E::ScalarField: Field,
     {
-        Self::prove_inner(circuit, pk, openings, rng)
+        Self::prove_inner(circuit, pk, openings, 0, rng)
+    }
+
+    /// Like [`Self::prove_with_openings`], but the last `num_derived_tail`
+    /// committed-input commitments are **excluded from the Fiat-Shamir
+    /// challenge**, matching [`Self::verify_derived`] /
+    /// [`Self::batch_verify_derived_tail`] on the verifier side.
+    ///
+    /// # Soundness contract
+    ///
+    /// Excluding a commitment from the challenge is sound **only** when that
+    /// commitment is a binding, deterministic function of material that *is*
+    /// absorbed (the public input and the remaining commitments) — e.g. the
+    /// verifier recomputes it as a linear combination of ledger commitments
+    /// with coefficients fixed by a public input that was itself derived by
+    /// hashing those commitments. The caller owns that binding argument.
+    pub fn prove_with_openings_derived<C: ZkPariCircuit<E::ScalarField>, R: RngCore>(
+        circuit: C,
+        pk: &ProvingKey<E>,
+        openings: &[CommittedInputOpening<E::ScalarField>],
+        num_derived_tail: usize,
+        rng: &mut R,
+    ) -> Result<Proof<E>, SynthesisError>
+    where
+        E::ScalarField: Field,
+    {
+        Self::prove_inner(circuit, pk, openings, num_derived_tail, rng)
     }
 
     fn prove_inner<C: ZkPariCircuit<E::ScalarField>, R: RngCore>(
         circuit: C,
         pk: &ProvingKey<E>,
         openings: &[CommittedInputOpening<E::ScalarField>],
+        num_derived_tail: usize,
         rng: &mut R,
     ) -> Result<Proof<E>, SynthesisError>
     where
@@ -191,17 +221,16 @@ impl<E: Pairing> ZkPari<E> {
         // Cross-check the expansion against the definitional computation
         #[cfg(debug_assertions)]
         {
-            let mask_poly = |poly: &DensePolynomial<E::ScalarField>,
-                             c0: E::ScalarField,
-                             c1: E::ScalarField| {
-                let mut coeffs = poly.coeffs.clone();
-                coeffs.resize(coeffs.len().max(domain_size + 2), E::ScalarField::zero());
-                coeffs[0] -= c0;
-                coeffs[1] -= c1;
-                coeffs[domain_size] += c0;
-                coeffs[domain_size + 1] += c1;
-                DensePolynomial::from_coefficients_vec(coeffs)
-            };
+            let mask_poly =
+                |poly: &DensePolynomial<E::ScalarField>, c0: E::ScalarField, c1: E::ScalarField| {
+                    let mut coeffs = poly.coeffs.clone();
+                    coeffs.resize(coeffs.len().max(domain_size + 2), E::ScalarField::zero());
+                    coeffs[0] -= c0;
+                    coeffs[1] -= c1;
+                    coeffs[domain_size] += c0;
+                    coeffs[domain_size + 1] += c1;
+                    DensePolynomial::from_coefficients_vec(coeffs)
+                };
             let z_a_masked = mask_poly(&z_a_hat_check, eta_1, eta_2);
             let z_b_masked = mask_poly(&z_b_hat_check, rho_ci, E::ScalarField::zero());
             let (q_check, rem) =
@@ -241,9 +270,9 @@ impl<E: Pairing> ZkPari<E> {
         {
             let block_values: Vec<E::ScalarField> =
                 block.iter().map(|&w| witness_assignment[w]).collect();
-            let c_ci_j: E::G1Affine =
-                (E::G1::msm_unchecked(sigma_ci_j, &block_values) + *gamma_ci_j * opening.rho)
-                    .into();
+            let c_ci_j: E::G1Affine = (E::G1::msm_unchecked(sigma_ci_j, &block_values)
+                + *gamma_ci_j * opening.rho)
+                .into();
             c_cis.push(c_ci_j);
         }
 
@@ -271,17 +300,23 @@ impl<E: Pairing> ZkPari<E> {
             &[pk.sigma_mask_const, pk.sigma_mask_linear],
             &[eta_1, eta_2],
         );
-        let t_q =
-            E::G1::msm_unchecked(&pk.sigma_q_comm[..q_tilde.coeffs.len()], &q_tilde.coeffs);
+        let t_q = E::G1::msm_unchecked(&pk.sigma_q_comm[..q_tilde.coeffs.len()], &q_tilde.coeffs);
         let t: E::G1Affine = (t_w + t_mask + t_q).into();
         end_timer!(timer_batch_commit);
 
         /////////////////////// Computing the challenge ///////////////////////
         let timer_init_transcript = start_timer!(|| "Computing Challenge");
+        // Derived-tail commitments are bound transitively by the caller (see
+        // `prove_with_openings_derived`) and excluded from the transcript.
+        assert!(
+            num_derived_tail <= c_cis.len(),
+            "cannot derive more blocks than exist"
+        );
+        let absorbed = c_cis.len() - num_derived_tail;
         let challenge = compute_chall::<E>(
             &pk.verifying_key,
             &instance_assignment[1..].to_vec(),
-            &c_cis,
+            &c_cis[..absorbed],
             &t,
         );
         end_timer!(timer_init_transcript);
@@ -341,8 +376,10 @@ impl<E: Pairing> ZkPari<E> {
         let timer_msms = start_timer!(|| "Computing the opening MSMs");
         debug_assert!(witness_a.coeffs.len() <= pk.sigma_a.len());
         debug_assert!(witness_r.coeffs.len() <= pk.sigma_r.len());
-        let w_a_proof = E::G1::msm_unchecked(&pk.sigma_a[..witness_a.coeffs.len()], &witness_a.coeffs);
-        let w_r_proof = E::G1::msm_unchecked(&pk.sigma_r[..witness_r.coeffs.len()], &witness_r.coeffs);
+        let w_a_proof =
+            E::G1::msm_unchecked(&pk.sigma_a[..witness_a.coeffs.len()], &witness_a.coeffs);
+        let w_r_proof =
+            E::G1::msm_unchecked(&pk.sigma_r[..witness_r.coeffs.len()], &witness_r.coeffs);
         let u: E::G1Affine = (w_a_proof + w_r_proof).into();
         end_timer!(timer_msms);
         end_timer!(timer_opening);
@@ -375,7 +412,7 @@ impl<E: Pairing> ZkPari<E> {
         let cs: gr1cs::ConstraintSystemRef<E::ScalarField> = ConstraintSystem::new_ref();
         cs.set_optimization_goal(OptimizationGoal::Constraints);
         let blocks = circuit.synthesize(cs.clone())?;
-        let block_indices = blocks_to_witness_indices(&blocks);
+        let mut block_indices = blocks_to_witness_indices(&blocks);
         end_timer!(timer_synthesize_circuit);
         let timer_inlining = start_timer!(|| "Inlining constraints");
         cs.finalize();
@@ -383,16 +420,46 @@ impl<E: Pairing> ZkPari<E> {
 
         let sr1cs_timer = start_timer!(|| "Convert to SR1CS");
         // Circuits that natively register the SR1CS predicate skip the R1CS-to-SR1CS conversion.
-        // Both the conversion and the instance outlining only append witness
-        // variables, so the declared indices stay valid.
+        // The conversion does NOT preserve witness indices (it rebuilds the
+        // witness space by first use, interleaved with square variables and
+        // public-input copies), so the declared committed-input indices are
+        // remapped into the converted numbering — the same remapping keygen
+        // applied. The subsequent instance outlining only appends witness
+        // variables, so the (remapped) indices stay valid through it.
         let native_sr1cs = cs.has_predicate(SR1CS_PREDICATE_LABEL);
         let mut sr1cs_inner = if native_sr1cs {
             cs.into_inner().unwrap()
         } else {
-            let sr1cs_cs =
-                Sr1csAdapter::r1cs_to_sr1cs_with_assignment(&mut cs.into_inner().unwrap())
-                    .unwrap();
-            sr1cs_cs.into_inner().unwrap()
+            let conversion_map = r1cs_conversion_witness_map(
+                &cs.to_matrices().unwrap()[R1CS_PREDICATE_LABEL],
+                cs.num_instance_variables(),
+            );
+            let mut inner = cs.into_inner().unwrap();
+            let declared_values: Vec<Vec<E::ScalarField>> = block_indices
+                .iter()
+                .map(|block| {
+                    block
+                        .iter()
+                        .map(|&w| inner.assignments.witness_assignment[w])
+                        .collect()
+                })
+                .collect();
+            block_indices = remap_blocks_through_conversion(&block_indices, &conversion_map);
+            let sr1cs_cs = Sr1csAdapter::r1cs_to_sr1cs_with_assignment(&mut inner).unwrap();
+            let sr1cs_inner = sr1cs_cs.into_inner().unwrap();
+            // The remapped indices must carry the declared variables' values;
+            // this catches any drift between the adapter's allocation order
+            // and r1cs_conversion_witness_map.
+            for (block, values) in block_indices.iter().zip(&declared_values) {
+                for (&w, value) in block.iter().zip(values) {
+                    assert_eq!(
+                        sr1cs_inner.assignments.witness_assignment[w], *value,
+                        "R1CS-to-SR1CS conversion witness map out of sync with the adapter's \
+                         allocation order"
+                    );
+                }
+            }
+            sr1cs_inner
         };
 
         sr1cs_inner

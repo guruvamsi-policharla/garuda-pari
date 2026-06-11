@@ -18,14 +18,12 @@ use ark_ec::{AffineRepr, CurveGroup};
 use ark_ff::Field;
 use ark_relations::gr1cs::predicate::polynomial_constraint::SR1CS_PREDICATE_LABEL;
 use ark_relations::gr1cs::predicate::PredicateConstraintSystem;
-use ark_relations::gr1cs::{
-    ConstraintSystemRef, R1CS_PREDICATE_LABEL, SynthesisError, Variable,
-};
+use ark_relations::gr1cs::{ConstraintSystemRef, SynthesisError, Variable, R1CS_PREDICATE_LABEL};
 use ark_relations::lc;
 use ark_serialize::CanonicalSerialize;
 use ark_std::rand::SeedableRng;
-use zkpari::{CommittedInputOpening, ZkPari, ZkPariCircuit};
 use std::time::Instant;
+use zkpari::{CommittedInputOpening, ZkPari, ZkPariCircuit};
 
 // ---------------------------------------------------------------------------
 // Range proof circuit (native SR1CS)
@@ -223,9 +221,15 @@ fn main() {
     println!("   Proving done: {delta_prove_ms:.1} ms + {remaining_prove_ms:.1} ms");
 
     let proof_size = proof_delta.c_ci[0].serialized_size(ark_serialize::Compress::Yes)
-        + proof_delta.t_g.serialized_size(ark_serialize::Compress::Yes)
-        + proof_delta.u_g.serialized_size(ark_serialize::Compress::Yes)
-        + proof_delta.v_a.serialized_size(ark_serialize::Compress::Yes);
+        + proof_delta
+            .t_g
+            .serialized_size(ark_serialize::Compress::Yes)
+        + proof_delta
+            .u_g
+            .serialized_size(ark_serialize::Compress::Yes)
+        + proof_delta
+            .v_a
+            .serialized_size(ark_serialize::Compress::Yes);
     println!(
         "   Proof size: {proof_size} bytes (C_ci, T, U, v_a) = 3 G1 + 1 F;\n   \
          C_ci is ledger state, so the incremental proof is 2 G1 + 1 F\n"
@@ -283,8 +287,7 @@ fn main() {
     // Bob learns (amount, delta opening) out of band; the paper's eVRF-based
     // randomness recovery makes this non-interactive.
     bob.balance += transfer_amount;
-    bob.commitment =
-        (bob.commitment.into_group() + proof_delta.c_ci[0].into_group()).into_affine();
+    bob.commitment = (bob.commitment.into_group() + proof_delta.c_ci[0].into_group()).into_affine();
     bob.opening = &bob.opening + &delta_opening;
 
     // Both updated commitments must be consistent with the new balances

@@ -56,6 +56,11 @@ name = "prove-verify-compare"
 path = "benches/prove-verify-compare.rs"
 harness = false
 
+[[bench]]
+name = "ledger-block"
+path = "benches/ledger-block.rs"
+harness = false
+
 [features]
 default = ["std", "parallel"]
 std = ["ark-ff/std", "ark-poly/std", "ark-relations/std", "ark-std/std", "ark-serialize/std"]

@@ -1,6 +1,8 @@
 use ark_ff::Field;
-use ark_relations::gr1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError, Variable};
-use ark_std::collections::BTreeSet;
+use ark_relations::gr1cs::{
+    ConstraintSynthesizer, ConstraintSystemRef, Matrix, SynthesisError, Variable,
+};
+use ark_std::collections::{BTreeMap, BTreeSet};
 
 /// A circuit for ZK-Pari: synthesizes constraints and *declares* its
 /// committed-input blocks.
@@ -37,6 +39,81 @@ impl<F: Field, C: ConstraintSynthesizer<F>> ZkPariCircuit<F> for Uncommitted<C> 
         self.0.generate_constraints(cs)?;
         Ok(Vec::new())
     }
+}
+
+/// Witness-index map of `Sr1csAdapter::r1cs_to_sr1cs[_with_assignment]`:
+/// old witness index -> witness index in the converted constraint system.
+///
+/// The adapter does *not* preserve witness indices: it rebuilds the witness
+/// space from scratch, scanning the R1CS rows in order (per row: the A-,
+/// then B-, then C-side linear combination, terms in order) and allocating
+/// the next new witness index to each previously unseen variable — original
+/// *instance* variables included, since they get witness copies — followed
+/// by one fresh square witness per row. This function replays that scan over
+/// the same matrices the adapter reads, so declared committed-input indices
+/// can be remapped into the converted numbering. The prover cross-checks the
+/// result against the converted assignment, so any upstream change to the
+/// adapter's allocation order fails loudly there.
+pub(crate) fn r1cs_conversion_witness_map<F: Field>(
+    r1cs_matrices: &[Matrix<F>],
+    num_instance: usize,
+) -> BTreeMap<usize, usize> {
+    let num_rows = r1cs_matrices.iter().map(Vec::len).min().unwrap_or(0);
+    // Old absolute variable index -> new witness index
+    let mut new_index: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut next = 0usize;
+    for row in 0..num_rows {
+        for matrix in r1cs_matrices {
+            for &(_, index) in &matrix[row] {
+                // Variable::One stays Variable::One; everything else gets a
+                // new witness on first use
+                if index == 0 {
+                    continue;
+                }
+                new_index.entry(index).or_insert_with(|| {
+                    let assigned = next;
+                    next += 1;
+                    assigned
+                });
+            }
+        }
+        // The adapter allocates one square witness per R1CS row
+        next += 1;
+    }
+    // Keep only the original witnesses, rebased to witness-vector indices
+    new_index
+        .into_iter()
+        .filter(|&(old, _)| old >= num_instance)
+        .map(|(old, new)| (old - num_instance, new))
+        .collect()
+}
+
+/// Remap declared committed-input blocks through the R1CS-to-SR1CS
+/// conversion's witness map (see [`r1cs_conversion_witness_map`]).
+///
+/// Panics if a declared variable appears in no constraint: it then has no
+/// column in the converted system, so no commitment basis element exists
+/// for it and the commitment would silently ignore the value.
+pub(crate) fn remap_blocks_through_conversion(
+    blocks: &[Vec<usize>],
+    map: &BTreeMap<usize, usize>,
+) -> Vec<Vec<usize>> {
+    blocks
+        .iter()
+        .map(|block| {
+            block
+                .iter()
+                .map(|w| {
+                    *map.get(w).unwrap_or_else(|| {
+                        panic!(
+                            "committed input (witness variable {w}) does not appear in any \
+                             constraint; it has no column in the converted SR1CS system"
+                        )
+                    })
+                })
+                .collect()
+        })
+        .collect()
 }
 
 /// Convert declared blocks of [`Variable`]s into blocks of witness indices,

@@ -15,8 +15,8 @@ use ark_std::{
     rand::{RngCore, SeedableRng},
     test_rng,
 };
-use zkpari::{Uncommitted, ZkPari};
 use rayon::ThreadPoolBuilder;
+use zkpari::{Uncommitted, ZkPari};
 mod common;
 use common::{create_test_rescue_parameter, BenchResult, RescueDemo};
 use std::env;

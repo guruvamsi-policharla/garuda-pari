@@ -6,7 +6,7 @@ use ark_ec::{AffineRepr, CurveGroup};
 use ark_ff::{Field, UniformRand};
 use ark_relations::gr1cs::{
     predicate::{polynomial_constraint::SR1CS_PREDICATE_LABEL, PredicateConstraintSystem},
-    ConstraintSynthesizer, ConstraintSystemRef, R1CS_PREDICATE_LABEL, SynthesisError, Variable,
+    ConstraintSynthesizer, ConstraintSystemRef, SynthesisError, Variable, R1CS_PREDICATE_LABEL,
 };
 use ark_relations::lc;
 use ark_std::rand::{RngCore, SeedableRng};
@@ -205,13 +205,12 @@ impl<F: Field> ZkPariCircuit<F> for BatchedRangeCircuit<F> {
             }
             _ => None,
         };
-        let v_theta_var = cs
-            .new_witness_variable(|| v_theta_value.ok_or(SynthesisError::AssignmentMissing))?;
+        let v_theta_var =
+            cs.new_witness_variable(|| v_theta_value.ok_or(SynthesisError::AssignmentMissing))?;
 
         // theta is an ordinary public input (chosen after the ledger
         // commitments and the block-1 commitment are fixed)
-        let theta_var =
-            cs.new_input_variable(|| theta.ok_or(SynthesisError::AssignmentMissing))?;
+        let theta_var = cs.new_input_variable(|| theta.ok_or(SynthesisError::AssignmentMissing))?;
 
         // 64-bit range check for every committed value
         for (i, &v) in value_vars.iter().enumerate() {
@@ -297,13 +296,16 @@ fn roundtrip(spec: CommitSpec, expected_blocks: usize) {
         b: Some(b_val),
         spec,
     };
-    let (pk, vk): (ProvingKey<E>, VerifyingKey<E>) =
-        ZkPari::<E>::keygen(circuit.clone(), &mut rng);
+    let (pk, vk): (ProvingKey<E>, VerifyingKey<E>) = ZkPari::<E>::keygen(circuit.clone(), &mut rng);
     let proof: Proof<E> = ZkPari::prove(circuit, &pk, &mut rng).unwrap();
     assert_eq!(proof.c_ci.len(), expected_blocks);
     assert!(ZkPari::<E>::verify(&proof, &vk, &[a_val * b_val]));
     // Wrong public input must be rejected
-    assert!(!ZkPari::<E>::verify(&proof, &vk, &[a_val * b_val + Fr::ONE]));
+    assert!(!ZkPari::<E>::verify(
+        &proof,
+        &vk,
+        &[a_val * b_val + Fr::ONE]
+    ));
 }
 
 #[test]
@@ -365,13 +367,9 @@ fn committed_input_pedersen_consistency() {
     let opening = CommittedInputOpening::<Fr>::rand(&mut rng);
     let expected_commitment = pk.pedersen_commit(0, &[a_val, b_val], &opening);
 
-    let proof = ZkPari::<E>::prove_with_openings(
-        circuit,
-        &pk,
-        core::slice::from_ref(&opening),
-        &mut rng,
-    )
-    .unwrap();
+    let proof =
+        ZkPari::<E>::prove_with_openings(circuit, &pk, core::slice::from_ref(&opening), &mut rng)
+            .unwrap();
     assert_eq!(proof.c_ci[0], expected_commitment);
     assert!(ZkPari::<E>::verify(&proof, &vk, &[a_val * b_val]));
 
@@ -396,6 +394,88 @@ fn committed_input_pedersen_consistency() {
         pk2.pedersen_commit(1, &[b_val], &openings[1])
     );
     assert!(ZkPari::<E>::verify(&proof2, &vk2, &[a_val * b_val]));
+}
+
+/// Derived-tail flow: the last block's commitment is excluded from the
+/// challenge on both sides, the batch verifier folds it from caller-supplied
+/// MSM terms, and a wrong derived commitment is rejected.
+#[test]
+fn derived_tail_block_roundtrip_and_binding() {
+    let mut rng = rng();
+    let make = |a: u64, b: u64| MulCircuit {
+        a: Some(Fr::from(a)),
+        b: Some(Fr::from(b)),
+        spec: CommitSpec::BlocksAThenB,
+    };
+
+    let (pk, vk) = ZkPari::<E>::keygen(make(3, 5), &mut rng);
+
+    let prove = |a: u64, b: u64, rng: &mut _| {
+        let openings = [
+            CommittedInputOpening::<Fr>::rand(rng),
+            CommittedInputOpening::<Fr>::rand(rng),
+        ];
+        let proof =
+            ZkPari::<E>::prove_with_openings_derived(make(a, b), &pk, &openings, 1, rng).unwrap();
+        let x = vec![Fr::from(a) * Fr::from(b)];
+        (proof, x)
+    };
+
+    let (full_one, x_one) = prove(3, 5, &mut rng);
+    let (full_two, x_two) = prove(7, 11, &mut rng);
+
+    // The full proof verifies with the derived-tail challenge, and NOT with
+    // the standard challenge (the transcripts must actually differ).
+    assert!(ZkPari::<E>::verify_derived(&full_one, &vk, &x_one, 1));
+    assert!(!ZkPari::<E>::verify(&full_one, &vk, &x_one));
+
+    // Strip the derived tail for transmission.
+    let strip = |proof: &Proof<E>| Proof {
+        c_ci: vec![proof.c_ci[0]],
+        ..proof.clone()
+    };
+    let tail_one = full_one.c_ci[1];
+    let tail_two = full_two.c_ci[1];
+
+    // n == 1 derived batch (delegates to verify_derived).
+    assert!(ZkPari::<E>::batch_verify_derived_tail(
+        &[(strip(&full_one), x_one.clone())],
+        &[vec![(tail_one, Fr::ONE)]],
+        &vk,
+        &mut rng,
+    ));
+
+    // Multi-proof batch; the second term list expresses the same commitment
+    // as 2*C - C to exercise multi-term folding with non-trivial coefficients.
+    let claims = vec![
+        (strip(&full_one), x_one.clone()),
+        (strip(&full_two), x_two.clone()),
+    ];
+    assert!(ZkPari::<E>::batch_verify_derived_tail(
+        &claims,
+        &[
+            vec![(tail_one, Fr::ONE)],
+            vec![(tail_two, Fr::from(2u64)), (tail_two, -Fr::ONE)],
+        ],
+        &vk,
+        &mut rng,
+    ));
+
+    // Binding: a wrong derived commitment must be rejected (tails swapped).
+    assert!(!ZkPari::<E>::batch_verify_derived_tail(
+        &claims,
+        &[vec![(tail_two, Fr::ONE)], vec![(tail_one, Fr::ONE)]],
+        &vk,
+        &mut rng,
+    ));
+
+    // Shape mismatches are rejected, not panicked on.
+    assert!(!ZkPari::<E>::batch_verify_derived_tail(
+        &claims,
+        &[vec![(tail_one, Fr::ONE)]],
+        &vk,
+        &mut rng,
+    ));
 }
 
 /// A serialized proof must deserialize and verify; verification must reject
@@ -484,7 +564,11 @@ fn batch_verify() {
 
     // A corrupted proof in the batch must be rejected
     proofs_and_inputs[2].1[0] += Fr::ONE;
-    assert!(!ZkPari::<E>::batch_verify(&proofs_and_inputs, &vk, &mut rng));
+    assert!(!ZkPari::<E>::batch_verify(
+        &proofs_and_inputs,
+        &vk,
+        &mut rng
+    ));
 }
 
 /// Committed inputs may be allocated anywhere in the circuit — here the
@@ -519,6 +603,98 @@ fn committed_input_allocation_order_independent() {
         assert_eq!(proof.c_ci[0], commitment);
         assert!(ZkPari::<E>::verify(&proof, &vk, &[]));
     }
+}
+
+/// R1CS circuit (converted to SR1CS by the adapter) whose declared committed
+/// input `a` is allocated *first* but used only *after* `b`: the adapter
+/// renumbers witnesses by first use in the constraint matrices, so `a`'s
+/// post-conversion index differs from its allocation index. Regression
+/// circuit for the committed-input remapping across the conversion.
+#[derive(Clone)]
+struct LateUseCircuit<F: Field> {
+    a: Option<F>,
+    b: Option<F>,
+    /// Declare a never-constrained witness as the committed input instead of `a`.
+    declare_unused: bool,
+}
+
+impl<F: Field> ZkPariCircuit<F> for LateUseCircuit<F> {
+    fn synthesize(self, cs: ConstraintSystemRef<F>) -> Result<Vec<Vec<Variable>>, SynthesisError> {
+        let a = cs.new_witness_variable(|| self.a.ok_or(SynthesisError::AssignmentMissing))?;
+        let b = cs.new_witness_variable(|| self.b.ok_or(SynthesisError::AssignmentMissing))?;
+        let unused = cs.new_witness_variable(|| Ok(F::ZERO))?;
+        let b_sq = cs.new_input_variable(|| {
+            let b = self.b.ok_or(SynthesisError::AssignmentMissing)?;
+            Ok(b.square())
+        })?;
+        let a_sq = cs.new_input_variable(|| {
+            let a = self.a.ok_or(SynthesisError::AssignmentMissing)?;
+            Ok(a.square())
+        })?;
+
+        // b is first-used before a, so the conversion assigns b the lower
+        // new witness index
+        for _ in 0..3 {
+            cs.enforce_r1cs_constraint(|| lc!() + b, || lc!() + b, || lc!() + b_sq)?;
+        }
+        for _ in 0..3 {
+            cs.enforce_r1cs_constraint(|| lc!() + a, || lc!() + a, || lc!() + a_sq)?;
+        }
+        Ok(vec![vec![if self.declare_unused { unused } else { a }]])
+    }
+}
+
+/// Regression test for the R1CS-to-SR1CS renumbering bug: the proof's
+/// committed-input commitment must open to the *declared* variable's value
+/// even when the conversion reorders the witness space.
+#[test]
+fn committed_input_survives_r1cs_conversion_renumbering() {
+    let mut rng = rng();
+    let a_val = Fr::from(3u64);
+    let b_val = Fr::from(5u64);
+    let circuit = LateUseCircuit {
+        a: Some(a_val),
+        b: Some(b_val),
+        declare_unused: false,
+    };
+    let (pk, vk) = ZkPari::<E>::keygen(circuit.clone(), &mut rng);
+
+    let opening = CommittedInputOpening::<Fr>::rand(&mut rng);
+    let proof =
+        ZkPari::<E>::prove_with_openings(circuit, &pk, core::slice::from_ref(&opening), &mut rng)
+            .unwrap();
+
+    assert_eq!(
+        proof.c_ci[0],
+        pk.pedersen_commit(0, &[a_val], &opening),
+        "C_ci must commit to the declared variable, not whichever witness the \
+         conversion renumbered into its slot"
+    );
+    assert_ne!(
+        proof.c_ci[0],
+        pk.pedersen_commit(0, &[b_val], &opening),
+        "C_ci must not commit to the first-used variable"
+    );
+    assert!(ZkPari::<E>::verify(
+        &proof,
+        &vk,
+        &[b_val * b_val, a_val * a_val]
+    ));
+}
+
+/// A committed input that appears in no constraint must be rejected at key
+/// generation: on the conversion path it has no column in the converted
+/// system at all.
+#[test]
+#[should_panic(expected = "does not appear in any constraint")]
+fn unused_committed_input_rejected_on_conversion_path() {
+    let mut rng = rng();
+    let circuit = LateUseCircuit {
+        a: Some(Fr::from(3u64)),
+        b: Some(Fr::from(5u64)),
+        declare_unused: true,
+    };
+    let _ = ZkPari::<E>::keygen(circuit, &mut rng);
 }
 
 /// The Pedersen commitments exposed by the proof are additively homomorphic.
@@ -585,7 +761,10 @@ fn batched_transfer_theta_aggregation() {
             .iter()
             .fold(<E as Pairing>::G1::zero(), |acc, c| acc + c))
     .into_affine();
-    assert_eq!(com_rem, pk.pedersen_commit(1, &[Fr::from(remaining)], &r_rem));
+    assert_eq!(
+        com_rem,
+        pk.pedersen_commit(1, &[Fr::from(remaining)], &r_rem)
+    );
 
     // Block-1 commitment to the claimed values (sent before theta is drawn)
     let rho_1 = CommittedInputOpening::<Fr>::rand(&mut rng);
@@ -628,4 +807,102 @@ fn batched_transfer_theta_aggregation() {
 
     // A wrong theta (i.e. inconsistent aggregate) must be rejected
     assert!(!ZkPari::<E>::verify(&proof, &vk, &[theta + Fr::ONE]));
+}
+
+// ---------------------------------------------------------------------------
+// HVZK simulator (Theorem 1)
+// ---------------------------------------------------------------------------
+
+/// The trapdoor simulator forges an accepting transcript for any committed
+/// input commitment, with no witness — for a circuit with no public input.
+#[test]
+fn simulate_accepts_for_range_circuit() {
+    let mut rng = rng();
+    let (pk, vk, trapdoor) = ZkPari::<E>::keygen_with_trapdoor(
+        RangeProofCircuit {
+            value: Some(0),
+            value_allocated_last: false,
+        },
+        &mut rng,
+    );
+
+    // Bind the simulated proof to an arbitrary public ledger commitment.
+    let opening = CommittedInputOpening::<Fr>::rand(&mut rng);
+    let commitment = pk.pedersen_commit(0, &[Fr::from(123_456u64)], &opening);
+
+    let proof = ZkPari::<E>::simulate(
+        &trapdoor,
+        &vk,
+        core::slice::from_ref(&commitment),
+        &[],
+        &mut rng,
+    );
+
+    assert_eq!(proof.c_ci[0], commitment, "simulator binds the commitment");
+    assert!(
+        ZkPari::<E>::verify(&proof, &vk, &[]),
+        "simulated transcript must verify"
+    );
+}
+
+/// The simulator also handles nonempty public input (exercising the instance
+/// polynomial evaluations at tau and at the challenge).
+#[test]
+fn simulate_accepts_with_public_input() {
+    let mut rng = rng();
+    let circuit = MulCircuit {
+        a: Some(Fr::from(3u64)),
+        b: Some(Fr::from(5u64)),
+        spec: CommitSpec::A,
+    };
+    let (pk, vk, trapdoor) = ZkPari::<E>::keygen_with_trapdoor(circuit, &mut rng);
+
+    let public_input = [Fr::from(15u64)];
+    let opening = CommittedInputOpening::<Fr>::rand(&mut rng);
+    let commitment = pk.pedersen_commit(0, &[Fr::from(3u64)], &opening);
+
+    let proof = ZkPari::<E>::simulate(
+        &trapdoor,
+        &vk,
+        core::slice::from_ref(&commitment),
+        &public_input,
+        &mut rng,
+    );
+
+    assert_eq!(proof.c_ci[0], commitment);
+    assert!(ZkPari::<E>::verify(&proof, &vk, &public_input));
+    // The challenge binds the public input: verifying under a different
+    // instance must fail.
+    assert!(!ZkPari::<E>::verify(&proof, &vk, &[Fr::from(16u64)]));
+}
+
+/// A simulated proof is bound to its commitment: verifying it as if it opened
+/// a different commitment fails.
+#[test]
+fn simulate_is_bound_to_its_commitment() {
+    let mut rng = rng();
+    let (pk, vk, trapdoor) = ZkPari::<E>::keygen_with_trapdoor(
+        RangeProofCircuit {
+            value: Some(0),
+            value_allocated_last: false,
+        },
+        &mut rng,
+    );
+
+    let opening = CommittedInputOpening::<Fr>::rand(&mut rng);
+    let commitment = pk.pedersen_commit(0, &[Fr::from(7u64)], &opening);
+    let proof = ZkPari::<E>::simulate(
+        &trapdoor,
+        &vk,
+        core::slice::from_ref(&commitment),
+        &[],
+        &mut rng,
+    );
+
+    let mut tampered = proof.clone();
+    tampered.c_ci[0] = pk.pedersen_commit(0, &[Fr::from(8u64)], &opening);
+    assert!(
+        !ZkPari::<E>::verify(&tampered, &vk, &[]),
+        "swapping the commitment must break the proof"
+    );
 }

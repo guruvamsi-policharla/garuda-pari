@@ -5,15 +5,18 @@ use ark_ff::{Field, Zero};
 use ark_poly::{EvaluationDomain, Radix2EvaluationDomain};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
-use crate::circuit::{blocks_to_witness_indices, ZkPariCircuit};
-use crate::data_structures::{ProvingKey, SuccinctIndex, VerifyingKey};
+use crate::circuit::{
+    blocks_to_witness_indices, r1cs_conversion_witness_map, remap_blocks_through_conversion,
+    ZkPariCircuit,
+};
+use crate::data_structures::{ProvingKey, SuccinctIndex, Trapdoor, VerifyingKey};
 use crate::ZkPari;
 use ark_relations::{
     gr1cs::{
         self,
         instance_outliner::{outline_sr1cs, InstanceOutliner},
         predicate::polynomial_constraint::SR1CS_PREDICATE_LABEL,
-        ConstraintSystem, OptimizationGoal, SynthesisError, SynthesisMode,
+        ConstraintSystem, OptimizationGoal, SynthesisError, SynthesisMode, R1CS_PREDICATE_LABEL,
     },
     sr1cs::Sr1csAdapter,
 };
@@ -31,6 +34,25 @@ impl<E: Pairing> ZkPari<E> {
         circuit: C,
         rng: &mut R,
     ) -> (ProvingKey<E>, VerifyingKey<E>)
+    where
+        E: Pairing,
+        E::ScalarField: Field,
+    {
+        let (pk, vk, _trapdoor) = Self::keygen_with_trapdoor(circuit, rng);
+        (pk, vk)
+    }
+
+    /// Like [`Self::keygen`], but also returns the setup [`Trapdoor`].
+    ///
+    /// The trapdoor is the toxic waste of the trusted setup: keeping it breaks
+    /// soundness. It is returned only so the honest-verifier zero-knowledge
+    /// [`Self::simulate`] can forge accepting transcripts for tests,
+    /// benchmarks, and load generation. A real deployment must use
+    /// [`Self::keygen`] and discard the trapdoor.
+    pub fn keygen_with_trapdoor<C: ZkPariCircuit<E::ScalarField>, R: RngCore>(
+        circuit: C,
+        rng: &mut R,
+    ) -> (ProvingKey<E>, VerifyingKey<E>, Trapdoor<E>)
     where
         E: Pairing,
         E::ScalarField: Field,
@@ -250,7 +272,21 @@ impl<E: Pairing> ZkPari<E> {
             verifying_key: vk.clone(),
         };
 
-        (pk, vk)
+        // Capture the trapdoor for the HVZK simulator. `a`/`b` hold a_i(tau),
+        // b_i(tau) for every variable; the instance variables are the leading
+        // `instance_len` entries.
+        let trapdoor = Trapdoor {
+            alpha,
+            beta,
+            deltas,
+            delta_w,
+            tau,
+            g: g.into(),
+            instance_a_at_tau: a[..instance_len].to_vec(),
+            instance_b_at_tau: b[..instance_len].to_vec(),
+        };
+
+        (pk, vk, trapdoor)
     }
 
     /// Synthesize the circuit in setup mode and return the finalized SR1CS
@@ -270,17 +306,26 @@ impl<E: Pairing> ZkPari<E> {
         cs.set_mode(SynthesisMode::Setup);
         cs.set_optimization_goal(OptimizationGoal::Constraints);
         let blocks = circuit.synthesize(cs.clone())?;
-        let block_indices = blocks_to_witness_indices(&blocks);
+        let mut block_indices = blocks_to_witness_indices(&blocks);
         cs.finalize();
         // Circuits that natively register the SR1CS predicate skip the R1CS-to-SR1CS conversion.
-        // Both the conversion and the instance outlining only append witness
-        // variables, so the declared indices stay valid.
+        // The conversion does NOT preserve witness indices (it rebuilds the
+        // witness space by first use, interleaved with square variables and
+        // public-input copies), so the declared committed-input indices are
+        // remapped into the converted numbering. The subsequent instance
+        // outlining only appends witness variables, so the (remapped) indices
+        // stay valid through it.
         let native_sr1cs = cs.has_predicate(SR1CS_PREDICATE_LABEL);
 
         let timer_inlining = start_timer!(|| "Inlining constraints");
         let mut sr1cs_inner = if native_sr1cs {
             cs.into_inner().unwrap()
         } else {
+            let conversion_map = r1cs_conversion_witness_map(
+                &cs.to_matrices().unwrap()[R1CS_PREDICATE_LABEL],
+                cs.num_instance_variables(),
+            );
+            block_indices = remap_blocks_through_conversion(&block_indices, &conversion_map);
             let sr1cs_cs = Sr1csAdapter::r1cs_to_sr1cs(&cs).unwrap();
             sr1cs_cs.set_instance_outliner(InstanceOutliner {
                 pred_label: SR1CS_PREDICATE_LABEL.to_string(),

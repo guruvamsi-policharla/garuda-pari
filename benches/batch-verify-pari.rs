@@ -7,8 +7,8 @@ use ark_relations::lc;
 use ark_std::ops::Neg;
 use ark_std::rand::{RngCore, SeedableRng};
 use ark_std::test_rng;
-use zkpari::{Uncommitted, ZkPari};
 use std::time::Instant;
+use zkpari::{Uncommitted, ZkPari};
 
 #[derive(Clone)]
 struct MulCircuit<F: Field> {

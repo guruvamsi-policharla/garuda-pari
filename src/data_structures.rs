@@ -29,8 +29,9 @@ where
     pub sigma_ci: Vec<Vec<E::G1Affine>>,
     /// Per-block blinding generators `Gamma_ci_j = (beta v_K(tau)/delta_j) G`.
     pub gamma_ci: Vec<E::G1Affine>,
-    /// Per-block witness indices of the committed inputs, as declared by the
-    /// circuit at key generation.
+    /// Per-block witness indices of the committed inputs declared by the
+    /// circuit at key generation, remapped into the converted SR1CS witness
+    /// numbering on the R1CS path (native-SR1CS circuits keep their indices).
     pub committed_witness_indices: Vec<Vec<usize>>,
     /// Witness commitment key
     /// `Sigma_W = [(alpha a_i(tau) + beta b_i(tau))/delta_w G]` for the
@@ -116,6 +117,35 @@ impl SuccinctIndex {
     pub fn num_committed_inputs(&self) -> usize {
         self.committed_input_blocks.iter().sum()
     }
+}
+
+/// The setup trapdoor `(alpha, beta, delta_j, delta_w, tau)` plus the instance
+/// polynomial evaluations at `tau`.
+///
+/// This is the toxic waste of the trusted setup. An honest setup discards it;
+/// retaining it breaks soundness, since it lets [`crate::ZkPari::simulate`]
+/// forge accepting transcripts for any committed-input commitment without a
+/// witness. Use it only for the honest-verifier zero-knowledge *simulator*
+/// (testing, benchmarking, or load generation) — never in a real deployment.
+#[derive(Clone, Debug)]
+pub struct Trapdoor<E: Pairing> {
+    /// A-side trapdoor scalar.
+    pub alpha: E::ScalarField,
+    /// B-side trapdoor scalar.
+    pub beta: E::ScalarField,
+    /// Per-block committed-input trapdoors `delta_j`.
+    pub deltas: Vec<E::ScalarField>,
+    /// Witness-commitment trapdoor `delta_w`.
+    pub delta_w: E::ScalarField,
+    /// Evaluation point trapdoor `tau`.
+    pub tau: E::ScalarField,
+    /// CRS generator `G`.
+    pub g: E::G1Affine,
+    /// `a_i(tau)` for the instance variables (index `0` is the constant one).
+    pub instance_a_at_tau: Vec<E::ScalarField>,
+    /// `b_i(tau)` for the instance variables (zero after instance outlining,
+    /// retained for generality).
+    pub instance_b_at_tau: Vec<E::ScalarField>,
 }
 
 /// A Pari proof: `(2 + #blocks) G1 + 1 F` elements.

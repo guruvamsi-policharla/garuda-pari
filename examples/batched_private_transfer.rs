@@ -25,16 +25,14 @@ use ark_ec::{AffineRepr, CurveGroup, VariableBaseMSM};
 use ark_ff::Field;
 use ark_relations::gr1cs::predicate::polynomial_constraint::SR1CS_PREDICATE_LABEL;
 use ark_relations::gr1cs::predicate::PredicateConstraintSystem;
-use ark_relations::gr1cs::{
-    ConstraintSystemRef, R1CS_PREDICATE_LABEL, SynthesisError, Variable,
-};
+use ark_relations::gr1cs::{ConstraintSystemRef, SynthesisError, Variable, R1CS_PREDICATE_LABEL};
 use ark_relations::lc;
 use ark_serialize::CanonicalSerialize;
 use ark_std::rand::SeedableRng;
 use ark_std::Zero;
-use zkpari::{CommittedInputOpening, Proof, VerifyingKey, ZkPari, ZkPariCircuit};
-use zkpari::utils::transcript::IOPTranscript;
 use std::time::Instant;
+use zkpari::utils::transcript::IOPTranscript;
+use zkpari::{CommittedInputOpening, Proof, VerifyingKey, ZkPari, ZkPariCircuit};
 
 type E = Bls12_381;
 type Fr = <Bls12_381 as Pairing>::ScalarField;
@@ -215,11 +213,7 @@ fn derive_theta(com_sender: &G1, transfer_commitments: &[G1], c_ci_1: &G1) -> Fr
 /// Validator: recompute theta and com_theta from public data, reassemble the
 /// proof, and verify. Returns the recomputed remaining-balance commitment on
 /// success (the sender's new balance commitment).
-fn validate(
-    tx: &BatchedTransferTx,
-    com_sender: &G1,
-    vk: &VerifyingKey<E>,
-) -> Option<G1> {
+fn validate(tx: &BatchedTransferTx, com_sender: &G1, vk: &VerifyingKey<E>) -> Option<G1> {
     let b = tx.transfer_commitments.len();
     let theta = derive_theta(com_sender, &tx.transfer_commitments, &tx.c_ci_1);
 
@@ -241,8 +235,7 @@ fn validate(
         theta_powers.push(theta_pow);
         theta_pow *= theta;
     }
-    let com_theta: G1 =
-        <E as Pairing>::G1::msm_unchecked(&bases, &theta_powers).into_affine();
+    let com_theta: G1 = <E as Pairing>::G1::msm_unchecked(&bases, &theta_powers).into_affine();
 
     // Reassemble the full proof and verify; theta is the only public input
     let proof = Proof::<E> {
@@ -275,7 +268,10 @@ fn main() {
 
     // ── 1. Trusted Setup ────────────────────────────────────────────────
     println!("1. Trusted Setup (batch size B = {B})");
-    println!("   Block 1: B+1 = {} claimed values, Block 2: 1 aggregate\n", B + 1);
+    println!(
+        "   Block 1: B+1 = {} claimed values, Block 2: 1 aggregate\n",
+        B + 1
+    );
     let setup_start = Instant::now();
     let setup_circuit = BatchedRangeCircuit::<Fr> {
         theta: None,
@@ -360,7 +356,9 @@ fn main() {
     let proof_bytes = 3 * g1_size + fr_size;
     let naive_bytes = (B + 1) * (2 * g1_size + fr_size) + g1_size;
     println!("4. On-chain size (excluding the B ledger commitments themselves)");
-    println!("   This construction : C_ci_1 + (T, U, v_a)            = 3 G1 + 1 F = {proof_bytes} bytes");
+    println!(
+        "   This construction : C_ci_1 + (T, U, v_a)            = 3 G1 + 1 F = {proof_bytes} bytes"
+    );
     println!(
         "   Naive             : B+1 = {} proofs of (T, U, v_a) + C_ci = {naive_bytes} bytes",
         B + 1
@@ -376,7 +374,10 @@ fn main() {
     let com_rem = validate(&tx, &com_alice, &vk).expect("transaction must verify");
     let verify_ms = verify_start.elapsed().as_secs_f64() * 1000.0;
     println!("   Recomputed theta and com_theta from the ledger commitments");
-    println!("   One pairing equation covers all {} range checks: PASS", B + 1);
+    println!(
+        "   One pairing equation covers all {} range checks: PASS",
+        B + 1
+    );
     println!("   Verification done in {verify_ms:.1} ms\n");
 
     // A tampered transaction (inflated transfer commitment) must be rejected

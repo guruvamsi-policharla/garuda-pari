@@ -7,8 +7,8 @@ use ark_relations::lc;
 use ark_std::ops::Neg;
 use ark_std::rand::{RngCore, SeedableRng};
 use ark_std::test_rng;
-use zkpari::{Uncommitted, ZkPari};
 use std::time::Instant;
+use zkpari::{Uncommitted, ZkPari};
 
 #[derive(Clone)]
 struct MulCircuit<F: Field> {
@@ -62,7 +62,10 @@ where
     let max_chunk = *per_thread_sizes.iter().max().unwrap();
 
     println!("Threads: {}", num_threads);
-    println!("Generating {} proofs (one chunk, cloned to {} threads)...", max_chunk, num_threads);
+    println!(
+        "Generating {} proofs (one chunk, cloned to {} threads)...",
+        max_chunk, num_threads
+    );
     let start = Instant::now();
     let mut base_chunk = Vec::with_capacity(max_chunk);
     for _ in 0..max_chunk {
