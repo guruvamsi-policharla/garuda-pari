@@ -180,7 +180,7 @@ pub type AccountId = u64;
 
 /// The transmitted range-proof body. The committed-input commitment `C_ci` is
 /// not transmitted here: validators reconstruct it from ledger commitments.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RangeProof<E: Pairing> {
     pub t_g: E::G1Affine,
     pub u_g: E::G1Affine,
@@ -286,6 +286,51 @@ impl<E: Pairing> RangeProof<E> {
             u_g: self.u_g,
             v_a: self.v_a,
         }
+    }
+
+    /// Honestly proves that `commitment = commit_with(value, opening)` opens to
+    /// a value in `[0, 2^64)`. `c_ci` is not stored in the returned proof; the
+    /// verifier supplies the commitment at [`Self::to_claim`] time.
+    pub fn prove(
+        params: &LedgerParams<E>,
+        value: u64,
+        opening: &CommittedInputOpening<E::ScalarField>,
+        rng: &mut impl RngCore,
+    ) -> Self {
+        build_range_proof(
+            params,
+            value,
+            params.commit_with(value, opening),
+            opening,
+            false,
+            rng,
+        )
+    }
+
+    /// Forges an accepting range proof for `commitment` from the setup
+    /// trapdoor (HVZK simulation). Attests no range validity; for load
+    /// generation only, where honest proving would dwarf the cost under study.
+    pub fn simulate(
+        params: &LedgerParams<E>,
+        commitment: E::G1Affine,
+        rng: &mut impl RngCore,
+    ) -> Self {
+        build_range_proof(
+            params,
+            0,
+            commitment,
+            &CommittedInputOpening::zero(),
+            true,
+            rng,
+        )
+    }
+
+    /// Pairs this proof with the committed-input `commitment` it must open,
+    /// yielding the `(proof, public_input)` claim consumed by
+    /// [`ZkPari::batch_verify`] / [`ZkPari::batch_verify_partitioned`]. The
+    /// range relation has no public input, so the input vector is empty.
+    pub fn to_claim(&self, commitment: E::G1Affine) -> (Proof<E>, Vec<E::ScalarField>) {
+        (self.to_zkpari_proof(commitment), Vec::new())
     }
 }
 
