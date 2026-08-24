@@ -63,7 +63,6 @@ mod batch_verify;
 mod circuit;
 pub mod data_structures;
 mod generator;
-pub mod ledger;
 mod prover;
 mod simulator;
 pub mod utils;
