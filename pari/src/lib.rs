@@ -3,6 +3,7 @@ use ark_ec::pairing::Pairing;
 pub use ark_relations::gr1cs::ConstraintSystemRef;
 use ark_std::marker::PhantomData;
 
+mod batch_verify;
 pub mod data_structures;
 mod generator;
 mod prover;
