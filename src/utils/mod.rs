@@ -24,37 +24,18 @@ macro_rules! to_bytes {
 
 /// Compute the Fiat-Shamir challenge `r`. Binds the verifying key, the
 /// public input, and all first-message commitments `(C_ci_1, ..., C_ci_J, T)`.
+///
+/// The verifying key is absorbed once, when the key is built
+/// ([`VerifyingKey::new`]); this clones that seeded state rather than
+/// re-serializing the key on every call. The absorbed bytes are identical
+/// either way, so challenges are unchanged.
 pub(crate) fn compute_chall<E: Pairing>(
     vk: &VerifyingKey<E>,
     public_input: &[E::ScalarField],
     c_cis: &[E::G1Affine],
     t_g: &E::G1Affine,
 ) -> E::ScalarField {
-    let mut transcript = IOPTranscript::<E::ScalarField>::new(crate::ZkPari::<E>::SNARK_NAME);
-    let _ = transcript.append_serializable_element(b"vk", vk);
-    append_input_and_comms::<E>(&mut transcript, public_input, c_cis, t_g);
-    transcript.get_and_append_challenge("r".as_bytes()).unwrap()
-}
-
-/// Pre-seed a transcript with the VK. Clone the result for each proof to avoid
-/// re-serializing the VK N times during batch verification.
-pub(crate) fn seed_transcript_with_vk<E: Pairing>(
-    vk: &VerifyingKey<E>,
-) -> IOPTranscript<E::ScalarField> {
-    let mut transcript = IOPTranscript::<E::ScalarField>::new(crate::ZkPari::<E>::SNARK_NAME);
-    let _ = transcript.append_serializable_element(b"vk", vk);
-    transcript
-}
-
-/// Compute the Fiat-Shamir challenge from a pre-seeded transcript (already
-/// contains the VK). Clones the base transcript so the caller can reuse it.
-pub(crate) fn compute_chall_from_transcript<E: Pairing>(
-    base_transcript: &IOPTranscript<E::ScalarField>,
-    public_input: &[E::ScalarField],
-    c_cis: &[E::G1Affine],
-    t_g: &E::G1Affine,
-) -> E::ScalarField {
-    let mut transcript = base_transcript.clone();
+    let mut transcript = vk.transcript().clone();
     append_input_and_comms::<E>(&mut transcript, public_input, c_cis, t_g);
     transcript.get_and_append_challenge("r".as_bytes()).unwrap()
 }
@@ -162,75 +143,6 @@ fn make_digits<const W: usize>(
         }
         digit
     })
-}
-
-/// Pippenger MSM with configurable scalar bit-length.
-///
-/// For batch verification with 128-bit random challenges, pass `scalar_bits = 128`
-/// to halve the number of Pippenger windows compared to full-size scalars.
-pub fn msm_pippenger<V: VariableBaseMSM>(
-    bases: &[V::MulBase],
-    scalars: &[<V::ScalarField as PrimeField>::BigInt],
-    scalar_bits: usize,
-) -> V {
-    let size = bases.len().min(scalars.len());
-    if size == 0 || scalar_bits == 0 {
-        return V::zero();
-    }
-
-    let c = if size < 32 {
-        3
-    } else {
-        ln_without_floats(size) + 2
-    };
-
-    let zero = V::zero();
-    let num_buckets = (1 << c) - 1;
-
-    let window_sums: Vec<_> = (0..scalar_bits)
-        .step_by(c)
-        .map(|w_start| {
-            let mut buckets = vec![zero; num_buckets];
-
-            for (scalar, base) in scalars[..size].iter().zip(&bases[..size]) {
-                if scalar.is_zero() {
-                    continue;
-                }
-                let mut s = *scalar;
-                s >>= w_start as u32;
-                let idx = (s.as_ref()[0] & ((1u64 << c) - 1)) as usize;
-                if idx != 0 {
-                    buckets[idx - 1] += base;
-                }
-            }
-
-            let mut running_sum = V::zero();
-            let mut res = V::zero();
-            for b in buckets.into_iter().rev() {
-                running_sum += &b;
-                res += &running_sum;
-            }
-            res
-        })
-        .collect();
-
-    let lowest = window_sums[0];
-    lowest
-        + &window_sums[1..]
-            .iter()
-            .rev()
-            .fold(V::zero(), |mut total, sum_i| {
-                total += sum_i;
-                for _ in 0..c {
-                    total.double_in_place();
-                }
-                total
-            })
-}
-
-fn ln_without_floats(a: usize) -> usize {
-    let log2a = (usize::BITS - a.leading_zeros()) as usize;
-    log2a * 69 / 100
 }
 
 /// Given a vector of field elements {v_i}, compute the vector {coeff * v_i^(-1)}.

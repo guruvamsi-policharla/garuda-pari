@@ -6,8 +6,8 @@ use ark_poly::{EvaluationDomain, Radix2EvaluationDomain};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 use crate::circuit::{
-    blocks_to_witness_indices, r1cs_conversion_witness_map, remap_blocks_through_conversion,
-    ZkPariCircuit,
+    assert_instance_outlining_complete, blocks_to_witness_indices, r1cs_conversion_witness_map,
+    remap_blocks_through_conversion, ZkPariCircuit,
 };
 use crate::data_structures::{ProvingKey, SuccinctIndex, Trapdoor, VerifyingKey};
 use crate::ZkPari;
@@ -243,21 +243,19 @@ impl<E: Pairing> ZkPari<E> {
         end_timer!(timer_pk_gen);
 
         /////////////////////// Output keys ///////////////////////
-        let vk = VerifyingKey {
+        // `new` derives the prepared G2 points and seeds the key's
+        // Fiat-Shamir transcript.
+        let vk = VerifyingKey::new(
             succinct_index,
-            alpha_g: alpha_g.into(),
-            beta_g: beta_g.into(),
-            delta_h_prep: delta_h.iter().map(|d| (*d).into()).collect(),
+            g.into(),
+            alpha_g.into(),
+            beta_g.into(),
             delta_h,
-            delta_w_h: delta_w_h.into(),
-            delta_w_h_prep: delta_w_h.into().into(),
-            tau_h: tau_h.into(),
-            tau_h_prep: tau_h.into().into(),
-            g: g.into(),
-            h: h.into(),
-            h_prep: h.into().into(),
+            delta_w_h.into(),
+            tau_h.into(),
+            h.into(),
             domain,
-        };
+        );
 
         let pk = ProvingKey {
             sigma_ci,
@@ -358,6 +356,10 @@ impl<E: Pairing> ZkPari<E> {
         let num_variables = new_cs.num_instance_variables() + new_cs.num_witness_variables();
         let num_constraints = new_cs.num_constraints();
         let matrices = &new_cs.to_matrices().unwrap()[SR1CS_PREDICATE_LABEL];
+
+        // The verifier's public-input reconstruction depends on outlining
+        // having confined every instance column to the trailing rows.
+        assert_instance_outlining_complete(matrices, new_cs.num_instance_variables(), num_constraints);
 
         let mut a = vec![E::ScalarField::zero(); num_variables];
         let mut b = vec![E::ScalarField::zero(); num_variables];

@@ -824,3 +824,161 @@ fn simulate_is_bound_to_its_commitment() {
         "swapping the commitment must break the proof"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Instance-outlining guard
+// ---------------------------------------------------------------------------
+
+/// A native-SR1CS circuit that references its public input through a bare
+/// coefficient-1 single-variable linear combination.
+///
+/// `ark-relations` 0.6.0 returns such an LC as the bare `Variable` instead of
+/// interning it in the constraint system's LC map, and
+/// `perform_instance_outlining` rewrites instance variables only by walking
+/// that map — so the instance column survives outlining. The verifier reads
+/// the public contribution only from the trailing outlining rows (and takes
+/// `x_B = 0`), so the resulting keys would produce proofs that silently fail
+/// to verify. Key generation must reject the circuit instead.
+///
+/// The trigger is the single-term LC, not which side it sits on, so both
+/// placements are exercised.
+#[derive(Clone, Copy)]
+struct UnoutlinedInstanceCircuit {
+    b_side: bool,
+}
+
+impl<F: Field> ZkPariCircuit<F> for UnoutlinedInstanceCircuit {
+    fn synthesize(self, cs: ConstraintSystemRef<F>) -> Result<Vec<Vec<Variable>>, SynthesisError> {
+        cs.remove_predicate(R1CS_PREDICATE_LABEL);
+        let _ = cs.register_predicate(
+            SR1CS_PREDICATE_LABEL,
+            PredicateConstraintSystem::new_sr1cs_predicate()
+                .map_err(|_| SynthesisError::Unsatisfiable)?,
+        );
+        let w = cs.new_witness_variable(|| Ok(F::from(3u64)))?;
+        let sq = cs.new_witness_variable(|| Ok(F::from(9u64)))?;
+        let out = cs.new_input_variable(|| Ok(F::from(9u64)))?;
+        if self.b_side {
+            // (w)^2 = out
+            cs.enforce_sr1cs_constraint(|| lc!() + w, || lc!() + out)?;
+        } else {
+            // (out)^2 = sq
+            cs.enforce_sr1cs_constraint(|| lc!() + out, || lc!() + sq)?;
+        }
+        // No committed inputs: these tests lock in the outlining guard only,
+        // and declaring a block would drag keygen's separate "committed input
+        // appears in no constraint" assert into the expected-panic message.
+        Ok(Vec::new())
+    }
+}
+
+#[test]
+#[should_panic(expected = "instance outlining did not remove instance variable")]
+fn unoutlined_instance_column_in_b_rejected_at_keygen() {
+    let _ = ZkPari::<E>::keygen(UnoutlinedInstanceCircuit { b_side: true }, &mut rng());
+}
+
+#[test]
+#[should_panic(expected = "instance outlining did not remove instance variable")]
+fn unoutlined_instance_column_in_a_rejected_at_keygen() {
+    let _ = ZkPari::<E>::keygen(UnoutlinedInstanceCircuit { b_side: false }, &mut rng());
+}
+
+/// The same binding written as a multi-term linear combination is interned,
+/// outlined correctly, and must key-generate and verify end to end.
+#[test]
+fn multi_term_instance_binding_is_outlined() {
+    #[derive(Clone, Copy)]
+    struct Ok2;
+    impl<F: Field> ZkPariCircuit<F> for Ok2 {
+        fn synthesize(
+            self,
+            cs: ConstraintSystemRef<F>,
+        ) -> Result<Vec<Vec<Variable>>, SynthesisError> {
+            cs.remove_predicate(R1CS_PREDICATE_LABEL);
+            let _ = cs.register_predicate(
+                SR1CS_PREDICATE_LABEL,
+                PredicateConstraintSystem::new_sr1cs_predicate()
+                    .map_err(|_| SynthesisError::Unsatisfiable)?,
+            );
+            let w = cs.new_witness_variable(|| Ok(F::from(3u64)))?;
+            let out = cs.new_input_variable(|| Ok(F::from(3u64)))?;
+            // (out - w)^2 = 0, both sides multi-term.
+            cs.enforce_sr1cs_constraint(|| lc!() + out - w, || lc!() + w - w)?;
+            Ok(vec![vec![w]])
+        }
+    }
+
+    let mut rng = rng();
+    let (pk, vk) = ZkPari::<E>::keygen(Ok2, &mut rng);
+    let proof = ZkPari::<E>::prove(Ok2, &pk, &mut rng).unwrap();
+    assert!(ZkPari::<E>::verify(&proof, &vk, &[Fr::from(3u64)]));
+}
+
+// ---------------------------------------------------------------------------
+// Verifying-key transcript
+// ---------------------------------------------------------------------------
+
+/// `VerifyingKey::transcript` is public so integrators can derive the
+/// challenge themselves. That documented recipe — clone the seeded state, then
+/// absorb the public input, each `c_ci`, and `T` — must reproduce exactly what
+/// verification computes.
+#[test]
+fn public_transcript_reproduces_the_challenge() {
+    let mut rng = rng();
+    let (a_val, b_val) = (Fr::rand(&mut rng), Fr::rand(&mut rng));
+    let circuit = MulCircuit {
+        a: Some(a_val),
+        b: Some(b_val),
+        spec: CommitSpec::BlocksAThenB,
+    };
+    let (pk, vk) = ZkPari::<E>::keygen(circuit.clone(), &mut rng);
+    let proof = ZkPari::<E>::prove(circuit, &pk, &mut rng).unwrap();
+    let public_input = vec![a_val * b_val];
+
+    let mut transcript = vk.transcript().clone();
+    transcript
+        .append_serializable_element(b"input", &public_input)
+        .unwrap();
+    for c_ci in &proof.c_ci {
+        transcript
+            .append_serializable_element(b"comm_ci", c_ci)
+            .unwrap();
+    }
+    transcript
+        .append_serializable_element(b"comm", &proof.t_g)
+        .unwrap();
+
+    assert_eq!(
+        transcript.get_and_append_challenge(b"r").unwrap(),
+        crate::utils::compute_chall::<E>(&vk, &public_input, &proof.c_ci, &proof.t_g),
+    );
+}
+
+/// The seeded transcript must actually bind the key: two independently
+/// generated keys for the same circuit must give different challenges for
+/// identical proof material.
+#[test]
+fn seeded_transcript_binds_the_verifying_key() {
+    let mut rng = rng();
+    let (a_val, b_val) = (Fr::rand(&mut rng), Fr::rand(&mut rng));
+    let circuit = MulCircuit {
+        a: Some(a_val),
+        b: Some(b_val),
+        spec: CommitSpec::A,
+    };
+    let (pk, vk) = ZkPari::<E>::keygen(circuit.clone(), &mut rng);
+    let (_pk2, vk2) = ZkPari::<E>::keygen(circuit.clone(), &mut rng);
+    let proof = ZkPari::<E>::prove(circuit, &pk, &mut rng).unwrap();
+    let public_input = [a_val * b_val];
+
+    let chall = |v| crate::utils::compute_chall::<E>(v, &public_input, &proof.c_ci, &proof.t_g);
+    assert_eq!(chall(&vk), chall(&vk), "challenge derivation must be deterministic");
+    assert_ne!(
+        chall(&vk),
+        chall(&vk2),
+        "a different verifying key must give a different challenge"
+    );
+    // And the proof must not verify under the other key.
+    assert!(!ZkPari::<E>::verify(&proof, &vk2, &public_input));
+}

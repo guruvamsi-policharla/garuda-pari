@@ -25,8 +25,18 @@ ark-bls12-381 = { version = "0.6.0", default-features = false, features = ["curv
 ark-bn254 = { version = "0.6.0", default-features = false, features = ["curve"] }
 
 [[bench]]
-name = "ledger-block"
-path = "benches/ledger-block.rs"
+name = "batch_verify"
+path = "benches/batch_verify.rs"
+harness = false
+
+[[bench]]
+name = "prover"
+path = "benches/prover.rs"
+harness = false
+
+[[bench]]
+name = "verifier"
+path = "benches/verifier.rs"
 harness = false
 
 [features]

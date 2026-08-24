@@ -71,7 +71,6 @@ mod verifier;
 #[cfg(test)]
 mod test;
 
-pub use batch_verify::BatchVerifyTimings;
 pub use circuit::{Uncommitted, ZkPariCircuit};
 pub use data_structures::{
     CommittedInputOpening, Proof, ProvingKey, SuccinctIndex, Trapdoor, VerifyingKey,

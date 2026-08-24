@@ -145,3 +145,53 @@ pub(crate) fn blocks_to_witness_indices(blocks: &[Vec<Variable>]) -> Vec<Vec<usi
         })
         .collect()
 }
+
+/// Panic unless instance outlining left the matrices in the shape the verifier
+/// assumes: every instance column confined to the trailing `num_instance`
+/// rows (the outlining equality rows).
+///
+/// The verifier reconstructs the public contribution as
+/// `x_A(r) = sum_i x_i L_{outline_start + i}(r)` — a Lagrange sum over those
+/// trailing rows only — and takes `x_B = 0` outright. An instance column
+/// anywhere else is silently unaccounted for, so honest proofs fail to verify
+/// with no other symptom.
+///
+/// This is reachable through a live bug in `ark-relations` 0.6.0:
+/// `ConstraintSystem::new_lc_add_helper` returns a coefficient-1
+/// single-variable linear combination as the bare `Variable` instead of
+/// interning it in `lc_map`, while `perform_instance_outlining` rewrites
+/// instance variables *only* by iterating `lc_map`. A constraint side written
+/// as exactly `lc!() + <public input>` therefore keeps a live instance column.
+/// Writing that side with two or more terms (or a non-unit coefficient) routes
+/// it through `lc_map` and outlines correctly.
+///
+/// Circuits reaching ZK-Pari through the R1CS-to-SR1CS adapter are unaffected:
+/// the adapter rebuilds the witness space from the matrices, so instance
+/// variables never survive into the converted linear combinations.
+///
+/// Checked once at key generation, over matrices key generation already
+/// materializes, so it costs nothing per proof.
+pub(crate) fn assert_instance_outlining_complete<F: Field>(
+    matrices: &[Matrix<F>],
+    num_instance: usize,
+    num_constraints: usize,
+) {
+    let outline_start = num_constraints.saturating_sub(num_instance);
+    for (matrix, side) in matrices.iter().zip(["A", "B"]) {
+        for (row, terms) in matrix.iter().enumerate().take(outline_start) {
+            for &(_, index) in terms {
+                assert!(
+                    index >= num_instance,
+                    "instance outlining did not remove instance variable {index} from row \
+                     {row} of the {side} matrix (outlining rows start at {outline_start}). \
+                     The verifier only accounts for instance columns in the trailing \
+                     {num_instance} rows, so this circuit would produce proofs that fail to \
+                     verify. Cause: a constraint side written as a bare `lc!() + <variable>` \
+                     is not interned into the constraint system's LC map and so escapes \
+                     outlining; rewrite that side with two or more terms (for example \
+                     `lc!() + x - y`) so it is outlined."
+                );
+            }
+        }
+    }
+}

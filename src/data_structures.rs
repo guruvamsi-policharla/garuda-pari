@@ -2,6 +2,7 @@ use ark_ec::pairing::Pairing;
 use ark_ec::VariableBaseMSM;
 use ark_ff::Field;
 use ark_poly::Radix2EvaluationDomain;
+use crate::utils::transcript::IOPTranscript;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::rand::RngCore;
 use core::ops::{Add, Sub};
@@ -17,7 +18,7 @@ use core::ops::{Add, Sub};
 /// [`crate::ZkPariCircuit`]) are grouped into independently committed *blocks*:
 /// block `j` has its own trapdoor `delta_j`, commitment key `sigma_ci[j]`,
 /// blinding generator `gamma_ci[j]`, and commitment `C_ci_j` in the proof.
-#[derive(CanonicalSerialize, CanonicalDeserialize, Clone)]
+#[derive(Clone)]
 pub struct ProvingKey<E>
 where
     E: Pairing,
@@ -51,7 +52,20 @@ where
 }
 
 /// The verifying key for Pari.
-#[derive(Clone, Debug, CanonicalSerialize, CanonicalDeserialize)]
+///
+/// Carries a Fiat-Shamir transcript already seeded with the key material
+/// (see [`Self::transcript`]). The key is identical on every verification, so
+/// it is absorbed once at construction and each challenge derivation just
+/// clones that fixed-size Strobe state. Challenge derivation is therefore
+/// O(1) in the size of the key rather than linear in it, which matters here:
+/// the key carries one `G2Prepared` per committed-input block, so hashing it
+/// per verification would cost milliseconds at high block counts.
+///
+/// The key is deliberately **not** serializable, and does not implement
+/// `Debug`. Both would mean hand-writing impls around the transcript field,
+/// and nothing in the protocol needs either — only [`Proof`] goes on the wire.
+/// Add them back if key distribution ever needs them.
+#[derive(Clone)]
 pub struct VerifyingKey<E: Pairing> {
     pub succinct_index: SuccinctIndex,
     pub g: E::G1Affine,
@@ -67,6 +81,75 @@ pub struct VerifyingKey<E: Pairing> {
     pub h: E::G2Affine,
     pub h_prep: E::G2Prepared,
     pub domain: Radix2EvaluationDomain<E::ScalarField>,
+    /// Transcript seeded with the key material above, built once by
+    /// [`Self::new`].
+    transcript: IOPTranscript<E::ScalarField>,
+}
+
+impl<E: Pairing> VerifyingKey<E> {
+    /// Assemble a verifying key, deriving the prepared `G2` points and seeding
+    /// the Fiat-Shamir transcript.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        succinct_index: SuccinctIndex,
+        g: E::G1Affine,
+        alpha_g: E::G1Affine,
+        beta_g: E::G1Affine,
+        delta_h: Vec<E::G2Affine>,
+        delta_w_h: E::G2Affine,
+        tau_h: E::G2Affine,
+        h: E::G2Affine,
+        domain: Radix2EvaluationDomain<E::ScalarField>,
+    ) -> Self {
+        let mut vk = Self {
+            succinct_index,
+            g,
+            alpha_g,
+            beta_g,
+            delta_h_prep: delta_h.iter().map(|d| (*d).into()).collect(),
+            delta_h,
+            delta_w_h,
+            delta_w_h_prep: delta_w_h.into(),
+            tau_h,
+            tau_h_prep: tau_h.into(),
+            h,
+            h_prep: h.into(),
+            domain,
+            transcript: IOPTranscript::new(crate::ZkPari::<E>::SNARK_NAME),
+        };
+        vk.seed_transcript();
+        vk
+    }
+
+    /// Absorb the key material into a fresh transcript and store the result.
+    ///
+    /// The prepared `G2` points are deliberately not absorbed: they are Miller
+    /// loop precomputation of `delta_h`, `tau_h`, and `h`, which are. Binding
+    /// the key does not mean binding its precomputation.
+    fn seed_transcript(&mut self) {
+        let mut t = IOPTranscript::new(crate::ZkPari::<E>::SNARK_NAME);
+        let _ = t.append_serializable_element(b"index", &self.succinct_index);
+        let _ = t.append_serializable_element(b"g", &self.g);
+        let _ = t.append_serializable_element(b"alpha_g", &self.alpha_g);
+        let _ = t.append_serializable_element(b"beta_g", &self.beta_g);
+        let _ = t.append_serializable_element(b"delta_h", &self.delta_h);
+        let _ = t.append_serializable_element(b"delta_w_h", &self.delta_w_h);
+        let _ = t.append_serializable_element(b"tau_h", &self.tau_h);
+        let _ = t.append_serializable_element(b"h", &self.h);
+        let _ = t.append_serializable_element(b"domain", &self.domain);
+        self.transcript = t;
+    }
+
+    /// The transcript seeded with this key. Clone it, absorb the per-proof
+    /// material, and squeeze the challenge — this is exactly what
+    /// verification does.
+    ///
+    /// Exposed so integrators (and benchmarks) can reproduce challenge
+    /// derivation without re-absorbing the key. It holds no secret: anyone
+    /// with the verifying key can recompute it.
+    pub fn transcript(&self) -> &IOPTranscript<E::ScalarField> {
+        &self.transcript
+    }
 }
 
 /// The succinct index for Pari.

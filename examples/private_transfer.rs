@@ -108,8 +108,8 @@ fn main() {
     let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(2026_06_10);
 
     println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║       Private Transfers with Hidden Amounts (ZK-Pari)         ║");
-    println!("║          vanishing-polynomial masks + committed inputs        ║");
+    println!("║       Private Transfers with Hidden Amounts (ZK-Pari)        ║");
+    println!("║          vanishing-polynomial masks + committed inputs       ║");
     println!("╚══════════════════════════════════════════════════════════════╝\n");
 
     // ── 1. Trusted Setup ────────────────────────────────────────────────
@@ -370,10 +370,10 @@ fn main() {
 
     // ── 7. Summary ───────────────────────────────────────────────────────
     println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║  Transfer complete. Validators verified:                      ║");
-    println!("║    - Both amounts are non-negative (range proofs)             ║");
-    println!("║    - Amounts are consistent with the sender's balance         ║");
-    println!("║    - No amounts were revealed at any point                    ║");
-    println!("║    - Batch verification gives significant speedup             ║");
+    println!("║  Transfer complete. Validators verified:                     ║");
+    println!("║    - Both amounts are non-negative (range proofs)            ║");
+    println!("║    - Amounts are consistent with the sender's balance        ║");
+    println!("║    - No amounts were revealed at any point                   ║");
+    println!("║    - Batch verification gives significant speedup            ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
 }
