@@ -17,7 +17,7 @@ use core::ops::{Add, Sub};
 /// [`crate::ZkPariCircuit`]) are grouped into independently committed *blocks*:
 /// block `j` has its own trapdoor `delta_j`, commitment key `sigma_ci[j]`,
 /// blinding generator `gamma_ci[j]`, and commitment `C_ci_j` in the proof.
-#[derive(CanonicalSerialize, Clone)]
+#[derive(CanonicalSerialize, CanonicalDeserialize, Clone)]
 pub struct ProvingKey<E>
 where
     E: Pairing,
@@ -51,7 +51,7 @@ where
 }
 
 /// The verifying key for Pari.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, CanonicalSerialize, CanonicalDeserialize)]
 pub struct VerifyingKey<E: Pairing> {
     pub succinct_index: SuccinctIndex,
     pub g: E::G1Affine,
@@ -69,40 +69,8 @@ pub struct VerifyingKey<E: Pairing> {
     pub domain: Radix2EvaluationDomain<E::ScalarField>,
 }
 
-impl<E: Pairing> CanonicalSerialize for VerifyingKey<E> {
-    fn serialize_with_mode<W: std::io::Write>(
-        &self,
-        mut writer: W,
-        compress: ark_serialize::Compress,
-    ) -> Result<(), ark_serialize::SerializationError> {
-        self.succinct_index
-            .serialize_with_mode(&mut writer, compress)?;
-        self.alpha_g.serialize_with_mode(&mut writer, compress)?;
-        self.beta_g.serialize_with_mode(&mut writer, compress)?;
-        self.delta_h.serialize_with_mode(&mut writer, compress)?;
-        self.delta_w_h.serialize_with_mode(&mut writer, compress)?;
-        self.tau_h.serialize_with_mode(&mut writer, compress)?;
-        self.g.serialize_with_mode(&mut writer, compress)?;
-        self.h.serialize_with_mode(&mut writer, compress)?;
-        Ok(())
-    }
-
-    fn serialized_size(&self, compress: ark_serialize::Compress) -> usize {
-        let mut size = 0;
-        size += ark_serialize::CanonicalSerialize::serialized_size(&self.succinct_index, compress);
-        size += ark_serialize::CanonicalSerialize::serialized_size(&self.alpha_g, compress);
-        size += ark_serialize::CanonicalSerialize::serialized_size(&self.beta_g, compress);
-        size += ark_serialize::CanonicalSerialize::serialized_size(&self.delta_h, compress);
-        size += ark_serialize::CanonicalSerialize::serialized_size(&self.delta_w_h, compress);
-        size += ark_serialize::CanonicalSerialize::serialized_size(&self.tau_h, compress);
-        size += ark_serialize::CanonicalSerialize::serialized_size(&self.g, compress);
-        size += ark_serialize::CanonicalSerialize::serialized_size(&self.h, compress);
-        size
-    }
-}
-
 /// The succinct index for Pari.
-#[derive(CanonicalSerialize, Clone, Debug)]
+#[derive(CanonicalSerialize, CanonicalDeserialize, Clone, Debug)]
 pub struct SuccinctIndex {
     /// Number of SR1CS constraints (after instance outlining).
     pub num_constraints: usize,
@@ -127,7 +95,7 @@ impl SuccinctIndex {
 /// forge accepting transcripts for any committed-input commitment without a
 /// witness. Use it only for the honest-verifier zero-knowledge *simulator*
 /// (testing, benchmarking, or load generation) — never in a real deployment.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, CanonicalSerialize, CanonicalDeserialize)]
 pub struct Trapdoor<E: Pairing> {
     /// A-side trapdoor scalar.
     pub alpha: E::ScalarField,
