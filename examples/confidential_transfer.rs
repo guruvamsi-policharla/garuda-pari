@@ -1,7 +1,7 @@
-//! Private transfers with hidden amounts using ZK-Pari (vanishing-polynomial
-//! mask construction with committed inputs).
+//! Confidential transfers (Zether-style, hidden amounts) using ZK-Pari
+//! (vanishing-polynomial mask construction with committed inputs).
 //!
-//! Demonstrates a Zether-like private payment system where:
+//! Demonstrates a Zether-like confidential payment system where:
 //!   - Account balances are stored as Pedersen commitments
 //!   - The committed-input commitment C_ci of a ZK-Pari proof IS the ledger
 //!     commitment: the transfer value is a committed input, hidden by the
@@ -10,7 +10,7 @@
 //!   - A full proof is 3 G1 + 1 F; since C_ci is ledger state here, the
 //!     incremental proof material is 2 G1 + 1 F per range proof
 //!
-//! Run with: cargo run --release --example private_transfer -p zkpari
+//! Run with: cargo run --release --example confidential_transfer -p zkpari
 
 use ark_bls12_381::Bls12_381;
 use ark_ec::pairing::Pairing;
@@ -108,7 +108,7 @@ fn main() {
     let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(2026_06_10);
 
     println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║       Private Transfers with Hidden Amounts (ZK-Pari)        ║");
+    println!("║     Confidential Transfers with Hidden Amounts (ZK-Pari)     ║");
     println!("║          vanishing-polynomial masks + committed inputs       ║");
     println!("╚══════════════════════════════════════════════════════════════╝\n");
 
@@ -166,11 +166,11 @@ fn main() {
         &format!("{}", bob.commitment)[..20]
     );
 
-    // ── 3. Private Transfer: Alice → Bob ─────────────────────────────────
+    // ── 3. Confidential Transfer: Alice → Bob ────────────────────────────
     let transfer_amount: u64 = 300;
     let remaining_balance: u64 = alice.balance - transfer_amount;
 
-    println!("3. Private Transfer: Alice sends {transfer_amount} tokens to Bob");
+    println!("3. Confidential Transfer: Alice sends {transfer_amount} tokens to Bob");
     println!("   (Validators see ONLY commitments and proofs, never amounts)\n");
 
     // 3a. Sender creates commitment to the transfer amount

@@ -1,7 +1,8 @@
 //! Experiment 2 — batch verification vs individual verification (BLS12-381).
 //!
-//! 2a: a (committed-input blocks) x (proofs per batch) grid, reporting
-//!     amortised cost per proof and the speedup over verifying one at a time.
+//! 2a: a (committed-input blocks) x (proofs per batch) grid of amortised cost
+//!     per proof, each cell annotated with its speedup over verifying one at a
+//!     time. Total wall clock (per-proof * N) is not printed separately.
 //! 2b: a phase breakdown at the largest batch, showing where the time goes.
 //!
 //! Batch verification replaces N independent `(3 + #blocks)`-pairing checks
@@ -191,7 +192,7 @@ fn fs_challenge(vk: &VerifyingKey<E>, x: &[Fr], p: &Proof<E>) -> Fr {
     t.get_and_append_challenge(b"r").unwrap()
 }
 
-const BLOCK_COUNTS: &[usize] = &[0, 1, 2, 4];
+const BLOCK_COUNTS: &[usize] = &[0, 1, 2, 4, 8, 16, 32, 64];
 const PROOF_COUNTS: &[usize] = &[1, 256, 4096, 65536];
 
 /// Circuit size is irrelevant to batch verification; keep it small so the
@@ -215,6 +216,8 @@ fn simulated_claim(
     blocks: usize,
     rng: &mut StdRng,
 ) -> Claim {
+    // Each claim is independent, so the pool can be built in parallel even
+    // when the measurements themselves are pinned to one thread.
     use ark_std::UniformRand;
     let c_ci: Vec<_> = (0..blocks)
         .map(|j| pk.pedersen_commit(j, &[Fr::rand(rng)], &CommittedInputOpening::rand(rng)))
@@ -283,17 +286,17 @@ fn print_grid(title: &str, rows: &[Row], cell: impl Fn(&Row, f64, usize) -> Stri
     println!("\n{title}");
     print!("  blocks │");
     for n in PROOF_COUNTS {
-        print!(" {:>11}", format!("N={n}"));
+        print!(" {:>16}", format!("N={n}"));
     }
     print!("\n  ───────┼");
     for _ in PROOF_COUNTS {
-        print!("────────────");
+        print!("─────────────────");
     }
     println!();
     for r in rows {
         print!("  {:>6} │", r.blocks);
         for (&ms, &n) in r.batch_ms.iter().zip(PROOF_COUNTS) {
-            print!(" {:>11}", cell(r, ms, n));
+            print!(" {:>16}", cell(r, ms, n));
         }
         println!();
     }
@@ -321,6 +324,8 @@ fn run() {
         .map(|&b| measure(b, max_proofs))
         .collect();
 
+    // The baseline the speedup column in the grid below divides by. Total wall
+    // clock is recoverable as per-proof * N, so it is not printed separately.
     println!("\nPer-proof cost of individual verification");
     println!("  blocks │ pairings │ verify us");
     println!("  ───────┼──────────┼──────────");
@@ -329,21 +334,13 @@ fn run() {
     }
 
     print_grid(
-        "2a. Amortised batch cost per proof (us)",
+        "2a. Amortised batch cost per proof: us (speedup vs individual)",
         &rows,
-        |_, ms, n| format!("{:.2}", ms * 1000.0 / n as f64),
+        |r, ms, n| {
+            let per_proof = ms * 1000.0 / n as f64;
+            format!("{per_proof:.2} ({:.1}x)", r.single_us / per_proof)
+        },
     );
-    print_grid(
-        "2a. Speedup over verifying one by one (N x individual / batch)",
-        &rows,
-        |r, ms, n| format!("{:.1}x", r.single_us * n as f64 / (ms * 1000.0)),
-    );
-    print_grid(
-        "Batch verification — total wall clock (ms)",
-        &rows,
-        |_, ms, _| format!("{ms:.2}"),
-    );
-
     println!("\n2b. Where the time goes at N={max_proofs} (ms)");
     println!("  Phases are re-executed against the public API — the library carries no");
     println!("  instrumentation — and their total is checked against `batch_verify`.");

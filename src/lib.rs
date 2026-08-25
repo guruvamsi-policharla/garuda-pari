@@ -44,15 +44,16 @@
 //! circuits can be wrapped in [`Uncommitted`] for proofs without committed
 //! inputs.
 //!
-//! # Batched private transfers
+//! # Batched confidential transfers
 //!
-//! The batched-transfer example uses two committed-input blocks: the claimed
+//! The batched-transfer design uses two committed-input blocks: the claimed
 //! amounts live in block 1 (size `B+1`), while block 2 holds a single
 //! random-linear-combination aggregate `v_theta`. The circuit enforces
 //! `sum_i theta^{i-1} v_i = v_theta` for a Fiat-Shamir challenge `theta`
 //! bound to the ledger commitments and block-1 commitment, which guarantees
 //! (w.h.p.) that the range-checked claimed amounts equal the committed ledger
-//! amounts. See `examples/batched_private_transfer.rs`.
+//! amounts. See `examples/confidential_transfer.rs` for the single-transfer
+//! flow.
 
 use ark_ec::pairing::Pairing;
 

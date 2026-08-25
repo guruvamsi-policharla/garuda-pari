@@ -1,0 +1,168 @@
+//! Fixed-depth Poseidon Merkle tree over receipts, standing in for the
+//! receipt MMR of the paper.
+//!
+//! The ledger appends each receipt `rho` as a leaf; empty positions hold the
+//! zero leaf. Depth is a parameter (the paper's MMR peaks are absorbed into a
+//! single fixed-depth root here, which upper-bounds the in-circuit cost: a
+//! real MMR membership path is at most `depth` hashes).
+
+use ark_r1cs_std::alloc::AllocVar;
+use ark_r1cs_std::boolean::Boolean;
+use ark_r1cs_std::eq::EqGadget;
+use ark_r1cs_std::fields::fp::FpVar;
+use ark_r1cs_std::select::CondSelectGadget;
+use ark_relations::gr1cs::{ConstraintSystemRef, SynthesisError};
+
+use ark_crypto_primitives::sponge::poseidon::PoseidonConfig;
+
+use super::super::Fr;
+use super::poseidon::{hash, hash_var, DOM_NODE};
+
+/// Authentication path: sibling hashes from the leaf level up, and the
+/// leaf-index bit per level (`true` = current node is the *right* child).
+#[derive(Clone, Debug)]
+pub struct MerklePath {
+    pub siblings: Vec<Fr>,
+    pub index_bits: Vec<bool>,
+}
+
+/// Append-only fixed-depth Merkle tree. Keeps every level in memory, which
+/// is fine for benchmark-sized leaf counts: level `j` holds
+/// `ceil(num_leaves / 2^j)` nodes and everything to the right is the
+/// all-zero subtree `zeros[j]`.
+pub struct MerkleTree {
+    cfg: PoseidonConfig<Fr>,
+    pub depth: usize,
+    /// `levels[0]` = leaves, ..., `levels[depth]` = root (if any leaf exists).
+    levels: Vec<Vec<Fr>>,
+    /// `zeros[j]` = root of the all-zero subtree of height `j`.
+    zeros: Vec<Fr>,
+}
+
+impl MerkleTree {
+    pub fn new(cfg: &PoseidonConfig<Fr>, depth: usize) -> Self {
+        let mut zeros = Vec::with_capacity(depth + 1);
+        zeros.push(Fr::from(0u64));
+        for j in 0..depth {
+            let z = zeros[j];
+            zeros.push(hash(cfg, DOM_NODE, &[z, z]));
+        }
+        Self {
+            cfg: cfg.clone(),
+            depth,
+            levels: vec![Vec::new(); depth + 1],
+            zeros,
+        }
+    }
+
+    pub fn num_leaves(&self) -> usize {
+        self.levels[0].len()
+    }
+
+    /// Append a leaf and rebuild the (sparse) upper levels.
+    pub fn append(&mut self, leaf: Fr) -> usize {
+        let index = self.levels[0].len();
+        assert!(index < 1usize << self.depth.min(63), "tree is full");
+        self.levels[0].push(leaf);
+        for j in 0..self.depth {
+            let next: Vec<Fr> = self.levels[j]
+                .chunks(2)
+                .map(|pair| {
+                    let left = pair[0];
+                    let right = if pair.len() == 2 { pair[1] } else { self.zeros[j] };
+                    hash(&self.cfg, DOM_NODE, &[left, right])
+                })
+                .collect();
+            self.levels[j + 1] = next;
+        }
+        index
+    }
+
+    pub fn root(&self) -> Fr {
+        *self.levels[self.depth].first().unwrap_or(&self.zeros[self.depth])
+    }
+
+    /// Authentication path for the leaf at `index`.
+    pub fn path(&self, index: usize) -> MerklePath {
+        assert!(index < self.num_leaves(), "no leaf at index {index}");
+        let mut siblings = Vec::with_capacity(self.depth);
+        let mut index_bits = Vec::with_capacity(self.depth);
+        for j in 0..self.depth {
+            let pos = index >> j;
+            let sib_pos = pos ^ 1;
+            let sib = *self.levels[j].get(sib_pos).unwrap_or(&self.zeros[j]);
+            siblings.push(sib);
+            index_bits.push(pos & 1 == 1);
+        }
+        MerklePath {
+            siblings,
+            index_bits,
+        }
+    }
+}
+
+/// Native root recomputation from a leaf and its path (for sanity checks).
+pub fn root_from_path(cfg: &PoseidonConfig<Fr>, leaf: Fr, path: &MerklePath) -> Fr {
+    let mut node = leaf;
+    for (sib, is_right) in path.siblings.iter().zip(&path.index_bits) {
+        let (l, r) = if *is_right { (*sib, node) } else { (node, *sib) };
+        node = hash(cfg, DOM_NODE, &[l, r]);
+    }
+    node
+}
+
+/// A [`MerklePath`] allocated in-circuit. Allocating once lets several root
+/// computations share the same siblings and index bits (as the indexed-tree
+/// insertion gadget requires).
+pub struct PathVars {
+    pub siblings: Vec<FpVar<Fr>>,
+    pub bits: Vec<Boolean<Fr>>,
+}
+
+/// Allocate a path's siblings and index bits as witnesses.
+pub fn alloc_path(
+    cs: ConstraintSystemRef<Fr>,
+    path: &MerklePath,
+) -> Result<PathVars, SynthesisError> {
+    let siblings = path
+        .siblings
+        .iter()
+        .map(|s| FpVar::new_witness(cs.clone(), || Ok(*s)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let bits = path
+        .index_bits
+        .iter()
+        .map(|b| Boolean::new_witness(cs.clone(), || Ok(*b)))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(PathVars { siblings, bits })
+}
+
+/// Hash `leaf` up an allocated path and return the resulting root.
+///
+/// Costs one Poseidon permutation plus two conditional selects per level.
+pub fn compute_root_var(
+    cs: ConstraintSystemRef<Fr>,
+    cfg: &PoseidonConfig<Fr>,
+    leaf: &FpVar<Fr>,
+    path: &PathVars,
+) -> Result<FpVar<Fr>, SynthesisError> {
+    let mut node = leaf.clone();
+    for (sib, is_right) in path.siblings.iter().zip(&path.bits) {
+        let left = FpVar::conditionally_select(is_right, sib, &node)?;
+        let right = FpVar::conditionally_select(is_right, &node, sib)?;
+        node = hash_var(cs.clone(), cfg, DOM_NODE, &[left, right])?;
+    }
+    Ok(node)
+}
+
+/// Allocate `path` as witnesses and enforce that `leaf` hashes up to `root`.
+pub fn enforce_membership(
+    cs: ConstraintSystemRef<Fr>,
+    cfg: &PoseidonConfig<Fr>,
+    leaf: &FpVar<Fr>,
+    root: &FpVar<Fr>,
+    path: &MerklePath,
+) -> Result<(), SynthesisError> {
+    let vars = alloc_path(cs.clone(), path)?;
+    compute_root_var(cs, cfg, leaf, &vars)?.enforce_equal(root)
+}

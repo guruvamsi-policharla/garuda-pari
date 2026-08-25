@@ -5,8 +5,8 @@
 #![allow(dead_code)]
 
 use ark_bls12_381::Bls12_381;
-use ark_ff::Field;
 use ark_ec::pairing::Pairing;
+use ark_ff::Field;
 use ark_relations::gr1cs::predicate::polynomial_constraint::SR1CS_PREDICATE_LABEL;
 use ark_relations::gr1cs::predicate::PredicateConstraintSystem;
 use ark_relations::gr1cs::{
@@ -15,6 +15,8 @@ use ark_relations::gr1cs::{
 use ark_relations::lc;
 use std::time::Instant;
 use zkpari::ZkPariCircuit;
+
+pub mod private;
 
 pub type E = Bls12_381;
 pub type Fr = <E as Pairing>::ScalarField;
@@ -117,6 +119,65 @@ impl<F: Field> ZkPariCircuit<F> for SquareChain {
         cs.enforce_sr1cs_constraint(|| lc!() + out - prev, || lc!() + prev - prev)?;
 
         Ok(blocks)
+    }
+}
+
+/// The confidential-transfer (Zether-style) range circuit in *native* SR1CS:
+/// proves the witness `value` is in [0, 2^`bits`) and declares it as the
+/// single committed input, so the proof's `c_ci[0]` is a Pedersen commitment
+/// to the amount under the CRS basis — the ledger commitment itself.
+///
+/// Bit-width-parametric version of the circuit in
+/// `examples/confidential_transfer.rs`: `bits` boolean rows + 1 packing row
+/// (+ 2 instance-outlining rows appended by keygen).
+#[derive(Clone, Copy)]
+pub struct ConfidentialRangeCircuit {
+    pub value: u64,
+    pub bits: usize,
+}
+
+impl<F: Field> ZkPariCircuit<F> for ConfidentialRangeCircuit {
+    fn synthesize(self, cs: ConstraintSystemRef<F>) -> Result<Vec<Vec<Variable>>, SynthesisError> {
+        cs.remove_predicate(R1CS_PREDICATE_LABEL);
+        let _ = cs.register_predicate(
+            SR1CS_PREDICATE_LABEL,
+            PredicateConstraintSystem::new_sr1cs_predicate()
+                .map_err(|_| SynthesisError::Unsatisfiable)?,
+        );
+
+        assert!(self.bits <= 64, "value is a u64");
+        if self.bits < 64 {
+            assert!(self.value < 1u64 << self.bits, "value out of range");
+        }
+
+        // The committed input (declared in the return value below).
+        let v = cs.new_witness_variable(|| Ok(F::from(self.value)))?;
+
+        let mut bit_vars = Vec::with_capacity(self.bits);
+        for i in 0..self.bits {
+            let b = cs.new_witness_variable(|| {
+                Ok(if (self.value >> i) & 1 == 1 { F::ONE } else { F::ZERO })
+            })?;
+            bit_vars.push(b);
+        }
+
+        // (sum(b_i * 2^i) - v)^2 = 0, with `v - v` as the zero RHS to avoid
+        // the empty-LC -> symbolic_lc(0) aliasing bug.
+        let mut recon_minus_v = lc!() - v;
+        let mut coeff = F::ONE;
+        for &b in &bit_vars {
+            recon_minus_v = recon_minus_v + (coeff, b);
+            coeff.double_in_place();
+        }
+        cs.enforce_sr1cs_constraint(|| recon_minus_v, || lc!() + v - v)?;
+
+        // b_i^2 = b_i
+        for &b in &bit_vars {
+            cs.enforce_sr1cs_constraint(|| lc!() + b, || lc!() + b)?;
+        }
+
+        // Declare v as the single committed-input block.
+        Ok(vec![vec![v]])
     }
 }
 
