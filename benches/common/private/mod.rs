@@ -1,7 +1,9 @@
 //! The private-transfer circuits from the paper (R_send, R_recv) and their
-//! Poseidon/Merkle building blocks.
+//! hash/Merkle building blocks. Every hash goes through [`hasher`], which
+//! Pedersen over Jubjub for Merkle nodes, indexed leaves, and commitments;
+//! SHA-256 for the nullifier/tag CRPRFs.
 //!
-//! Account commitments are Poseidon values opened in-circuit as public
+//! Account commitments are hash values opened in-circuit as public
 //! inputs, so these proofs carry **zero** committed-input blocks (2 G1 + 1 F
 //! on the wire, 3 pairings to verify); wrap the circuits in
 //! `zkpari::Uncommitted` for keygen/prove.
@@ -17,9 +19,9 @@
 //! receipt anchor (rootrho in the W most recent roots) and receiver
 //! registration.
 
+pub mod hasher;
 pub mod indexed;
 pub mod merkle;
-pub mod poseidon;
 pub mod recv;
 pub mod send;
 

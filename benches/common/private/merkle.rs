@@ -1,5 +1,5 @@
-//! Fixed-depth Poseidon Merkle tree over receipts, standing in for the
-//! receipt MMR of the paper.
+//! Fixed-depth Merkle tree over receipts (hash backend from [`super::hasher`]),
+//! standing in for the receipt MMR of the paper.
 //!
 //! The ledger appends each receipt `rho` as a leaf; empty positions hold the
 //! zero leaf. Depth is a parameter (the paper's MMR peaks are absorbed into a
@@ -13,10 +13,8 @@ use ark_r1cs_std::fields::fp::FpVar;
 use ark_r1cs_std::select::CondSelectGadget;
 use ark_relations::gr1cs::{ConstraintSystemRef, SynthesisError};
 
-use ark_crypto_primitives::sponge::poseidon::PoseidonConfig;
-
 use super::super::Fr;
-use super::poseidon::{hash, hash_var, DOM_NODE};
+use super::hasher::{hash, hash_var, HashCfg, DOM_NODE};
 
 /// Authentication path: sibling hashes from the leaf level up, and the
 /// leaf-index bit per level (`true` = current node is the *right* child).
@@ -31,7 +29,7 @@ pub struct MerklePath {
 /// `ceil(num_leaves / 2^j)` nodes and everything to the right is the
 /// all-zero subtree `zeros[j]`.
 pub struct MerkleTree {
-    cfg: PoseidonConfig<Fr>,
+    cfg: HashCfg,
     pub depth: usize,
     /// `levels[0]` = leaves, ..., `levels[depth]` = root (if any leaf exists).
     levels: Vec<Vec<Fr>>,
@@ -40,7 +38,7 @@ pub struct MerkleTree {
 }
 
 impl MerkleTree {
-    pub fn new(cfg: &PoseidonConfig<Fr>, depth: usize) -> Self {
+    pub fn new(cfg: &HashCfg, depth: usize) -> Self {
         let mut zeros = Vec::with_capacity(depth + 1);
         zeros.push(Fr::from(0u64));
         for j in 0..depth {
@@ -102,7 +100,7 @@ impl MerkleTree {
 }
 
 /// Native root recomputation from a leaf and its path (for sanity checks).
-pub fn root_from_path(cfg: &PoseidonConfig<Fr>, leaf: Fr, path: &MerklePath) -> Fr {
+pub fn root_from_path(cfg: &HashCfg, leaf: Fr, path: &MerklePath) -> Fr {
     let mut node = leaf;
     for (sib, is_right) in path.siblings.iter().zip(&path.index_bits) {
         let (l, r) = if *is_right { (*sib, node) } else { (node, *sib) };
@@ -139,10 +137,9 @@ pub fn alloc_path(
 
 /// Hash `leaf` up an allocated path and return the resulting root.
 ///
-/// Costs one Poseidon permutation plus two conditional selects per level.
+/// Costs one node hash plus two conditional selects per level.
 pub fn compute_root_var(
-    cs: ConstraintSystemRef<Fr>,
-    cfg: &PoseidonConfig<Fr>,
+    cfg: &HashCfg,
     leaf: &FpVar<Fr>,
     path: &PathVars,
 ) -> Result<FpVar<Fr>, SynthesisError> {
@@ -150,7 +147,7 @@ pub fn compute_root_var(
     for (sib, is_right) in path.siblings.iter().zip(&path.bits) {
         let left = FpVar::conditionally_select(is_right, sib, &node)?;
         let right = FpVar::conditionally_select(is_right, &node, sib)?;
-        node = hash_var(cs.clone(), cfg, DOM_NODE, &[left, right])?;
+        node = hash_var(cfg, DOM_NODE, &[left, right])?;
     }
     Ok(node)
 }
@@ -158,11 +155,11 @@ pub fn compute_root_var(
 /// Allocate `path` as witnesses and enforce that `leaf` hashes up to `root`.
 pub fn enforce_membership(
     cs: ConstraintSystemRef<Fr>,
-    cfg: &PoseidonConfig<Fr>,
+    cfg: &HashCfg,
     leaf: &FpVar<Fr>,
     root: &FpVar<Fr>,
     path: &MerklePath,
 ) -> Result<(), SynthesisError> {
-    let vars = alloc_path(cs.clone(), path)?;
-    compute_root_var(cs, cfg, leaf, &vars)?.enforce_equal(root)
+    let vars = alloc_path(cs, path)?;
+    compute_root_var(cfg, leaf, &vars)?.enforce_equal(root)
 }

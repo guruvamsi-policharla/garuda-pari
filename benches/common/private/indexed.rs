@@ -14,17 +14,16 @@
 //! `mt.AccVerifyInsert(root, key, pi_mt) = root'` moved inside the SNARK:
 //! the ledger then only compares `root` against its stored 32-byte root and
 //! swaps in `root'` — no per-transaction hashing, and no `pi_mt` on the
-//! wire. Cost: four hash-chains of `depth` Poseidon permutations (old low
+//! wire. Cost: four hash-chains of `depth` node hashes (old low
 //! leaf up to `root`, updated low leaf up to the intermediate root, the
 //! empty slot up to the same intermediate root, the new leaf up to `root'`)
 //! plus three leaf hashes and two 128-bit comparisons.
 //!
-//! Tree keys are the low 128 bits of the (Poseidon-output) nullifier/tag —
+//! Tree keys are the low 128 bits of the (hash-output) nullifier/tag —
 //! full field elements cannot be compared soundly in-circuit without their
 //! own decomposition, and 128 bits keeps collisions negligible while making
 //! the ordering checks cheap.
 
-use ark_crypto_primitives::sponge::poseidon::PoseidonConfig;
 use ark_ff::{BigInt, PrimeField, Zero};
 use ark_r1cs_std::alloc::AllocVar;
 use ark_r1cs_std::boolean::Boolean;
@@ -36,8 +35,8 @@ use ark_r1cs_std::select::CondSelectGadget;
 use ark_relations::gr1cs::{ConstraintSystemRef, SynthesisError};
 
 use super::super::Fr;
+use super::hasher::{hash, hash_var, HashCfg, DOM_ILEAF, DOM_NODE};
 use super::merkle::{alloc_path, compute_root_var, MerklePath};
-use super::poseidon::{hash, hash_var, DOM_ILEAF, DOM_NODE};
 use super::{enforce_lt_128, enforce_range_bits};
 
 /// Truncate a field element to the low 128 bits — the indexed-tree key of a
@@ -104,7 +103,7 @@ impl IndexedInsertion {
 /// Fixed-depth indexed Merkle tree, rebuilt eagerly on each insert (fine for
 /// benchmark-sized trees; empty slots to the right are all-zero subtrees).
 pub struct IndexedMerkleTree {
-    cfg: PoseidonConfig<Fr>,
+    cfg: HashCfg,
     pub depth: usize,
     leaves: Vec<IndexedLeaf>,
     /// `levels[0]` = leaf hashes, ..., `levels[depth]` = root.
@@ -114,7 +113,7 @@ pub struct IndexedMerkleTree {
 }
 
 impl IndexedMerkleTree {
-    pub fn new(cfg: &PoseidonConfig<Fr>, depth: usize) -> Self {
+    pub fn new(cfg: &HashCfg, depth: usize) -> Self {
         let mut zeros = Vec::with_capacity(depth + 1);
         zeros.push(Fr::zero());
         for j in 0..depth {
@@ -250,7 +249,7 @@ pub fn key_from_field_var(x: &FpVar<Fr>) -> Result<FpVar<Fr>, SynthesisError> {
 /// linked-list invariant, which every accepted insertion preserves.
 pub fn enforce_indexed_insert(
     cs: ConstraintSystemRef<Fr>,
-    cfg: &PoseidonConfig<Fr>,
+    cfg: &HashCfg,
     key: &FpVar<Fr>,
     key_val: Fr,
     root_old: &FpVar<Fr>,
@@ -268,12 +267,11 @@ pub fn enforce_indexed_insert(
     // 1. The low leaf is in the tree under root_old.
     let low_path = alloc_path(cs.clone(), &ins.low_path)?;
     let low_hash = hash_var(
-        cs.clone(),
         cfg,
         DOM_ILEAF,
         &[low_value.clone(), low_next.clone(), low_next_index.clone()],
     )?;
-    compute_root_var(cs.clone(), cfg, &low_hash, &low_path)?.enforce_equal(root_old)?;
+    compute_root_var(cfg, &low_hash, &low_path)?.enforce_equal(root_old)?;
 
     // 2. Non-membership: low.value < key < low.next_value, where a zero
     //    next_value means "list maximum" and compares as 2^128.
@@ -289,30 +287,20 @@ pub fn enforce_indexed_insert(
 
     // 3. The new slot's position, bound to the value hashed into the
     //    updated low leaf.
-    let new_path = alloc_path(cs.clone(), &ins.new_path)?;
+    let new_path = alloc_path(cs, &ins.new_path)?;
     let new_index = Boolean::le_bits_to_fp(&new_path.bits)?;
 
     // 4. Updated low leaf (successor becomes the new leaf) -> intermediate
     //    root, over the *same* siblings as step 1.
-    let low_updated_hash = hash_var(
-        cs.clone(),
-        cfg,
-        DOM_ILEAF,
-        &[low_value, key.clone(), new_index],
-    )?;
-    let mid_root = compute_root_var(cs.clone(), cfg, &low_updated_hash, &low_path)?;
+    let low_updated_hash = hash_var(cfg, DOM_ILEAF, &[low_value, key.clone(), new_index])?;
+    let mid_root = compute_root_var(cfg, &low_updated_hash, &low_path)?;
 
     // 5. The new slot is empty under the intermediate root...
-    compute_root_var(cs.clone(), cfg, &FpVar::zero(), &new_path)?.enforce_equal(&mid_root)?;
+    compute_root_var(cfg, &FpVar::zero(), &new_path)?.enforce_equal(&mid_root)?;
 
     // 6. ...and holds the new leaf under root_new.
-    let new_leaf_hash = hash_var(
-        cs.clone(),
-        cfg,
-        DOM_ILEAF,
-        &[key.clone(), low_next, low_next_index],
-    )?;
-    compute_root_var(cs, cfg, &new_leaf_hash, &new_path)?.enforce_equal(root_new)?;
+    let new_leaf_hash = hash_var(cfg, DOM_ILEAF, &[key.clone(), low_next, low_next_index])?;
+    compute_root_var(cfg, &new_leaf_hash, &new_path)?.enforce_equal(root_new)?;
 
     Ok(())
 }

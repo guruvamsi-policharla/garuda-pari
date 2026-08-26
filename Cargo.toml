@@ -23,7 +23,8 @@ rayon = { version = "1.5.2" }
 # Curves for tests, examples, and benchmarks
 ark-bls12-381 = { version = "0.6.0", default-features = false, features = ["curve"] }
 ark-bn254 = { version = "0.6.0", default-features = false, features = ["curve"] }
-ark-crypto-primitives = { version = "0.6", features = ["sponge", "constraints"] }
+ark-crypto-primitives = { version = "0.6", features = ["crh", "constraints"] }
+ark-ed-on-bls12-381 = { version = "0.6.0", features = ["r1cs"] }
 ark-r1cs-std = "0.6"
 
 [[bench]]

@@ -21,7 +21,6 @@
 //! root, and the ledger checks `rootrho` against its retained root history
 //! (the W most recent roots) natively.
 
-use ark_crypto_primitives::sponge::poseidon::PoseidonConfig;
 use ark_r1cs_std::alloc::AllocVar;
 use ark_r1cs_std::eq::EqGadget;
 use ark_r1cs_std::fields::fp::FpVar;
@@ -30,16 +29,16 @@ use ark_relations::gr1cs::{ConstraintSynthesizer, ConstraintSystemRef, Synthesis
 
 use super::super::Fr;
 use super::enforce_range_64;
+use super::hasher::{hash, hash_var, HashCfg, DOM_ACCT, DOM_REC};
 use super::indexed::{
     enforce_indexed_insert, key_from_field_var, truncate_to_key, IndexedInsertion,
     IndexedMerkleTree,
 };
 use super::merkle::{enforce_membership, MerklePath, MerkleTree};
-use super::poseidon::{hash, hash_var, DOM_ACCT, DOM_REC};
 
 #[derive(Clone)]
 pub struct RecvCircuit {
-    pub cfg: PoseidonConfig<Fr>,
+    pub cfg: HashCfg,
     /// Acting receiver identifier (public).
     pub rec: Fr,
     /// Revealed nullifier of the consumed receipt (public).
@@ -70,7 +69,7 @@ pub struct RecvCircuit {
 impl RecvCircuit {
     /// A satisfiable instance of the given depths, for keygen and
     /// constraint counting.
-    pub fn blank(cfg: &PoseidonConfig<Fr>, receipt_depth: usize, acct_depth: usize) -> Self {
+    pub fn blank(cfg: &HashCfg, receipt_depth: usize, acct_depth: usize) -> Self {
         let mut receipt_tree = MerkleTree::new(cfg, receipt_depth);
         let mut null_tree = IndexedMerkleTree::new(cfg, acct_depth);
         let mut blank = Self {
@@ -162,22 +161,14 @@ impl ConstraintSynthesizer<Fr> for RecvCircuit {
         let sen = FpVar::new_witness(cs.clone(), || Ok(self.sen))?;
 
         // com = Com_acct(b, kappa; r)
-        hash_var(cs.clone(), &self.cfg, DOM_ACCT, &[b.clone(), kappa.clone(), r])?
-            .enforce_equal(&com)?;
+        hash_var(&self.cfg, DOM_ACCT, &[b.clone(), kappa.clone(), r])?.enforce_equal(&com)?;
 
         // com' = Com_acct(b + v, kappa; r') — same PRF key, credited balance.
         let b_new = &b + &v;
-        hash_var(
-            cs.clone(),
-            &self.cfg,
-            DOM_ACCT,
-            &[b_new.clone(), kappa, r_new],
-        )?
-        .enforce_equal(&com_new)?;
+        hash_var(&self.cfg, DOM_ACCT, &[b_new.clone(), kappa, r_new])?.enforce_equal(&com_new)?;
 
         // rho = Com_rec(v, Sen, Rec, nullifier; r'')
         let receipt = hash_var(
-            cs.clone(),
             &self.cfg,
             DOM_REC,
             &[v.clone(), sen, rec, nullifier.clone(), r_receipt],

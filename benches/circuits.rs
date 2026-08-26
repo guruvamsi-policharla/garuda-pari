@@ -8,17 +8,23 @@
 //!     3 G1 + 1 F, of which C_ci is ledger state (incremental 2 G1 + 1 F).
 //!
 //!   - *Private transfer* (the paper's R_send / R_recv): unlinkable payments
-//!     over Poseidon account commitments opened in-circuit as public inputs.
-//!     Zero committed-input blocks — the proof is 2 G1 + 1 F and verification
-//!     is 3 pairings. Both relations verify the paper's `AccVerifyInsert`
-//!     *in-circuit*: the per-account nullifier/tag trees are user-maintained
-//!     indexed Merkle trees (with the non-membership low-leaf argument, so
-//!     double-receives are impossible), the statement carries (root, root'),
-//!     and the ledger's only tree work is compare-and-swap on 32-byte roots.
-//!     Batch verification cost is independent of circuit size, so the added
-//!     constraints are free for the ledger — they only cost the prover.
+//!     over hash-based account commitments opened in-circuit as public
+//!     inputs. Zero committed-input blocks — the proof is 2 G1 + 1 F and
+//!     verification is 3 pairings. Both relations verify the paper's
+//!     `AccVerifyInsert` *in-circuit*: the per-account nullifier/tag trees
+//!     are user-maintained indexed Merkle trees (with the non-membership
+//!     low-leaf argument, so double-receives are impossible), the statement
+//!     carries (root, root'), and the ledger's only tree work is
+//!     compare-and-swap on 32-byte roots. Batch verification cost is
+//!     independent of circuit size, so the added constraints are free for
+//!     the ledger — they only cost the prover.
 //!     The account-tree depth is swept over {10, 20}; the receipt-tree
 //!     membership path in R_recv is fixed at depth 40.
+//!
+//!   Hashes follow the Sapling split (see `common/private/hasher.rs`):
+//!   Pedersen over Jubjub for Merkle nodes, indexed-tree leaves, and
+//!   commitments; SHA-256 for the two CRPRF call sites (nullifier and tag
+//!   derivation, R_send only — R_recv has no PRF call).
 //!
 //!   What stays native and unbenchmarked here: the ledger's root-history
 //!   check on the revealed receipt anchor (rootrho in the retained set of
@@ -48,9 +54,9 @@ use ark_relations::gr1cs::{ConstraintSynthesizer, ConstraintSystem};
 use ark_std::rand::{rngs::StdRng, Rng, SeedableRng};
 use ark_std::UniformRand;
 
+use common::private::hasher::HashCfg;
 use common::private::indexed::{truncate_to_key, IndexedInsertion, IndexedMerkleTree};
 use common::private::merkle::{root_from_path, MerkleTree};
-use common::private::poseidon::poseidon_config;
 use common::private::recv::RecvCircuit;
 use common::private::send::SendCircuit;
 use common::*;
@@ -93,6 +99,7 @@ fn measure<C: ZkPariCircuit<Fr> + Clone>(
     circuit: C,
     public_input: &[Fr],
     r1cs: Option<usize>,
+    prove_iters: usize,
     rng: &mut StdRng,
 ) -> Row {
     eprint!("  {name:<24} keygen ...");
@@ -102,9 +109,9 @@ fn measure<C: ZkPariCircuit<Fr> + Clone>(
     });
     let (pk, vk) = keys.unwrap();
 
-    eprint!(" prove x{PROVE_ITERS} ...");
+    eprint!(" prove x{prove_iters} ...");
     let mut proof = None;
-    let prove_ms = median_ms(PROVE_ITERS, || {
+    let prove_ms = median_ms(prove_iters, || {
         proof = Some(ZkPari::<E>::prove(circuit.clone(), &pk, rng).expect("proving failed"));
     });
     let proof = proof.unwrap();
@@ -135,12 +142,17 @@ fn measure<C: ZkPariCircuit<Fr> + Clone>(
 }
 
 /// R1CS constraints a gadget circuit emits, before the SR1CS adapter.
+/// Also asserts the witnessed instance actually satisfies the constraints,
+/// catching native/in-circuit hash mismatches before the expensive keygen.
 fn r1cs_count<C: ConstraintSynthesizer<Fr>>(circuit: C) -> usize {
     let cs = ConstraintSystem::<Fr>::new_ref();
     circuit
         .generate_constraints(cs.clone())
         .expect("synthesis failed");
-    cs.num_constraints()
+    let count = cs.num_constraints();
+    cs.finalize();
+    assert_eq!(cs.is_satisfied(), Ok(true), "instance does not satisfy the circuit");
+    count
 }
 
 fn run() {
@@ -150,8 +162,9 @@ fn run() {
     println!("╚══════════════════════════════════════════════════════════════════════╝");
     println!();
     println!("Threads: {}.", thread_label());
-    println!("Poseidon: width 5 (rate 4), alpha 5, 8 full / 60 partial rounds;");
-    println!("          one config for commitments, PRFs, and both tree node types.");
+    println!("Hashes (Sapling split): Pedersen/Jubjub (8-bit byte windows) for");
+    println!("          Merkle nodes, indexed leaves, and commitments; SHA-256 for");
+    println!("          the nullifier/tag CRPRFs (R_send only).");
     println!("Private transfer: indexed-tree insertion (AccVerifyInsert) proved");
     println!("          in-circuit; account-tree depth swept over {ACCT_TREE_DEPTHS:?},");
     println!("          receipt-tree membership fixed at depth {RECEIPT_DEPTH}.");
@@ -162,7 +175,7 @@ fn run() {
     e2e_flow(&mut rng);
 
     // ── Benchmark table ─────────────────────────────────────────────────
-    let cfg = poseidon_config();
+    let cfg = HashCfg::new();
     let mut rows = Vec::new();
 
     for &bits in RANGE_BITS {
@@ -175,6 +188,7 @@ fn run() {
             circuit,
             &[],
             None,
+            PROVE_ITERS,
             &mut rng,
         ));
     }
@@ -182,10 +196,11 @@ fn run() {
     for &depth in ACCT_TREE_DEPTHS {
         let send = random_send(&cfg, depth, &mut rng);
         rows.push(measure(
-            &format!("R_send tag d{depth}"),
+            &format!("R_send d{depth}"),
             Uncommitted(send.clone()),
             &send.public_input(),
             Some(r1cs_count(send.clone())),
+            PROVE_ITERS,
             &mut rng,
         ));
     }
@@ -193,20 +208,21 @@ fn run() {
     for &depth in ACCT_TREE_DEPTHS {
         let recv = random_recv(&cfg, RECEIPT_DEPTH, depth, &mut rng);
         rows.push(measure(
-            &format!("R_recv rcpt40 null d{depth}"),
+            &format!("R_recv d{depth}"),
             Uncommitted(recv.clone()),
             &recv.public_input(),
             Some(r1cs_count(recv.clone())),
+            PROVE_ITERS,
             &mut rng,
         ));
     }
 
     println!();
-    println!("  circuit                  │  r1cs │ sr1cs │ domain │ |x| │ blocks │ keygen ms │ prove ms │ verify us │ proof B");
-    println!("  ─────────────────────────┼───────┼───────┼────────┼─────┼────────┼───────────┼──────────┼───────────┼────────");
+    println!("  circuit                  │    r1cs │    sr1cs │   domain │ |x| │ blocks │ keygen ms │ prove ms │ verify us │ proof B");
+    println!("  ─────────────────────────┼─────────┼──────────┼──────────┼─────┼────────┼───────────┼──────────┼───────────┼────────");
     for r in &rows {
         println!(
-            "  {:<24} │ {:>5} │ {:>5} │ {:>6} │ {:>3} │ {:>6} │ {:>9.1} │ {:>8.1} │ {:>9.1} │ {:>6}",
+            "  {:<24} │ {:>7} │ {:>8} │ {:>8} │ {:>3} │ {:>6} │ {:>9.1} │ {:>8.1} │ {:>9.1} │ {:>6}",
             r.name,
             r.r1cs.map_or_else(|| "—".to_string(), |n| n.to_string()),
             r.sr1cs,
@@ -226,11 +242,7 @@ fn run() {
 
 // ── Random instances for the table ──────────────────────────────────────
 
-fn random_send(
-    cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<Fr>,
-    tag_depth: usize,
-    rng: &mut StdRng,
-) -> SendCircuit {
+fn random_send(cfg: &HashCfg, tag_depth: usize, rng: &mut StdRng) -> SendCircuit {
     // The sender's tag tree, with a few earlier payments in it.
     let mut tag_tree = IndexedMerkleTree::new(cfg, tag_depth);
     for _ in 0..3 {
@@ -256,7 +268,7 @@ fn random_send(
 }
 
 fn random_recv(
-    cfg: &ark_crypto_primitives::sponge::poseidon::PoseidonConfig<Fr>,
+    cfg: &HashCfg,
     receipt_depth: usize,
     null_depth: usize,
     rng: &mut StdRng,
@@ -305,7 +317,7 @@ fn random_recv(
 
 fn e2e_flow(rng: &mut StdRng) {
     const ACCT_DEPTH: usize = 10;
-    let cfg = poseidon_config();
+    let cfg = HashCfg::new();
 
     println!(
         "End-to-end private transfer (receipts d{RECEIPT_DEPTH}, account trees d{ACCT_DEPTH}): \

@@ -7,7 +7,7 @@
 //! Constraints:
 //!   com  = Com_acct(b, kappa; r)
 //!   com' = Com_acct(b - v, kappa; r')
-//!   nullifier = CRPRF_kappa(pay, Sen, zeta)     (stays inside the circuit)
+//!   nullifier = CRPRF_kappa(pay, Sen, zeta)
 //!   tag       = CRPRF_kappa(pad, Sen, zeta)
 //!   rho  = Com_rec(v, Sen, Rec, nullifier; r'')
 //!   mt.AccVerifyInsert(roottag, tag, pi_mt) = roottag'   (indexed tree)
@@ -19,9 +19,8 @@
 //! root and swapping in `roottag'`. The paper's `Rec in Accounts` line is
 //! not enforced here: the receiver need not be registered when the receipt
 //! is created. There are no committed-input blocks because account
-//! commitments are Poseidon values chained by the ledger.
+//! commitments are hash values chained by the ledger.
 
-use ark_crypto_primitives::sponge::poseidon::PoseidonConfig;
 use ark_r1cs_std::alloc::AllocVar;
 use ark_r1cs_std::eq::EqGadget;
 use ark_r1cs_std::fields::fp::FpVar;
@@ -30,15 +29,15 @@ use ark_relations::gr1cs::{ConstraintSynthesizer, ConstraintSystemRef, Synthesis
 
 use super::super::Fr;
 use super::enforce_range_64;
+use super::hasher::{hash, hash_var, HashCfg, DOM_ACCT, DOM_PAD, DOM_PAY, DOM_REC};
 use super::indexed::{
     enforce_indexed_insert, key_from_field_var, truncate_to_key, IndexedInsertion,
     IndexedMerkleTree,
 };
-use super::poseidon::{hash, hash_var, DOM_ACCT, DOM_PAD, DOM_PAY, DOM_REC};
 
 #[derive(Clone)]
 pub struct SendCircuit {
-    pub cfg: PoseidonConfig<Fr>,
+    pub cfg: HashCfg,
     /// Acting sender identifier (public).
     pub sen: Fr,
     /// Current balance.
@@ -135,40 +134,27 @@ impl ConstraintSynthesizer<Fr> for SendCircuit {
         let zeta = FpVar::new_witness(cs.clone(), || Ok(self.zeta))?;
 
         // com = Com_acct(b, kappa; r)
-        hash_var(cs.clone(), &self.cfg, DOM_ACCT, &[b.clone(), kappa.clone(), r])?
-            .enforce_equal(&com)?;
+        hash_var(&self.cfg, DOM_ACCT, &[b.clone(), kappa.clone(), r])?.enforce_equal(&com)?;
 
         // com' = Com_acct(b - v, kappa; r')
         let b_new = &b - &v;
-        hash_var(
-            cs.clone(),
-            &self.cfg,
-            DOM_ACCT,
-            &[b_new.clone(), kappa.clone(), r_new],
-        )?
-        .enforce_equal(&com_new)?;
+        hash_var(&self.cfg, DOM_ACCT, &[b_new.clone(), kappa.clone(), r_new])?
+            .enforce_equal(&com_new)?;
 
         // nullifier = CRPRF_kappa(pay, Sen, zeta); stays private here — the
         // receiver reveals it when consuming the receipt.
         let nullifier = hash_var(
-            cs.clone(),
             &self.cfg,
             DOM_PAY,
             &[kappa.clone(), sen.clone(), zeta.clone()],
         )?;
 
         // tag = CRPRF_kappa(pad, Sen, zeta), inserted into the sender's tag tree.
-        hash_var(cs.clone(), &self.cfg, DOM_PAD, &[kappa, sen.clone(), zeta])?
-            .enforce_equal(&tag)?;
+        hash_var(&self.cfg, DOM_PAD, &[kappa, sen.clone(), zeta])?.enforce_equal(&tag)?;
 
         // rho = Com_rec(v, Sen, Rec, nullifier; r'')
-        hash_var(
-            cs.clone(),
-            &self.cfg,
-            DOM_REC,
-            &[v.clone(), sen, rec, nullifier, r_receipt],
-        )?
-        .enforce_equal(&receipt)?;
+        hash_var(&self.cfg, DOM_REC, &[v.clone(), sen, rec, nullifier, r_receipt])?
+            .enforce_equal(&receipt)?;
 
         // mt.AccVerifyInsert(roottag, tag, pi_mt) = roottag': the indexed
         // tag-tree insertion, verified in-circuit.
