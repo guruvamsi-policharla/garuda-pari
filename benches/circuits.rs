@@ -10,21 +10,27 @@
 //!   - *Private transfer* (the paper's R_send / R_recv): unlinkable payments
 //!     over hash-based account commitments opened in-circuit as public
 //!     inputs. Zero committed-input blocks — the proof is 2 G1 + 1 F and
-//!     verification is 3 pairings. Both relations verify the paper's
-//!     `AccVerifyInsert` *in-circuit*: the per-account nullifier/tag trees
-//!     are user-maintained indexed Merkle trees (with the non-membership
-//!     low-leaf argument, so double-receives are impossible), the statement
-//!     carries (root, root'), and the ledger's only tree work is
-//!     compare-and-swap on 32-byte roots. Batch verification cost is
-//!     independent of circuit size, so the added constraints are free for
-//!     the ledger — they only cost the prover.
-//!     The account-tree depth is swept over {10, 20}; the receipt-tree
-//!     membership path in R_recv is fixed at depth 40.
+//!     verification is 3 pairings.
+//!     R_send is three Pedersen commitment openings plus range checks: no
+//!     tree, no PRF, no depth parameter. Account commitments are
+//!     `Com_acct(b, kappa, root_null; r)` — three data slots, so the
+//!     owner's indexed-nullifier-tree root is bound inside the commitment
+//!     and an account's entire public state is one hash. R_recv carries
+//!     all the hashing: the receipt's MMR opening at a witnessed position
+//!     `pos` (path ordering driven by the bits of pos, depth fixed at 40),
+//!     the nullifier derived in-circuit as CRPRF_kappa(recv, pos) — never
+//!     published — and the paper's `AccVerifyInsert` into the receiver's
+//!     user-maintained indexed nullifier tree (with the non-membership
+//!     low-leaf argument, so double-receives are impossible). The tree
+//!     roots are witnesses, bound inside `com` / `com'`; the statement is
+//!     `(R, com, com', root_rho)` and the receive submission is
+//!     `(R, com', root_rho, proof)`. The nullifier-tree depth is swept
+//!     over {10, 20}; R_send has one depth-independent row.
 //!
 //!   Hashes follow the Sapling split (see `common/private/hasher.rs`):
 //!   Pedersen over Jubjub for Merkle nodes, indexed-tree leaves, and
-//!   commitments; SHA-256 for the two CRPRF call sites (nullifier and tag
-//!   derivation, R_send only — R_recv has no PRF call).
+//!   commitments; SHA-256 for the single CRPRF call site (nullifier
+//!   derivation, R_recv only — R_send has no PRF call).
 //!
 //!   What stays native and unbenchmarked here: the ledger's root-history
 //!   check on the revealed receipt anchor (rootrho in the retained set of
@@ -38,10 +44,16 @@
 //!
 //! Before the table, an end-to-end flow runs as a correctness gate: Alice
 //! sends 300 to Bob (real prove/verify), the ledger compare-and-swaps her
-//! account commitment and tag root, appends the receipt, and records the new
-//! root in its history; Bob proves receipt + nullifier insertion against
-//! that anchor, the ledger checks the anchor is in its history, and tampered
-//! public inputs are rejected.
+//! (single) account commitment, appends the receipt to the MMR, and records
+//! the new root in its history; Bob locates the receipt's position in the
+//! public log, derives the nullifier under his own key, inserts it into his
+//! local indexed tree, recommits `(b + v, kappa, root_null')`, and proves
+//! R_recv against the recorded anchor. The receive submission is
+//! `(R, com', root_rho, proof)` — no nullifier and no tree root on the
+//! wire. Tampering with any public input of either statement is rejected,
+//! a proof for the same receipt at a wrong position is rejected, and
+//! replaying the same receive against Bob's updated commitment is rejected
+//! (the old `com` no longer matches the ledger).
 //!
 //! Threads: single-threaded by default. Set `ZKPARI_BENCH_THREADS=0` for all
 //! cores, or `=N` for N.
@@ -56,14 +68,14 @@ use ark_std::UniformRand;
 
 use common::private::hasher::HashCfg;
 use common::private::indexed::{truncate_to_key, IndexedInsertion, IndexedMerkleTree};
-use common::private::merkle::{root_from_path, MerkleTree};
+use common::private::merkle::{root_from_path, MerklePath, MerkleTree};
 use common::private::recv::RecvCircuit;
 use common::private::send::SendCircuit;
 use common::*;
 use zkpari::{Uncommitted, ZkPari, ZkPariCircuit};
 
-/// Depths of the user-maintained (indexed) nullifier/tag trees
-/// (2^10 / 2^20 lifetime payments per account).
+/// Depths of the user-maintained (indexed) nullifier trees
+/// (2^10 / 2^20 lifetime receipts per account). Only R_recv has one.
 const ACCT_TREE_DEPTHS: &[usize] = &[10, 20];
 
 /// Depth of the global receipt tree (R_recv membership path):
@@ -151,7 +163,11 @@ fn r1cs_count<C: ConstraintSynthesizer<Fr>>(circuit: C) -> usize {
         .expect("synthesis failed");
     let count = cs.num_constraints();
     cs.finalize();
-    assert_eq!(cs.is_satisfied(), Ok(true), "instance does not satisfy the circuit");
+    assert_eq!(
+        cs.is_satisfied(),
+        Ok(true),
+        "instance does not satisfy the circuit"
+    );
     count
 }
 
@@ -164,13 +180,24 @@ fn run() {
     println!("Threads: {}.", thread_label());
     println!("Hashes (Sapling split): Pedersen/Jubjub (8-bit byte windows) for");
     println!("          Merkle nodes, indexed leaves, and commitments; SHA-256 for");
-    println!("          the nullifier/tag CRPRFs (R_send only).");
-    println!("Private transfer: indexed-tree insertion (AccVerifyInsert) proved");
-    println!("          in-circuit; account-tree depth swept over {ACCT_TREE_DEPTHS:?},");
-    println!("          receipt-tree membership fixed at depth {RECEIPT_DEPTH}.");
+    println!("          the nullifier CRPRF (R_recv only — R_send has no hashing");
+    println!("          beyond its three commitment openings).");
+    println!("Private transfer: nullifier = CRPRF_kappa(recv, pos), derived and");
+    println!("          inserted in-circuit (AccVerifyInsert); the nullifier-tree");
+    println!("          root lives inside the account commitment. Nullifier-tree");
+    println!("          depth swept over {ACCT_TREE_DEPTHS:?}, receipt-tree opening");
+    println!("          fixed at depth {RECEIPT_DEPTH} and bound to the witnessed position.");
     println!();
 
     let mut rng = StdRng::seed_from_u64(20_260_825);
+
+    // Fast satisfiability gate at toy depths: catches native/in-circuit
+    // hash mismatches in seconds, before any keygen.
+    {
+        let cfg = HashCfg::new();
+        r1cs_count(random_send(&cfg, &mut rng));
+        r1cs_count(random_recv(&cfg, 6, 4, &mut rng));
+    }
 
     e2e_flow(&mut rng);
 
@@ -193,10 +220,10 @@ fn run() {
         ));
     }
 
-    for &depth in ACCT_TREE_DEPTHS {
-        let send = random_send(&cfg, depth, &mut rng);
+    {
+        let send = random_send(&cfg, &mut rng);
         rows.push(measure(
-            &format!("R_send d{depth}"),
+            "R_send",
             Uncommitted(send.clone()),
             &send.public_input(),
             Some(r1cs_count(send.clone())),
@@ -242,29 +269,20 @@ fn run() {
 
 // ── Random instances for the table ──────────────────────────────────────
 
-fn random_send(cfg: &HashCfg, tag_depth: usize, rng: &mut StdRng) -> SendCircuit {
-    // The sender's tag tree, with a few earlier payments in it.
-    let mut tag_tree = IndexedMerkleTree::new(cfg, tag_depth);
-    for _ in 0..3 {
-        tag_tree.insert(truncate_to_key(Fr::rand(rng)));
-    }
-
+fn random_send(cfg: &HashCfg, rng: &mut StdRng) -> SendCircuit {
     let b = rng.gen_range(1u64..u64::MAX / 2);
-    let mut send = SendCircuit {
+    SendCircuit {
         cfg: cfg.clone(),
         sen: Fr::rand(rng),
         b,
         v: rng.gen_range(1..=b),
         kappa: Fr::rand(rng),
+        root_null: Fr::rand(rng),
         r: Fr::rand(rng),
         r_new: Fr::rand(rng),
         r_receipt: Fr::rand(rng),
         rec: Fr::rand(rng),
-        zeta: Fr::rand(rng),
-        tag_insert: IndexedInsertion::placeholder(),
-    };
-    send.attach_tag_insertion(&mut tag_tree);
-    send
+    }
 }
 
 fn random_recv(
@@ -282,7 +300,6 @@ fn random_recv(
     let mut recv = RecvCircuit {
         cfg: cfg.clone(),
         rec: Fr::rand(rng),
-        nullifier: Fr::rand(rng),
         root: Fr::from(0u64), // set below
         b: rng.gen_range(0u64..u64::MAX / 2),
         v: rng.gen_range(1u64..u64::MAX / 4),
@@ -291,13 +308,13 @@ fn random_recv(
         r_new: Fr::rand(rng),
         r_receipt: Fr::rand(rng),
         sen: Fr::rand(rng),
-        path: common::private::merkle::MerklePath {
+        pos: 0, // set below
+        path: MerklePath {
             siblings: vec![],
             index_bits: vec![],
         },
         null_insert: IndexedInsertion::placeholder(),
     };
-    recv.attach_nullifier_insertion(&mut null_tree);
 
     // A small receipt tree with unrelated receipts around ours.
     let mut tree = MerkleTree::new(cfg, receipt_depth);
@@ -308,8 +325,12 @@ fn random_recv(
     for _ in 0..3 {
         tree.append(Fr::rand(rng));
     }
+    recv.pos = index as u64;
     recv.root = tree.root();
     recv.path = tree.path(index);
+
+    // The nullifier depends on (kappa, pos), so it is derived only now.
+    recv.attach_nullifier_insertion(&mut null_tree);
     recv
 }
 
@@ -320,22 +341,19 @@ fn e2e_flow(rng: &mut StdRng) {
     let cfg = HashCfg::new();
 
     println!(
-        "End-to-end private transfer (receipts d{RECEIPT_DEPTH}, account trees d{ACCT_DEPTH}): \
+        "End-to-end private transfer (receipts d{RECEIPT_DEPTH}, nullifier tree d{ACCT_DEPTH}): \
          Alice sends 300 to Bob"
     );
 
     // Trusted setup, one CRS per relation. Keygen only needs the circuit
     // *shape* (tree depths), so any instance of the right depths works.
-    let (send_pk, send_vk) = ZkPari::<E>::keygen(
-        Uncommitted(random_send(&cfg, ACCT_DEPTH, rng)),
-        rng,
-    );
+    let (send_pk, send_vk) = ZkPari::<E>::keygen(Uncommitted(random_send(&cfg, rng)), rng);
     let (recv_pk, recv_vk) = ZkPari::<E>::keygen(
         Uncommitted(RecvCircuit::blank(&cfg, RECEIPT_DEPTH, ACCT_DEPTH)),
         rng,
     );
 
-    // Global ledger state: the receipt tree and the retained root history
+    // Global ledger state: the receipt MMR and the retained root history
     // (the W most recent roots; receive anchors must be in it).
     let mut receipt_tree = MerkleTree::new(&cfg, RECEIPT_DEPTH);
     let mut root_history: Vec<Fr> = vec![receipt_tree.root()];
@@ -345,34 +363,32 @@ fn e2e_flow(rng: &mut StdRng) {
         root_history.push(receipt_tree.root());
     }
 
-    // Alice's account. She maintains her own tag tree; the ledger stores
-    // only (com, roottag).
-    let mut alice_tag_tree = IndexedMerkleTree::new(&cfg, ACCT_DEPTH);
-    alice_tag_tree.insert(truncate_to_key(Fr::rand(rng))); // an earlier payment
-    let mut alice = SendCircuit {
+    // Registration commits the empty-tree root inside the account
+    // commitment. The ledger stores exactly one commitment per account.
+    let empty_root = IndexedMerkleTree::new(&cfg, ACCT_DEPTH).root();
+    let alice = SendCircuit {
         cfg: cfg.clone(),
         sen: Fr::rand(rng),
         b: 1000,
         v: 300,
         kappa: Fr::rand(rng),
+        root_null: empty_root,
         r: Fr::rand(rng),
         r_new: Fr::rand(rng),
         r_receipt: Fr::rand(rng),
         rec: Fr::rand(rng), // Bob's identifier
-        zeta: Fr::rand(rng),
-        tag_insert: IndexedInsertion::placeholder(),
     };
-    let mut ledger_alice = (alice.com(), alice_tag_tree.root()); // (com, roottag)
+    let mut ledger_alice = alice.com();
 
-    // Bob's account and his nullifier tree; ledger stores (com, rootnull).
     let bob_kappa = Fr::rand(rng);
     let bob_r = Fr::rand(rng);
     let mut bob_null_tree = IndexedMerkleTree::new(&cfg, ACCT_DEPTH);
+    assert_eq!(bob_null_tree.root(), empty_root);
 
-    // 1. Alice inserts the tag into her tree and proves R_send; the ledger
-    //    verifies, then compare-and-swaps her commitment and tag root.
-    //    Statement order: (Sen, com, com', roottag, roottag', rho, tag).
-    alice.attach_tag_insertion(&mut alice_tag_tree);
+    // 1. Alice proves R_send; the ledger verifies, compare-and-swaps her
+    //    single commitment (key and nullifier-tree root unchanged), appends
+    //    rho to the receipt MMR, and records the new root in its history.
+    //    Statement order: (S, com, com', rho).
     let send_proof =
         ZkPari::<E>::prove(Uncommitted(alice.clone()), &send_pk, rng).expect("send proving failed");
     let send_x = alice.public_input();
@@ -380,25 +396,25 @@ fn e2e_flow(rng: &mut StdRng) {
         ZkPari::<E>::verify(&send_proof, &send_vk, &send_x),
         "send proof rejected"
     );
-    assert_eq!(send_x[1], ledger_alice.0, "statement must open Alice's account");
-    assert_eq!(send_x[3], ledger_alice.1, "statement must extend Alice's tag root");
-    ledger_alice = (send_x[2], send_x[4]); // swap in com' and roottag'
-    let receipt_index = receipt_tree.append(send_x[5]); // rho joins the tree
-
-    // The ledger records the new root in its retained history; receivers
-    // later reveal one of these roots as their membership anchor.
+    assert_eq!(
+        send_x[1], ledger_alice,
+        "statement must open Alice's account"
+    );
+    ledger_alice = send_x[2]; // swap in com'
+    let receipt_index = receipt_tree.append(send_x[3]); // rho joins the MMR
     root_history.push(receipt_tree.root());
     let anchor = *root_history.last().unwrap();
 
-    // 2. Bob learns (v, Sen, nullifier, r'') out of band, inserts the
-    //    nullifier into his tree, computes the receipt path from the public
-    //    log against the latest anchor, and proves R_recv.
-    //    Statement order: (Rec, com, rootnull, com', rootnull', nf, rootrho).
-    let bob_rootnull_before = bob_null_tree.root();
+    // 2. Alice forwards the opening (rho, v, S, R, r'') privately. Bob
+    //    locates rho's position in the public log, derives the nullifier
+    //    from (kappa_Bob, "recv", pos), inserts it into his local indexed
+    //    tree, recommits (b + v, kappa, root_null'), and proves R_recv
+    //    against the latest anchor. The submission is
+    //    (R, com', root_rho, proof) — no nullifier and no tree root on the
+    //    wire. Statement order: (R, com, com', root_rho).
     let mut bob = RecvCircuit {
         cfg: cfg.clone(),
         rec: alice.rec,
-        nullifier: alice.nullifier(),
         root: anchor,
         b: 500,
         v: alice.v,
@@ -407,11 +423,14 @@ fn e2e_flow(rng: &mut StdRng) {
         r_new: Fr::rand(rng),
         r_receipt: alice.r_receipt,
         sen: alice.sen,
+        pos: receipt_index as u64,
         path: receipt_tree.path(receipt_index),
         null_insert: IndexedInsertion::placeholder(),
     };
     bob.attach_nullifier_insertion(&mut bob_null_tree);
-    let mut ledger_bob = (bob.com(), bob_rootnull_before); // (com, rootnull)
+    // Register Bob: one commitment, empty-tree root bound inside it.
+    let mut ledger_bob = bob.com();
+    assert_eq!(bob.null_insert.old_root, empty_root);
 
     assert_eq!(
         bob.receipt(),
@@ -432,50 +451,91 @@ fn e2e_flow(rng: &mut StdRng) {
         "recv proof rejected"
     );
     assert!(
-        root_history.contains(&recv_x[6]),
+        root_history.contains(&recv_x[3]),
         "revealed anchor must be in the ledger's root history"
     );
-    assert_eq!(recv_x[1], ledger_bob.0, "statement must open Bob's account");
-    assert_eq!(recv_x[2], ledger_bob.1, "statement must extend Bob's nullifier root");
-    ledger_bob = (recv_x[3], recv_x[4]); // swap in com' and rootnull'
-    assert_eq!(ledger_bob.0, bob.com_new(), "credited commitment must open to b + v");
+    assert_eq!(recv_x[1], ledger_bob, "statement must open Bob's account");
+    ledger_bob = recv_x[2]; // swap in com'
     assert_eq!(
-        ledger_bob.1,
+        ledger_bob,
+        bob.com_new(),
+        "credited commitment must open to (b + v, kappa, root_null')"
+    );
+    assert_eq!(
+        bob.null_insert.new_root,
         bob_null_tree.root(),
-        "ledger root must match Bob's updated tree"
+        "committed root must match Bob's updated tree"
     );
 
-    // 3. Tampered statements must be rejected. (A double-receive cannot even
-    //    be witnessed: the indexed tree rejects duplicate keys, and no low
-    //    leaf satisfying the in-circuit ordering exists for a present key.)
-    let mut bad = recv_x.clone();
-    bad[5] = Fr::rand(rng); // different nullifier
-    assert!(
-        !ZkPari::<E>::verify(&recv_proof, &recv_vk, &bad),
-        "tampered nullifier accepted"
+    // 3. Tampering with *any* public input of either statement must be
+    //    rejected. (A double-receive cannot even be witnessed: the indexed
+    //    tree rejects duplicate keys, and no low leaf satisfying the
+    //    in-circuit ordering exists for a present key.)
+    for i in 0..recv_x.len() {
+        let mut bad = recv_x.clone();
+        bad[i] = Fr::rand(rng);
+        assert!(
+            !ZkPari::<E>::verify(&recv_proof, &recv_vk, &bad),
+            "tampered recv statement slot {i} accepted"
+        );
+    }
+    for i in 0..send_x.len() {
+        let mut bad = send_x.clone();
+        bad[i] = Fr::rand(rng);
+        assert!(
+            !ZkPari::<E>::verify(&send_proof, &send_vk, &bad),
+            "tampered send statement slot {i} accepted"
+        );
+    }
+
+    // 4. The same receipt at a wrong position must be rejected: the MMR
+    //    opening pins rho to its true position, and the position pins the
+    //    nullifier. Slot 0 holds another user's receipt, so no witness
+    //    exists — the constraint system is unsatisfiable, and a proof
+    //    forced from the bad witness fails verification.
+    let mut cheat = bob.clone();
+    cheat.pos = 0;
+    cheat.path = receipt_tree.path(0);
+    let mut cheat_tree = IndexedMerkleTree::new(&cfg, ACCT_DEPTH); // Bob's pre-receive state
+    cheat.attach_nullifier_insertion(&mut cheat_tree);
+
+    let cs = ConstraintSystem::<Fr>::new_ref();
+    cheat
+        .clone()
+        .generate_constraints(cs.clone())
+        .expect("synthesis failed");
+    cs.finalize();
+    assert_eq!(
+        cs.is_satisfied(),
+        Ok(false),
+        "wrong-position witness must not satisfy R_recv"
     );
-    let mut bad = recv_x.clone();
-    bad[6] = Fr::rand(rng); // anchor outside the root history
-    assert!(
-        !ZkPari::<E>::verify(&recv_proof, &recv_vk, &bad),
-        "tampered receipt root accepted"
+    if let Ok(forged) = ZkPari::<E>::prove(Uncommitted(cheat.clone()), &recv_pk, rng) {
+        assert!(
+            !ZkPari::<E>::verify(&forged, &recv_vk, &cheat.public_input()),
+            "wrong-position proof accepted"
+        );
+    }
+
+    // 5. Replaying the same receive against Bob's updated commitment is
+    //    rejected: the original statement's `com` no longer matches the
+    //    ledger, and rebinding the proof to the current commitment fails
+    //    verification.
+    assert_ne!(
+        recv_x[1], ledger_bob,
+        "replay: old com must no longer match the ledger"
     );
-    let mut bad = recv_x.clone();
-    bad[4] = Fr::rand(rng); // wrong post-insertion nullifier root
+    let mut replay = recv_x.clone();
+    replay[1] = ledger_bob;
     assert!(
-        !ZkPari::<E>::verify(&recv_proof, &recv_vk, &bad),
-        "tampered nullifier root accepted"
-    );
-    let mut bad = send_x.clone();
-    bad[4] = Fr::rand(rng); // wrong post-insertion tag root
-    assert!(
-        !ZkPari::<E>::verify(&send_proof, &send_vk, &bad),
-        "tampered tag root accepted"
+        !ZkPari::<E>::verify(&recv_proof, &recv_vk, &replay),
+        "replay against updated commitment accepted"
     );
 
     // Keep the linter honest about the updated ledger state.
     let _ = ledger_alice;
 
-    println!("  send + receive verified, ledger roots swapped, tampering rejected");
+    println!("  send + receive verified, ledger stores one commitment per account,");
+    println!("  tampering, wrong-position, and receive-replay rejected");
     println!();
 }

@@ -8,7 +8,6 @@
 
 use ark_r1cs_std::alloc::AllocVar;
 use ark_r1cs_std::boolean::Boolean;
-use ark_r1cs_std::eq::EqGadget;
 use ark_r1cs_std::fields::fp::FpVar;
 use ark_r1cs_std::select::CondSelectGadget;
 use ark_relations::gr1cs::{ConstraintSystemRef, SynthesisError};
@@ -67,7 +66,11 @@ impl MerkleTree {
                 .chunks(2)
                 .map(|pair| {
                     let left = pair[0];
-                    let right = if pair.len() == 2 { pair[1] } else { self.zeros[j] };
+                    let right = if pair.len() == 2 {
+                        pair[1]
+                    } else {
+                        self.zeros[j]
+                    };
                     hash(&self.cfg, DOM_NODE, &[left, right])
                 })
                 .collect();
@@ -77,7 +80,9 @@ impl MerkleTree {
     }
 
     pub fn root(&self) -> Fr {
-        *self.levels[self.depth].first().unwrap_or(&self.zeros[self.depth])
+        *self.levels[self.depth]
+            .first()
+            .unwrap_or(&self.zeros[self.depth])
     }
 
     /// Authentication path for the leaf at `index`.
@@ -103,7 +108,11 @@ impl MerkleTree {
 pub fn root_from_path(cfg: &HashCfg, leaf: Fr, path: &MerklePath) -> Fr {
     let mut node = leaf;
     for (sib, is_right) in path.siblings.iter().zip(&path.index_bits) {
-        let (l, r) = if *is_right { (*sib, node) } else { (node, *sib) };
+        let (l, r) = if *is_right {
+            (*sib, node)
+        } else {
+            (node, *sib)
+        };
         node = hash(cfg, DOM_NODE, &[l, r]);
     }
     node
@@ -143,8 +152,21 @@ pub fn compute_root_var(
     leaf: &FpVar<Fr>,
     path: &PathVars,
 ) -> Result<FpVar<Fr>, SynthesisError> {
+    compute_root_with_bits(cfg, leaf, &path.siblings, &path.bits)
+}
+
+/// Hash `leaf` up `siblings` with the left/right ordering dictated by
+/// externally supplied `bits` (little-endian leaf index). Used by R_recv,
+/// where the bits come from the decomposition of the witnessed position so
+/// the membership proof *binds* that position.
+pub fn compute_root_with_bits(
+    cfg: &HashCfg,
+    leaf: &FpVar<Fr>,
+    siblings: &[FpVar<Fr>],
+    bits: &[Boolean<Fr>],
+) -> Result<FpVar<Fr>, SynthesisError> {
     let mut node = leaf.clone();
-    for (sib, is_right) in path.siblings.iter().zip(&path.bits) {
+    for (sib, is_right) in siblings.iter().zip(bits) {
         let left = FpVar::conditionally_select(is_right, sib, &node)?;
         let right = FpVar::conditionally_select(is_right, &node, sib)?;
         node = hash_var(cfg, DOM_NODE, &[left, right])?;
@@ -152,14 +174,14 @@ pub fn compute_root_var(
     Ok(node)
 }
 
-/// Allocate `path` as witnesses and enforce that `leaf` hashes up to `root`.
-pub fn enforce_membership(
+/// Allocate only a path's siblings as witnesses (the ordering bits are
+/// supplied separately, e.g. from a position decomposition).
+pub fn alloc_siblings(
     cs: ConstraintSystemRef<Fr>,
-    cfg: &HashCfg,
-    leaf: &FpVar<Fr>,
-    root: &FpVar<Fr>,
     path: &MerklePath,
-) -> Result<(), SynthesisError> {
-    let vars = alloc_path(cs, path)?;
-    compute_root_var(cfg, leaf, &vars)?.enforce_equal(root)
+) -> Result<Vec<FpVar<Fr>>, SynthesisError> {
+    path.siblings
+        .iter()
+        .map(|s| FpVar::new_witness(cs.clone(), || Ok(*s)))
+        .collect()
 }

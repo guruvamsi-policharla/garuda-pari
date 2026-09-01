@@ -42,6 +42,11 @@ name = "circuits"
 path = "benches/circuits.rs"
 harness = false
 
+[[bench]]
+name = "throughput"
+path = "benches/throughput.rs"
+harness = false
+
 [features]
 default = ["std", "parallel"]
 std = ["ark-ff/std", "ark-poly/std", "ark-relations/std", "ark-std/std", "ark-serialize/std"]

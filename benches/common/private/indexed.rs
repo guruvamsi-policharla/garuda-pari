@@ -150,7 +150,11 @@ impl IndexedMerkleTree {
                 .chunks(2)
                 .map(|pair| {
                     let left = pair[0];
-                    let right = if pair.len() == 2 { pair[1] } else { self.zeros[j] };
+                    let right = if pair.len() == 2 {
+                        pair[1]
+                    } else {
+                        self.zeros[j]
+                    };
                     hash(&self.cfg, DOM_NODE, &[left, right])
                 })
                 .collect();
@@ -158,7 +162,9 @@ impl IndexedMerkleTree {
     }
 
     pub fn root(&self) -> Fr {
-        *self.levels[self.depth].first().unwrap_or(&self.zeros[self.depth])
+        *self.levels[self.depth]
+            .first()
+            .unwrap_or(&self.zeros[self.depth])
     }
 
     /// Authentication path for `index`; the slot may be empty (used for the
@@ -259,8 +265,7 @@ pub fn enforce_indexed_insert(
     // The low leaf, range-checked so the orderings below are sound.
     let low_value = FpVar::new_witness(cs.clone(), || Ok(ins.low_leaf.value))?;
     let low_next = FpVar::new_witness(cs.clone(), || Ok(ins.low_leaf.next_value))?;
-    let low_next_index =
-        FpVar::new_witness(cs.clone(), || Ok(Fr::from(ins.low_leaf.next_index)))?;
+    let low_next_index = FpVar::new_witness(cs.clone(), || Ok(Fr::from(ins.low_leaf.next_index)))?;
     enforce_range_bits(cs.clone(), &low_value, ins.low_leaf.value, 128)?;
     enforce_range_bits(cs.clone(), &low_next, ins.low_leaf.next_value, 128)?;
 

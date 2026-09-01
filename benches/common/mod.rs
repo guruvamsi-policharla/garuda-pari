@@ -9,9 +9,7 @@ use ark_ec::pairing::Pairing;
 use ark_ff::Field;
 use ark_relations::gr1cs::predicate::polynomial_constraint::SR1CS_PREDICATE_LABEL;
 use ark_relations::gr1cs::predicate::PredicateConstraintSystem;
-use ark_relations::gr1cs::{
-    ConstraintSystemRef, SynthesisError, Variable, R1CS_PREDICATE_LABEL,
-};
+use ark_relations::gr1cs::{ConstraintSystemRef, SynthesisError, Variable, R1CS_PREDICATE_LABEL};
 use ark_relations::lc;
 use std::time::Instant;
 use zkpari::ZkPariCircuit;
@@ -156,7 +154,11 @@ impl<F: Field> ZkPariCircuit<F> for ConfidentialRangeCircuit {
         let mut bit_vars = Vec::with_capacity(self.bits);
         for i in 0..self.bits {
             let b = cs.new_witness_variable(|| {
-                Ok(if (self.value >> i) & 1 == 1 { F::ONE } else { F::ZERO })
+                Ok(if (self.value >> i) & 1 == 1 {
+                    F::ONE
+                } else {
+                    F::ZERO
+                })
             })?;
             bit_vars.push(b);
         }

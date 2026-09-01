@@ -1,13 +1,29 @@
 # Experiment 2 — batch vs individual verification (BLS12-381)
 
 Machine: Apple M5 Pro, 18 cores
-Date: 2026-08-24
-Commit: 822027b + working tree
+Date: 2026-08-26 (first run 2026-08-24; re-measured after the batch-verify
+      optimizations made for experiment 4, see note below)
+Commit: 3e9900b + working tree
 Profile: `cargo bench --bench batch_verify` (release)
 Threads: **single-threaded** (the default). Set `ZKPARI_BENCH_THREADS=0` for
          all cores, or `=N` for N.
 Circuit:  2^12 SR1CS constraints (batch cost is independent of circuit size).
 Sampling: mean over a >=150 ms budget loop.
+
+## 2026-08-26 update
+
+Two library changes made for experiment 4 moved these numbers and the
+tables below were re-measured:
+
+1. `batch_eval_last_lagrange_coeffs` now runs Montgomery batch inversion
+   once per 1024-proof chunk instead of once per proof, collapsing the
+   Lagrange phase from ~166 ms to ~22 ms at N=65536.
+2. `batch_verify`'s per-proof phases (challenges, Lagrange, instance) are
+   now rayon-parallel. Irrelevant here — this experiment is single-threaded
+   and the par_iters degrade to serial at no measurable cost — but noted
+   for provenance. Multi-threaded scaling lives in experiment 4.
+
+Headline effect at 0 blocks, N=65536: **14.19 -> 12.31 us/proof (-13%)**.
 
 ## Cross-check against the batch-pari reference
 
@@ -15,25 +31,29 @@ The [batch-pari benchmark](https://github.com/guruvamsi-policharla/zk-pari/pull/
 reports, on an M5 MacBook Pro with `RAYON_NUM_THREADS=1` and **BN254**:
 individual 584.5 us/proof, batch 644.5 ms at N=65536 = **9.83 us/proof**, 59.4x.
 
-Running *this* implementation with 0 committed-input blocks — which reduces it
-to the same three G1 MSMs (T, U, r*U) that reference measures — on both curves:
+This cross-check was run at commit 822027b, *before* the Lagrange
+optimization, with this implementation reduced to the same three G1 MSMs
+(0 committed-input blocks) on both curves:
 
 ```
-ZK-Pari, 0 committed blocks, N=65536, single-threaded
+ZK-Pari, 0 committed blocks, N=65536, single-threaded, pre-optimization
   BN254        individual    432.5 us/proof   batch(N=65536)     641.2 ms  =   9.78 us/proof   speedup  44.2x
   BLS12-381    individual    735.4 us/proof   batch(N=65536)     939.0 ms  =  14.33 us/proof   speedup  51.3x
 ```
 
-On the same curve the numbers match: **641.2 ms vs the reference's 644.5 ms**
-(0.5% apart), 9.78 vs 9.83 us/proof. There is no gap to explain. BLS12-381
-costs 1.46x more than BN254 for identical work, which is the whole difference.
+On the same curve and same algorithm the numbers matched: **641.2 ms vs the
+reference's 644.5 ms** (0.5% apart), 9.78 vs 9.83 us/proof. There was no gap
+to explain. BLS12-381 costs 1.46x more than BN254 for identical work, which
+is the whole difference. (Post-optimization this implementation is ~13%
+faster than that baseline; the reference still ran the per-proof-inversion
+variant.)
 
 Two things worth noting for write-up:
 
 - Our *individual* verification is faster than the reference's (432.5 vs 584.5
-  us on BN254). That makes our **speedup ratio lower** (44.2x vs 59.4x) while
-  the absolute per-proof cost is the same. Speedup-over-individual flatters a
-  slow baseline; quote absolute us/proof as the primary figure.
+  us on BN254). That makes our **speedup ratio lower** while the absolute
+  per-proof cost is the same. Speedup-over-individual flatters a slow
+  baseline; quote absolute us/proof as the primary figure.
 - The reference sets `delta_1 = 1` (its note on Fig 6 step 4), dropping a term
   from the final multi-pairing. We keep delta_1 random and add a per-block
   delta_j, so at >0 blocks we are structurally doing more pairing work.
@@ -62,32 +82,46 @@ keys under test are exercised by real proving.
 Per-proof cost of individual verification
   blocks │ pairings │ verify us
   ───────┼──────────┼──────────
-       0 │        3 │     732.9
-       1 │        4 │     856.8
-       2 │        5 │    1031.5
-       4 │        7 │    1199.4
+       0 │        3 │     732.2
+       1 │        4 │     946.2
+       2 │        5 │     999.6
+       4 │        7 │    1169.5
+       8 │       11 │    1601.3
+      16 │       19 │    2460.5
+      32 │       35 │    4477.5
+      64 │       67 │    7656.0
 
-2a. Amortised batch cost per proof (us)
-  blocks │         N=1       N=256      N=4096     N=65536
-  ───────┼────────────────────────────────────────────────
-       0 │      747.34       32.72       18.38       14.19
-       1 │      841.03       39.41       22.30       17.15
-       2 │     1051.93       47.40       26.85       20.60
-       4 │     1191.92       63.52       34.69       26.44
+2a. Amortised batch cost per proof: us (speedup vs individual)
+  blocks │              N=1            N=256           N=4096          N=65536
+  ───────┼────────────────────────────────────────────────────────────────────
+       0 │    718.45 (1.0x)    30.12 (24.3x)    16.33 (44.8x)    12.31 (59.5x)
+       1 │    809.86 (1.2x)    37.08 (25.5x)    20.14 (47.0x)    14.72 (64.3x)
+       2 │    962.91 (1.0x)    44.39 (22.5x)    24.20 (41.3x)    17.53 (57.0x)
+       4 │   1130.29 (1.0x)    58.47 (20.0x)    32.01 (36.5x)    23.25 (50.3x)
+       8 │   1551.82 (1.0x)    86.86 (18.4x)    47.41 (33.8x)    34.49 (46.4x)
+      16 │   2400.10 (1.0x)   143.31 (17.2x)    78.48 (31.4x)    57.12 (43.1x)
+      32 │   4404.04 (1.0x)   275.41 (16.3x)   150.73 (29.7x)   109.03 (41.1x)
+      64 │   7598.59 (1.0x)   482.98 (15.9x)   266.30 (28.8x)   193.99 (39.5x)
 
 2b. Where the time goes at N=65536 (ms)
   Phases are re-executed against the public API — the library carries no
   instrumentation — and their total is checked against `batch_verify`.
   blocks │ challenge │ lagrange │ instance │   C~ MSM │   T~ MSM │   U~ MSM │   V~ MSM │ pairing │    sum │ measured
   ───────┼───────────┼──────────┼──────────┼──────────┼──────────┼──────────┼──────────┼─────────┼────────┼─────────
-       0 │      51.0 │    166.4 │      2.7 │      0.0 │    177.4 │    180.7 │    345.8 │    0.60 │  924.7 │    929.9
-       1 │      67.5 │    164.7 │      2.6 │    176.6 │    176.1 │    178.1 │    346.5 │    0.69 │ 1112.7 │   1124.2
-       2 │      78.7 │    171.0 │      2.9 │    357.0 │    180.9 │    177.3 │    355.0 │    0.87 │ 1323.7 │   1350.4
-       4 │     105.3 │    161.0 │      2.7 │    716.5 │    177.7 │    178.3 │    349.1 │    1.07 │ 1691.7 │   1732.5
+       0 │      54.7 │     23.5 │      2.7 │      0.0 │    176.9 │    176.4 │    344.4 │    0.60 │  779.2 │    806.5
+       1 │      72.0 │     21.9 │      2.6 │    176.9 │    176.0 │    175.9 │    343.5 │    0.68 │  969.5 │    964.8
+       2 │      81.4 │     21.9 │      2.6 │    357.8 │    176.9 │    178.3 │    344.0 │    0.87 │ 1163.8 │   1148.7
+       4 │     110.8 │     21.9 │      2.6 │    706.8 │    175.4 │    176.1 │    342.0 │    1.07 │ 1536.7 │   1523.8
+       8 │     161.2 │     21.8 │      2.6 │   1409.2 │    174.4 │    174.3 │    340.1 │    1.45 │ 2284.9 │   2260.2
+      16 │     269.9 │     21.5 │      2.6 │   2821.6 │    173.5 │    174.2 │    338.9 │    2.32 │ 3804.6 │   3743.7
+      32 │     569.9 │     22.8 │      2.9 │   5966.8 │    179.7 │    179.6 │    349.8 │    4.37 │ 7275.8 │   7145.3
+      64 │     931.9 │     21.6 │      2.5 │  11265.8 │    173.6 │    173.5 │    340.6 │    7.52 │ 12917.1 │  12713.3
 
   C~ MSM is the only column that scales with the block count: one
   MSM over all N proofs per committed-input block. T~/U~ are the same
   MSM over T and U; V~ is the same again but with full-width scalars
   (rho_k * r^(k) rather than the 128-bit rho_k). The final pairing
   product is a fixed per-batch cost, which is what amortises away.
+  After the Lagrange fix the MSMs are ~90% of the 0-block total; the
+  challenge phase (Fiat-Shamir transcript per proof) is most of the rest.
 ```

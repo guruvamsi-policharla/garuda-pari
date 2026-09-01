@@ -1,23 +1,25 @@
 //! The private-transfer circuits from the paper (R_send, R_recv) and their
-//! hash/Merkle building blocks. Every hash goes through [`hasher`], which
+//! hash/Merkle building blocks. Every hash goes through [`hasher`]:
 //! Pedersen over Jubjub for Merkle nodes, indexed leaves, and commitments;
-//! SHA-256 for the nullifier/tag CRPRFs.
+//! SHA-256 for the single nullifier CRPRF (R_recv only).
 //!
 //! Account commitments are hash values opened in-circuit as public
 //! inputs, so these proofs carry **zero** committed-input blocks (2 G1 + 1 F
 //! on the wire, 3 pairings to verify); wrap the circuits in
 //! `zkpari::Uncommitted` for keygen/prove.
 //!
-//! The per-account nullifier/tag trees are *user-maintained* indexed Merkle
-//! trees; the ledger stores only their 32-byte roots, and the insertion
-//! proof `pi_mt` is verified **in-circuit** (`indexed.rs`) rather than
-//! natively — the statement carries (root, root') and the ledger just
-//! compares-and-swaps. Batch verification cost is independent of circuit
-//! size, so this removes both the per-transaction native hashing and the
-//! ~depth x 32 B insertion proof from the wire at zero marginal ledger
-//! cost. What stays native: the ledger's root-history check on the revealed
-//! receipt anchor (rootrho in the W most recent roots) and receiver
-//! registration.
+//! R_send is hash-light: three Pedersen commitment openings and range
+//! checks, nothing else. All tree work lives in R_recv: the nullifier is
+//! derived in-circuit from the receipt's MMR position under the receiver's
+//! committed key and inserted into the receiver's *user-maintained* indexed
+//! nullifier tree. The tree root lives *inside* the account commitment, so
+//! an account's entire public state is one commitment; the insertion proof
+//! `pi_mt` is verified **in-circuit** (`indexed.rs`) rather than natively,
+//! and the ledger just compare-and-swaps the commitment. Batch verification
+//! cost is independent of circuit size, so the added constraints are free
+//! for the ledger. What stays native: the ledger's root-history check on
+//! the revealed receipt anchor (root_rho in the W most recent roots) and
+//! receiver registration.
 
 pub mod hasher;
 pub mod indexed;

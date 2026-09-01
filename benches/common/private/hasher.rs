@@ -1,17 +1,19 @@
 //! The Sapling-style hash instantiation shared by all private-transfer
 //! primitives: Pedersen over Jubjub for everything structural (Merkle
-//! nodes, indexed-tree leaves, commitments) and SHA-256 for the two CRPRF
-//! call sites (nullifier and tag derivation).
+//! nodes, indexed-tree leaves, commitments) and SHA-256 for the scheme's
+//! single CRPRF call site (nullifier derivation in R_recv).
 //!
 //! Every hash in the scheme goes through [`hash`] / [`hash_var`], routed by
 //! its domain tag:
 //!
-//!   Com_acct(b, kappa; r)                = H(DOM_ACCT, b, kappa, r)        Pedersen
-//!   CRPRF_kappa(pay, Sen, zeta)          = H(DOM_PAY,  kappa, Sen, zeta)   SHA-256
-//!   CRPRF_kappa(pad, Sen, zeta)          = H(DOM_PAD,  kappa, Sen, zeta)   SHA-256
-//!   Com_rec(v, Sen, Rec, nullifier; r'') = H(DOM_REC,  v, ..., r'')        Pedersen
-//!   Merkle node                          = H(DOM_NODE, left, right)        Pedersen
-//!   Indexed-tree leaf                    = H(DOM_ILEAF, value, nv, ni)     Pedersen
+//!   Com_acct(b, kappa, root_null; r) = H(DOM_ACCT, b, kappa, root, r) Pedersen
+//!   CRPRF_kappa(recv, pos)           = H(DOM_NULL, kappa, pos)        SHA-256
+//!   Com_rec(v, Sen, Rec; r'')        = H(DOM_REC,  v, S, R, r'')      Pedersen
+//!   Merkle node                    = H(DOM_NODE, left, right)   Pedersen
+//!   Indexed-tree leaf              = H(DOM_ILEAF, value, nv, ni) Pedersen
+//!
+//! The paper's `recv` PRF label *is* the DOM_NULL domain byte; the key
+//! kappa comes first in the preimage, then the receipt position.
 //!
 //! Both primitives share a byte serialization: a 1-byte domain tag followed
 //! by the canonical 32-byte little-endian encoding of each field element
@@ -33,9 +35,9 @@
 //! **SHA-256**: the 256-bit digest is truncated to its low 253 bits and
 //! repacked as a field element — always `< r`, so native and in-circuit
 //! outputs agree bit for bit. With fixed-length input and the key in front,
-//! SHA-256(dom || kappa || Sen || zeta) is a standard PRF instantiation.
-//! Each call is 2 compression functions (~81k R1CS), but only R_send pays
-//! it (twice); R_recv has no PRF call site at all.
+//! SHA-256(dom || kappa || pos) is a standard PRF instantiation. The call
+//! is 2 compression functions; only R_recv pays it (once) — R_send has no
+//! PRF call site at all.
 
 use ark_crypto_primitives::crh::sha256::constraints::Sha256Gadget;
 use ark_crypto_primitives::crh::sha256::{digest::Digest, Sha256};
@@ -55,21 +57,22 @@ use ark_std::UniformRand;
 use super::super::Fr;
 
 /// Domain-separation tags (small values on purpose: they serialize as a
-/// single byte). PAY and PAD route to SHA-256; everything else to Pedersen.
+/// single byte). NULL routes to SHA-256; everything else to Pedersen.
 pub const DOM_ACCT: u64 = 1;
-pub const DOM_PAY: u64 = 2;
-pub const DOM_PAD: u64 = 3;
+/// The nullifier CRPRF: the paper's `recv` label.
+pub const DOM_NULL: u64 = 2;
 pub const DOM_REC: u64 = 4;
 pub const DOM_NODE: u64 = 5;
 /// Indexed-tree leaf: `H(DOM_ILEAF, value, next_value, next_index)`.
 pub const DOM_ILEAF: u64 = 6;
 
-/// The largest Pedersen preimage: Com_rec's 1-byte tag + 5 field elements.
-const PEDERSEN_MAX_BYTES: usize = 1 + 5 * 32;
+/// The largest Pedersen preimage: Com_acct / Com_rec's 1-byte tag + 4 field
+/// elements (three data slots plus randomness).
+const PEDERSEN_MAX_BYTES: usize = 1 + 4 * 32;
 
-/// The CRPRF call sites, which need a genuine PRF rather than a CRH.
+/// The CRPRF call site, which needs a genuine PRF rather than a CRH.
 fn is_prf(dom: u64) -> bool {
-    dom == DOM_PAY || dom == DOM_PAD
+    dom == DOM_NULL
 }
 
 /// The hash instantiation every primitive is parametrized by: the Pedersen
@@ -141,7 +144,10 @@ pub fn hash(cfg: &HashCfg, dom: u64, inputs: &[Fr]) -> Fr {
     if is_prf(dom) {
         field_from_digest(&Sha256::digest(&bytes))
     } else {
-        assert!(bytes.len() <= cfg.table.len(), "preimage exceeds generator table");
+        assert!(
+            bytes.len() <= cfg.table.len(),
+            "preimage exceeds generator table"
+        );
         let mut acc = EdwardsProjective::zero();
         for (byte, powers) in bytes.iter().zip(&cfg.table) {
             for (i, g) in powers.iter().enumerate() {
@@ -170,7 +176,10 @@ pub fn hash_var(
         }
         Boolean::le_bits_to_fp(&bits[..253])
     } else {
-        assert!(bytes.len() <= cfg.table.len(), "preimage exceeds generator table");
+        assert!(
+            bytes.len() <= cfg.table.len(),
+            "preimage exceeds generator table"
+        );
         let windows = bytes
             .iter()
             .map(|b| b.to_bits_le())

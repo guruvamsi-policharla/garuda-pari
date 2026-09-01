@@ -6,6 +6,7 @@ use ark_ec::VariableBaseMSM;
 use ark_ff::{FftField, Field, PrimeField, Zero};
 use ark_poly::{EvaluationDomain, Radix2EvaluationDomain};
 use ark_std::{ops::Neg, rand::RngCore};
+use rayon::prelude::*;
 
 impl<E: Pairing> ZkPari<E> {
     /// Batch verification of N proofs using a random linear combination.
@@ -53,9 +54,12 @@ impl<E: Pairing> ZkPari<E> {
 
         /////////////////////// Challenge computation ///////////////////////
         // The verifying key is already absorbed into `vk`'s transcript, so
-        // each challenge only absorbs its own proof's material.
+        // each challenge only absorbs its own proof's material. Challenges
+        // are independent across proofs, so they parallelize over the
+        // ambient rayon pool (as do the Lagrange and instance phases below;
+        // only rho sampling and the final scalar folds stay sequential).
         let challenges: Vec<E::ScalarField> = proofs_and_inputs
-            .iter()
+            .par_iter()
             .map(|(proof, public_input)| {
                 crate::utils::compute_chall::<E>(vk, public_input, &proof.c_ci, &proof.t_g)
             })
@@ -72,16 +76,17 @@ impl<E: Pairing> ZkPari<E> {
         );
 
         // For each proof k: compute x_A^(k)(r) and v_R^(k) = (x_A + v_a)^2
-        let mut v_rs = Vec::with_capacity(n);
-        for ((proof, public_input), lagrange_coeffs) in
-            proofs_and_inputs.iter().zip(all_lagrange_coeffs)
-        {
-            let x_a = lagrange_coeffs
-                .into_iter()
-                .zip(core::iter::once(E::ScalarField::ONE).chain(public_input.iter().copied()))
-                .fold(E::ScalarField::zero(), |acc, (l, x)| acc + l * x);
-            v_rs.push((x_a + proof.v_a).square());
-        }
+        let v_rs: Vec<E::ScalarField> = proofs_and_inputs
+            .par_iter()
+            .zip(all_lagrange_coeffs)
+            .map(|((proof, public_input), lagrange_coeffs)| {
+                let x_a = lagrange_coeffs
+                    .into_iter()
+                    .zip(core::iter::once(E::ScalarField::ONE).chain(public_input.iter().copied()))
+                    .fold(E::ScalarField::zero(), |acc, (l, x)| acc + l * x);
+                (x_a + proof.v_a).square()
+            })
+            .collect();
 
         /////////////////////// Random linear combination ///////////////////////
         // Sample 128-bit rho <-$ [0, 2^128)^N (sufficient for 2^-128 soundness).
@@ -168,8 +173,6 @@ impl<E: Pairing> ZkPari<E> {
         start_ind: usize,
         count: usize,
     ) -> Vec<Vec<F>> {
-        let n = challenges.len();
-
         let group_gen = domain.group_gen();
         let group_gen_inv = domain.group_gen_inv();
         let domain_size = domain.size_as_field_element();
@@ -183,31 +186,42 @@ impl<E: Pairing> ZkPari<E> {
             neg_cur *= &group_gen;
         }
 
-        // Evaluate z_H(tau_k) for all k
-        let z_h_vals: Vec<F> = challenges
-            .iter()
-            .map(|tau| domain.evaluate_vanishing_polynomial(*tau))
-            .collect();
-        for z in &z_h_vals {
-            assert!(!z.is_zero());
-        }
-
         // Lagrange coefficients: L_j(tau) = omega^j * z_H(tau) / (N * (tau - omega^j)).
         // z_H is in the numerator, so we build the denominators
-        // N * omega^(-j) * (tau - omega^j) and batch-invert them,
-        // folding in start_gen * z_H as the numerator constant.
-        let mut all_lagrange_coeffs = Vec::with_capacity(n);
-        for (tau, z_h) in challenges.iter().zip(&z_h_vals) {
-            let mut l_i = domain_size;
-            let mut coeffs = vec![F::zero(); count];
-            for (coeff, neg_elem) in coeffs.iter_mut().zip(&neg_elems) {
-                *coeff = l_i * (*tau + *neg_elem);
-                l_i *= &group_gen_inv;
-            }
-            batch_inversion_and_mul(&mut coeffs, &(start_gen * *z_h));
-            all_lagrange_coeffs.push(coeffs);
-        }
+        // N * omega^(-j) * (tau - omega^j) and batch-invert them.
+        //
+        // Proofs are processed in chunks: within a chunk the flattened
+        // denominators share one Montgomery batch inversion (a field
+        // inversion costs ~100x a multiplication, so per-proof inversions
+        // would dominate this whole function), and the chunks parallelize
+        // over the ambient rayon pool. The shared numerator factor
+        // start_gen rides along with the inversion; the per-proof
+        // z_H(tau_k) is applied afterwards.
+        const CHUNK: usize = 1024;
+        let per_chunk: Vec<Vec<Vec<F>>> = challenges
+            .par_chunks(CHUNK)
+            .map(|taus| {
+                let mut flat = Vec::with_capacity(taus.len() * count);
+                for tau in taus {
+                    let mut l_i = domain_size;
+                    for neg_elem in &neg_elems {
+                        flat.push(l_i * (*tau + *neg_elem));
+                        l_i *= &group_gen_inv;
+                    }
+                }
+                batch_inversion_and_mul(&mut flat, &start_gen);
 
-        all_lagrange_coeffs
+                flat.chunks_exact(count)
+                    .zip(taus)
+                    .map(|(coeffs, tau)| {
+                        let z_h = domain.evaluate_vanishing_polynomial(*tau);
+                        assert!(!z_h.is_zero());
+                        coeffs.iter().map(|c| *c * z_h).collect()
+                    })
+                    .collect()
+            })
+            .collect();
+
+        per_chunk.into_iter().flatten().collect()
     }
 }
