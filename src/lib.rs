@@ -1,67 +1,51 @@
 //! ZK-Pari: Pari with vanishing-polynomial masks, a zero-knowledge SNARK for
-//! Square R1CS with committed inputs.
+//! Square R1CS.
 //!
-//! This implements the masked, committed-input variant of
+//! This implements the masked variant of
 //! [Pari](https://eprint.iacr.org/2024/1245.pdf):
 //!
-//! - The assignment is split into ordinary public inputs, *committed inputs*
-//!   (witness variables declared by the circuit, see [`ZkPariCircuit`]), and
-//!   private witnesses.
-//! - The committed inputs are grouped into independently committed *blocks*:
-//!   block `j` has its own trapdoor `delta_j` and its commitment `C_ci_j` is
-//!   a Pedersen vector commitment under the basis `(Sigma_ci_j, Gamma_ci_j)`,
-//!   hidden by a vanishing-polynomial direction `rho_ci_j * v_K(X)` on the
-//!   B-side.
-//! - Two further vanishing directions `h(X) * v_K(X)` with `h(X) = eta_1 +
-//!   eta_2 * X` mask the A-side, giving the honest-verifier simulator
-//!   independent randomness at the verifier challenge and at the SRS trapdoor.
-//! - A single Glock-style opening proof accounts for both the ordinary Pari
-//!   commitment and the exposed committed-input commitments, so a proof is
-//!   `(2 + #blocks) G1 + 1 F` elements. Applications may use slimmer wire
-//!   formats when a commitment is recomputable, but must reconstruct the full
-//!   `Proof` before verification.
+//! - The Square R1CS columns are interpolated over a domain `H`, and the
+//!   basis is extended with two vanishing directions `h(X) * v_H(X)` with
+//!   `h(X) = eta_1 + eta_2 * X` masking the A-side, giving the
+//!   honest-verifier simulator independent randomness at the verifier
+//!   challenge and at the SRS trapdoor.
+//! - A single Glock-style opening proof batches the A-side and B-side
+//!   openings, so a proof is `2 G1 + 1 F` — 128 bytes compressed on
+//!   BLS12-381.
 //!
 //! The scheme is statistically honest-verifier zero-knowledge with simulation
-//! distance at most `1 / (|F| - |K|)`.
+//! distance at most `1 / (|F| - |H|)`.
 //!
-//! Verification checks the (3 + #blocks)-pairing equation
+//! Verification checks the 3-pairing equation
 //!
 //! ```text
-//! prod_j e(C_ci_j, delta_j H) * e(T, delta_w H)
-//!     = e(U, tau H - r H) * e(v_a alpha G + v_R beta G, H)
+//! e(T, delta H) = e(U, tau H - zeta H) e(v_a alpha G + v_R beta G, H)
 //! ```
 //!
-//! with `v_R = (v_a + x_A(r))^2 - x_B(r)` computed by the verifier
+//! with `v_R = (v_a + x_A(zeta))^2 - x_B(zeta)` computed by the verifier
 //! (`x_B = 0` after SR1CS instance outlining).
 //!
-//! # Committed inputs
+//! # Circuits
 //!
-//! Circuits declare their committed inputs by implementing [`ZkPariCircuit`]:
-//! synthesis returns the blocks as lists of witness [`Variable`]s, allocated
-//! anywhere in the circuit. Key generation derives the commitment keys from
-//! the declared variables, so there is no positional convention to maintain.
-//! Plain arkworks [`ConstraintSynthesizer`](ark_relations::gr1cs::ConstraintSynthesizer)
-//! circuits can be wrapped in [`Uncommitted`] for proofs without committed
-//! inputs.
+//! Any arkworks [`ConstraintSynthesizer`] works: circuits that natively
+//! register the SR1CS predicate are used as-is, plain R1CS circuits are
+//! converted by `ark_relations::sr1cs::Sr1csAdapter`. [`ZkPari::keygen`]
+//! digests the constraint matrices into the verifying key (the paper's
+//! `HashIdx`), so challenges — and hence proofs — are bound to the exact
+//! circuit.
 //!
-//! # Batched confidential transfers
-//!
-//! The batched-transfer design uses two committed-input blocks: the claimed
-//! amounts live in block 1 (size `B+1`), while block 2 holds a single
-//! random-linear-combination aggregate `v_theta`. The circuit enforces
-//! `sum_i theta^{i-1} v_i = v_theta` for a Fiat-Shamir challenge `theta`
-//! bound to the ledger commitments and block-1 commitment, which guarantees
-//! (w.h.p.) that the range-checked claimed amounts equal the committed ledger
-//! amounts. See `examples/confidential_transfer.rs` for the single-transfer
-//! flow.
+//! With the `circuits` feature, the crate additionally ships the private
+//! payment circuits from the accompanying paper (see [`circuits`]).
 
 use ark_ec::pairing::Pairing;
 
-pub use ark_relations::gr1cs::{ConstraintSystemRef, Variable};
+pub use ark_relations::gr1cs::{ConstraintSynthesizer, ConstraintSystemRef};
 use ark_std::marker::PhantomData;
 
 mod batch_verify;
 mod circuit;
+#[cfg(feature = "circuits")]
+pub mod circuits;
 pub mod data_structures;
 mod generator;
 mod prover;
@@ -72,10 +56,7 @@ mod verifier;
 #[cfg(test)]
 mod test;
 
-pub use circuit::{Uncommitted, ZkPariCircuit};
-pub use data_structures::{
-    CommittedInputOpening, Proof, ProvingKey, SuccinctIndex, Trapdoor, VerifyingKey,
-};
+pub use data_structures::{Proof, ProvingKey, SuccinctIndex, Trapdoor, VerifyingKey};
 
 /// The ZK-Pari SNARK.
 pub struct ZkPari<E: Pairing> {

@@ -12,7 +12,7 @@
 //!   mmr.Verify(root_rho, rho, pos, pi_mmr) = 1
 //!   null = CRPRF_kappa(recv, pos)
 //!   mt.AccVerifyInsert(root_null, null, pi_mt) = root_null'
-//!   v > 0   and   b, v, b + v in [0, 2^64)
+//!   v >= 0   and   b, v, b + v in [0, 2^64)
 //!
 //! The nullifier and both tree roots are witnesses: they live inside the
 //! account commitment, so the account's entire public state is one
@@ -39,10 +39,8 @@ use ark_r1cs_std::alloc::AllocVar;
 use ark_r1cs_std::boolean::Boolean;
 use ark_r1cs_std::eq::EqGadget;
 use ark_r1cs_std::fields::fp::FpVar;
-use ark_r1cs_std::fields::FieldVar;
 use ark_relations::gr1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
 
-use super::super::Fr;
 use super::enforce_range_64;
 use super::hasher::{hash, hash_var, HashCfg, DOM_ACCT, DOM_NULL, DOM_REC};
 use super::indexed::{
@@ -50,6 +48,7 @@ use super::indexed::{
     IndexedMerkleTree,
 };
 use super::merkle::{alloc_siblings, compute_root_with_bits, MerklePath, MerkleTree};
+use super::Fr;
 
 #[derive(Clone)]
 pub struct RecvCircuit {
@@ -235,14 +234,15 @@ impl ConstraintSynthesizer<Fr> for RecvCircuit {
             &root_null,
             &root_null_new,
             &self.null_insert,
+            &Boolean::TRUE,
         )?;
 
-        // v > 0 and b, v, b + v in B = [0, 2^64): the b + v range check
-        // rules out overflow past the balance domain.
+        // v >= 0 and b, v, b + v in B = [0, 2^64): the b + v range check
+        // rules out overflow past the balance domain. v = 0 is allowed,
+        // matching the paper's relation.
         enforce_range_64(cs.clone(), &b, self.b)?;
         enforce_range_64(cs.clone(), &v, self.v)?;
         enforce_range_64(cs, &b_new, self.b.wrapping_add(self.v))?;
-        v.enforce_not_equal(&FpVar::zero())?;
 
         Ok(())
     }

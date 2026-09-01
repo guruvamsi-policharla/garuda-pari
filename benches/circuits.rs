@@ -1,46 +1,46 @@
 //! Experiment 3 (phase 3a) — prover cost of the payment circuits (BLS12-381).
 //!
-//! Two payment flavours share this table:
+//! Benchmarks the paper's private-transfer relations (`zkpari::circuits`):
 //!
-//!   - *Confidential transfer* (Zether-style): a native-SR1CS range proof on
-//!     the amount, declared as the single committed-input block, so the
-//!     proof's C_ci is itself the ledger's Pedersen commitment. Proof is
-//!     3 G1 + 1 F, of which C_ci is ledger state (incremental 2 G1 + 1 F).
-//!
-//!   - *Private transfer* (the paper's R_send / R_recv): unlinkable payments
-//!     over hash-based account commitments opened in-circuit as public
-//!     inputs. Zero committed-input blocks — the proof is 2 G1 + 1 F and
-//!     verification is 3 pairings.
-//!     R_send is three Pedersen commitment openings plus range checks: no
+//!   - *R_send*: three Pedersen commitment openings plus range checks — no
 //!     tree, no PRF, no depth parameter. Account commitments are
-//!     `Com_acct(b, kappa, root_null; r)` — three data slots, so the
-//!     owner's indexed-nullifier-tree root is bound inside the commitment
-//!     and an account's entire public state is one hash. R_recv carries
-//!     all the hashing: the receipt's MMR opening at a witnessed position
-//!     `pos` (path ordering driven by the bits of pos, depth fixed at 40),
-//!     the nullifier derived in-circuit as CRPRF_kappa(recv, pos) — never
-//!     published — and the paper's `AccVerifyInsert` into the receiver's
-//!     user-maintained indexed nullifier tree (with the non-membership
-//!     low-leaf argument, so double-receives are impossible). The tree
-//!     roots are witnesses, bound inside `com` / `com'`; the statement is
-//!     `(R, com, com', root_rho)` and the receive submission is
-//!     `(R, com', root_rho, proof)`. The nullifier-tree depth is swept
-//!     over {10, 20}; R_send has one depth-independent row.
+//!     `Com_acct(b, kappa, root_null; r)`, so the owner's
+//!     indexed-nullifier-tree root is bound inside the commitment and an
+//!     account's entire public state is one hash.
 //!
-//!   Hashes follow the Sapling split (see `common/private/hasher.rs`):
-//!   Pedersen over Jubjub for Merkle nodes, indexed-tree leaves, and
-//!   commitments; SHA-256 for the single CRPRF call site (nullifier
-//!   derivation, R_recv only — R_send has no PRF call).
+//!   - *R_recv*: carries all the hashing — the receipt's MMR opening at a
+//!     witnessed position `pos` (path ordering driven by the bits of pos,
+//!     depth fixed at 40), the nullifier derived in-circuit as
+//!     CRPRF_kappa(recv, pos) — never published — and the paper's
+//!     `AccVerifyInsert` into the receiver's user-maintained indexed
+//!     nullifier tree (with the non-membership low-leaf argument, so
+//!     double-receives are impossible). The tree roots are witnesses, bound
+//!     inside `com` / `com'`; the statement is `(R, com, com', root_rho)`.
+//!     The nullifier-tree depth is swept over {10, 20}.
 //!
-//!   What stays native and unbenchmarked here: the ledger's root-history
-//!   check on the revealed receipt anchor (rootrho in the retained set of
-//!   recent roots), receiver registration, and R_reg entirely.
+//!   - *R_op*: the operation-hiding relation — a witness-selected OR of the
+//!     send and receive branches over the shared statement
+//!     `(A, com, com', rho, root_rho)`. Both branches share every gadget
+//!     (the selector muxes the balance delta, roots, and published-receipt
+//!     preimage, and gates the receive-only equalities), so the cost is
+//!     operation-independent by construction; the rows here prove with the
+//!     receive branch, the more constrained witness.
 //!
-//! The gadget circuits are plain R1CS (ark-r1cs-std) fed through the
-//! R1CS-to-SR1CS adapter, so both counts are reported: `r1cs` is what the
-//! gadgets emit, `sr1cs` is what the prover pays for (each R1CS row splits
-//! into squares, plus outlining rows; the FFT domain rounds up to a power of
-//! two). `prove` includes circuit synthesis, as everywhere in these benches.
+//! Hashes follow the Sapling split (see `src/circuits/hasher.rs`):
+//! Pedersen over Jubjub for Merkle nodes, indexed-tree leaves, and
+//! commitments; SHA-256 for the single CRPRF call site (nullifier
+//! derivation — R_send has no PRF call).
+//!
+//! What stays native and unbenchmarked here: the ledger's root-history
+//! check on the revealed receipt anchor (root_rho in the retained set of
+//! recent roots), receiver registration, and R_reg entirely (a Schnorr-style
+//! proof outside the SNARK).
+//!
+//! The circuits are plain R1CS (ark-r1cs-std) fed through the R1CS-to-SR1CS
+//! adapter, so both counts are reported: `r1cs` is what the gadgets emit,
+//! `sr1cs` is what the prover pays for (each R1CS row splits into squares,
+//! plus outlining rows; the FFT domain rounds up to a power of two).
+//! `prove` includes circuit synthesis, as everywhere in these benches.
 //!
 //! Before the table, an end-to-end flow runs as a correctness gate: Alice
 //! sends 300 to Bob (real prove/verify), the ledger compare-and-swaps her
@@ -66,24 +66,22 @@ use ark_relations::gr1cs::{ConstraintSynthesizer, ConstraintSystem};
 use ark_std::rand::{rngs::StdRng, Rng, SeedableRng};
 use ark_std::UniformRand;
 
-use common::private::hasher::HashCfg;
-use common::private::indexed::{truncate_to_key, IndexedInsertion, IndexedMerkleTree};
-use common::private::merkle::{root_from_path, MerklePath, MerkleTree};
-use common::private::recv::RecvCircuit;
-use common::private::send::SendCircuit;
 use common::*;
-use zkpari::{Uncommitted, ZkPari, ZkPariCircuit};
+use zkpari::circuits::hasher::HashCfg;
+use zkpari::circuits::indexed::{truncate_to_key, IndexedInsertion, IndexedMerkleTree};
+use zkpari::circuits::merkle::{root_from_path, MerklePath, MerkleTree};
+use zkpari::circuits::op::OpCircuit;
+use zkpari::circuits::recv::RecvCircuit;
+use zkpari::circuits::send::SendCircuit;
+use zkpari::ZkPari;
 
 /// Depths of the user-maintained (indexed) nullifier trees
-/// (2^10 / 2^20 lifetime receipts per account). Only R_recv has one.
+/// (2^10 / 2^20 lifetime receipts per account). R_recv and R_op have one.
 const ACCT_TREE_DEPTHS: &[usize] = &[10, 20];
 
-/// Depth of the global receipt tree (R_recv membership path):
+/// Depth of the global receipt tree (membership path):
 /// 2^40 receipts of capacity, ~4 months of history at 100K TPS.
 const RECEIPT_DEPTH: usize = 40;
-
-/// Bit widths for the confidential-transfer range proof.
-const RANGE_BITS: &[usize] = &[32, 64];
 
 const PROVE_ITERS: usize = 5;
 
@@ -96,7 +94,6 @@ struct Row {
     r1cs: Option<usize>,
     sr1cs: usize,
     instance_len: usize,
-    blocks: usize,
     domain: usize,
     keygen_ms: f64,
     prove_ms: f64,
@@ -106,7 +103,7 @@ struct Row {
 
 /// Keygen/prove/verify a circuit and collect one table row.
 /// `r1cs` is the pre-adapter constraint count (None for native SR1CS).
-fn measure<C: ZkPariCircuit<Fr> + Clone>(
+fn measure<C: ConstraintSynthesizer<Fr> + Clone>(
     name: &str,
     circuit: C,
     public_input: &[Fr],
@@ -144,12 +141,11 @@ fn measure<C: ZkPariCircuit<Fr> + Clone>(
         r1cs,
         sr1cs: vk.succinct_index.num_constraints,
         instance_len: vk.succinct_index.instance_len,
-        blocks: vk.succinct_index.committed_input_blocks.len(),
         domain: vk.domain.size as usize,
         keygen_ms,
         prove_ms,
         verify_us,
-        proof_bytes: proof_element_bytes(&proof),
+        proof_bytes: compressed_size(&proof),
     }
 }
 
@@ -174,29 +170,39 @@ fn r1cs_count<C: ConstraintSynthesizer<Fr>>(circuit: C) -> usize {
 fn run() {
     println!("╔══════════════════════════════════════════════════════════════════════╗");
     println!("║  3a. ZK-Pari payment circuits — BLS12-381                            ║");
-    println!("║      confidential transfer (range) and private transfer (send/recv)  ║");
+    println!("║      private transfer: R_send, R_recv, and operation-hiding R_op     ║");
     println!("╚══════════════════════════════════════════════════════════════════════╝");
     println!();
     println!("Threads: {}.", thread_label());
     println!("Hashes (Sapling split): Pedersen/Jubjub (8-bit byte windows) for");
     println!("          Merkle nodes, indexed leaves, and commitments; SHA-256 for");
-    println!("          the nullifier CRPRF (R_recv only — R_send has no hashing");
-    println!("          beyond its three commitment openings).");
+    println!("          the nullifier CRPRF (receive side only — R_send has no");
+    println!("          hashing beyond its three commitment openings).");
     println!("Private transfer: nullifier = CRPRF_kappa(recv, pos), derived and");
     println!("          inserted in-circuit (AccVerifyInsert); the nullifier-tree");
     println!("          root lives inside the account commitment. Nullifier-tree");
     println!("          depth swept over {ACCT_TREE_DEPTHS:?}, receipt-tree opening");
     println!("          fixed at depth {RECEIPT_DEPTH} and bound to the witnessed position.");
+    println!("R_op: one circuit for both operations; a witness bit selects the");
+    println!("          branch, so sends and receives are indistinguishable on the");
+    println!("          wire and cost the same to prove.");
     println!();
 
     let mut rng = StdRng::seed_from_u64(20_260_825);
 
     // Fast satisfiability gate at toy depths: catches native/in-circuit
-    // hash mismatches in seconds, before any keygen.
+    // hash mismatches (and R_op branch-shape drift) in seconds, before any
+    // keygen.
     {
         let cfg = HashCfg::new();
         r1cs_count(random_send(&cfg, &mut rng));
         r1cs_count(random_recv(&cfg, 6, 4, &mut rng));
+        let n_send = r1cs_count(random_op_send(&cfg, 6, 4, &mut rng));
+        let n_recv = r1cs_count(random_op_receive(&cfg, 6, 4, &mut rng));
+        assert_eq!(
+            n_send, n_recv,
+            "R_op branches must synthesize the same constraint count"
+        );
     }
 
     e2e_flow(&mut rng);
@@ -205,26 +211,11 @@ fn run() {
     let cfg = HashCfg::new();
     let mut rows = Vec::new();
 
-    for &bits in RANGE_BITS {
-        let circuit = ConfidentialRangeCircuit {
-            value: rng.gen::<u64>() >> (64 - bits),
-            bits,
-        };
-        rows.push(measure(
-            &format!("confidential range {bits}b"),
-            circuit,
-            &[],
-            None,
-            PROVE_ITERS,
-            &mut rng,
-        ));
-    }
-
     {
         let send = random_send(&cfg, &mut rng);
         rows.push(measure(
             "R_send",
-            Uncommitted(send.clone()),
+            send.clone(),
             &send.public_input(),
             Some(r1cs_count(send.clone())),
             PROVE_ITERS,
@@ -236,7 +227,7 @@ fn run() {
         let recv = random_recv(&cfg, RECEIPT_DEPTH, depth, &mut rng);
         rows.push(measure(
             &format!("R_recv d{depth}"),
-            Uncommitted(recv.clone()),
+            recv.clone(),
             &recv.public_input(),
             Some(r1cs_count(recv.clone())),
             PROVE_ITERS,
@@ -244,18 +235,29 @@ fn run() {
         ));
     }
 
+    for &depth in ACCT_TREE_DEPTHS {
+        let op = random_op_receive(&cfg, RECEIPT_DEPTH, depth, &mut rng);
+        rows.push(measure(
+            &format!("R_op d{depth}"),
+            op.clone(),
+            &op.public_input(),
+            Some(r1cs_count(op.clone())),
+            PROVE_ITERS,
+            &mut rng,
+        ));
+    }
+
     println!();
-    println!("  circuit                  │    r1cs │    sr1cs │   domain │ |x| │ blocks │ keygen ms │ prove ms │ verify us │ proof B");
-    println!("  ─────────────────────────┼─────────┼──────────┼──────────┼─────┼────────┼───────────┼──────────┼───────────┼────────");
+    println!("  circuit                  │    r1cs │    sr1cs │   domain │ |x| │ keygen ms │ prove ms │ verify us │ proof B");
+    println!("  ─────────────────────────┼─────────┼──────────┼──────────┼─────┼───────────┼──────────┼───────────┼────────");
     for r in &rows {
         println!(
-            "  {:<24} │ {:>7} │ {:>8} │ {:>8} │ {:>3} │ {:>6} │ {:>9.1} │ {:>8.1} │ {:>9.1} │ {:>6}",
+            "  {:<24} │ {:>7} │ {:>8} │ {:>8} │ {:>3} │ {:>9.1} │ {:>8.1} │ {:>9.1} │ {:>6}",
             r.name,
             r.r1cs.map_or_else(|| "—".to_string(), |n| n.to_string()),
             r.sr1cs,
             r.domain,
             r.instance_len,
-            r.blocks,
             r.keygen_ms,
             r.prove_ms,
             r.verify_us,
@@ -263,7 +265,7 @@ fn run() {
         );
     }
     println!();
-    println!("  |x| counts the leading constant 1. Proofs are (2 + blocks) G1 + 1 F.");
+    println!("  |x| counts the leading constant 1. Proofs are 2 G1 + 1 F.");
     println!();
 }
 
@@ -334,6 +336,83 @@ fn random_recv(
     recv
 }
 
+fn random_op_send(
+    cfg: &HashCfg,
+    receipt_depth: usize,
+    null_depth: usize,
+    rng: &mut StdRng,
+) -> OpCircuit {
+    let b = rng.gen_range(1u64..u64::MAX / 2);
+    let mut op = OpCircuit {
+        cfg: cfg.clone(),
+        is_send: true,
+        acct: Fr::rand(rng),
+        b,
+        v: rng.gen_range(1..=b),
+        kappa: Fr::rand(rng),
+        r: Fr::rand(rng),
+        r_new: Fr::rand(rng),
+        root_null: Fr::rand(rng),
+        counterparty: Fr::rand(rng),
+        r_receipt: Fr::rand(rng),
+        r_dummy: Fr::rand(rng),
+        root: Fr::rand(rng), // unconstrained on the send branch
+        pos: 0,
+        path: MerklePath::empty(receipt_depth),
+        null_insert: IndexedInsertion::placeholder(),
+    };
+    op.attach_dummy_insertion(null_depth);
+    op
+}
+
+fn random_op_receive(
+    cfg: &HashCfg,
+    receipt_depth: usize,
+    null_depth: usize,
+    rng: &mut StdRng,
+) -> OpCircuit {
+    let mut null_tree = IndexedMerkleTree::new(cfg, null_depth);
+    for _ in 0..3 {
+        null_tree.insert(truncate_to_key(Fr::rand(rng)));
+    }
+
+    let mut op = OpCircuit {
+        cfg: cfg.clone(),
+        is_send: false,
+        acct: Fr::rand(rng),
+        b: rng.gen_range(0u64..u64::MAX / 2),
+        v: rng.gen_range(1u64..u64::MAX / 4),
+        kappa: Fr::rand(rng),
+        r: Fr::rand(rng),
+        r_new: Fr::rand(rng),
+        root_null: Fr::from(0u64), // ignored on the receive branch
+        counterparty: Fr::rand(rng),
+        r_receipt: Fr::rand(rng),
+        r_dummy: Fr::rand(rng),
+        root: Fr::from(0u64), // set below
+        pos: 0,               // set below
+        path: MerklePath {
+            siblings: vec![],
+            index_bits: vec![],
+        },
+        null_insert: IndexedInsertion::placeholder(),
+    };
+
+    let mut tree = MerkleTree::new(cfg, receipt_depth);
+    for _ in 0..3 {
+        tree.append(Fr::rand(rng));
+    }
+    let index = tree.append(op.receipt_in());
+    for _ in 0..3 {
+        tree.append(Fr::rand(rng));
+    }
+    op.pos = index as u64;
+    op.root = tree.root();
+    op.path = tree.path(index);
+    op.attach_nullifier_insertion(&mut null_tree);
+    op
+}
+
 // ── End-to-end correctness gate ─────────────────────────────────────────
 
 fn e2e_flow(rng: &mut StdRng) {
@@ -347,11 +426,9 @@ fn e2e_flow(rng: &mut StdRng) {
 
     // Trusted setup, one CRS per relation. Keygen only needs the circuit
     // *shape* (tree depths), so any instance of the right depths works.
-    let (send_pk, send_vk) = ZkPari::<E>::keygen(Uncommitted(random_send(&cfg, rng)), rng);
-    let (recv_pk, recv_vk) = ZkPari::<E>::keygen(
-        Uncommitted(RecvCircuit::blank(&cfg, RECEIPT_DEPTH, ACCT_DEPTH)),
-        rng,
-    );
+    let (send_pk, send_vk) = ZkPari::<E>::keygen(random_send(&cfg, rng), rng);
+    let (recv_pk, recv_vk) =
+        ZkPari::<E>::keygen(RecvCircuit::blank(&cfg, RECEIPT_DEPTH, ACCT_DEPTH), rng);
 
     // Global ledger state: the receipt MMR and the retained root history
     // (the W most recent roots; receive anchors must be in it).
@@ -389,8 +466,7 @@ fn e2e_flow(rng: &mut StdRng) {
     //    single commitment (key and nullifier-tree root unchanged), appends
     //    rho to the receipt MMR, and records the new root in its history.
     //    Statement order: (S, com, com', rho).
-    let send_proof =
-        ZkPari::<E>::prove(Uncommitted(alice.clone()), &send_pk, rng).expect("send proving failed");
+    let send_proof = ZkPari::<E>::prove(alice.clone(), &send_pk, rng).expect("send proving failed");
     let send_x = alice.public_input();
     assert!(
         ZkPari::<E>::verify(&send_proof, &send_vk, &send_x),
@@ -443,8 +519,7 @@ fn e2e_flow(rng: &mut StdRng) {
         "native path check failed"
     );
 
-    let recv_proof =
-        ZkPari::<E>::prove(Uncommitted(bob.clone()), &recv_pk, rng).expect("recv proving failed");
+    let recv_proof = ZkPari::<E>::prove(bob.clone(), &recv_pk, rng).expect("recv proving failed");
     let recv_x = bob.public_input();
     assert!(
         ZkPari::<E>::verify(&recv_proof, &recv_vk, &recv_x),
@@ -510,7 +585,7 @@ fn e2e_flow(rng: &mut StdRng) {
         Ok(false),
         "wrong-position witness must not satisfy R_recv"
     );
-    if let Ok(forged) = ZkPari::<E>::prove(Uncommitted(cheat.clone()), &recv_pk, rng) {
+    if let Ok(forged) = ZkPari::<E>::prove(cheat.clone(), &recv_pk, rng) {
         assert!(
             !ZkPari::<E>::verify(&forged, &recv_vk, &cheat.public_input()),
             "wrong-position proof accepted"

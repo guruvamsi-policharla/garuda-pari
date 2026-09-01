@@ -1,9 +1,9 @@
 use crate::data_structures::{Proof, VerifyingKey};
-use crate::utils::{batch_inversion_and_mul, msm_bigint_wnaf};
+use crate::utils::msm_bigint_wnaf;
 use crate::ZkPari;
 use ark_ec::pairing::Pairing;
 use ark_ec::VariableBaseMSM;
-use ark_ff::{FftField, Field, PrimeField, Zero};
+use ark_ff::{batch_inversion_and_mul, FftField, Field, PrimeField, Zero};
 use ark_poly::{EvaluationDomain, Radix2EvaluationDomain};
 use ark_std::{ops::Neg, rand::RngCore};
 use rayon::prelude::*;
@@ -11,22 +11,28 @@ use rayon::prelude::*;
 impl<E: Pairing> ZkPari<E> {
     /// Batch verification of N proofs using a random linear combination.
     ///
-    /// Reduces N independent (3 + #blocks)-pairing checks to a single
-    /// (3 + #blocks)-pairing check by sampling random 128-bit challenges
-    /// `rho_k` and accumulating:
+    /// Reduces N independent 3-pairing checks to a single 3-pairing check by
+    /// sampling random 128-bit challenges `rho_k` and accumulating:
     ///
     /// ```text
-    /// C~_j = sum rho_k C_ci_j^(k),  T~ = sum rho_k T^(k),  U~ = sum rho_k U^(k),
-    /// V~ = sum (rho_k r^(k)) U^(k),
+    /// T~ = sum rho_k T^(k),  U~ = sum rho_k U^(k),
+    /// V~ = sum (rho_k zeta^(k)) U^(k),
     /// va~ = sum rho_k v_a^(k),  vR~ = sum rho_k v_R^(k)
     /// ```
     ///
     /// then checking
     ///
     /// ```text
-    /// prod_j e(C~_j, delta_j H) * e(T~, delta_w H) * e(-U~, tau H)
-    ///     * e(V~ - va~ alpha G - vR~ beta G, H) == 1
+    /// e(T~, delta H) * e(-U~, tau H) * e(V~ - va~ alpha G - vR~ beta G, H) == 1
     /// ```
+    ///
+    /// Returns `false` (never panics) on any invalid input: a wrong-length
+    /// public input anywhere in the batch, a batch that fails the combined
+    /// pairing check, and — with probability ~N * 2^-172 — a Fiat-Shamir
+    /// challenge landing inside the evaluation domain `H` for some proof in
+    /// the batch, where the Lagrange reconstruction of that proof's `x_A` is
+    /// undefined. Honest proofs re-proved with fresh randomness will pass,
+    /// so rejecting that astronomically unlikely case is sound.
     pub fn batch_verify(
         proofs_and_inputs: &[(Proof<E>, Vec<E::ScalarField>)],
         vk: &VerifyingKey<E>,
@@ -39,12 +45,11 @@ impl<E: Pairing> ZkPari<E> {
         if n == 0 {
             return true;
         }
-        // Malformed statements and proofs are rejected, not panicked on
-        let num_blocks = vk.delta_h_prep.len();
+        // Malformed statements are rejected, not panicked on
         let instance_len = vk.succinct_index.instance_len;
         if proofs_and_inputs
             .iter()
-            .any(|(p, x)| p.c_ci.len() != num_blocks || x.len() != instance_len - 1)
+            .any(|(_, x)| x.len() != instance_len - 1)
         {
             return false;
         }
@@ -61,21 +66,25 @@ impl<E: Pairing> ZkPari<E> {
         let challenges: Vec<E::ScalarField> = proofs_and_inputs
             .par_iter()
             .map(|(proof, public_input)| {
-                crate::utils::compute_chall::<E>(vk, public_input, &proof.c_ci, &proof.t_g)
+                crate::utils::compute_chall::<E>(vk, public_input, &proof.t_g)
             })
             .collect();
 
         /////////////////////// Per-proof computations ///////////////////////
         let instance_size = vk.succinct_index.instance_len;
         let r1cs_orig_num_cnstrs = vk.succinct_index.num_constraints - instance_size;
-        let all_lagrange_coeffs = Self::batch_eval_last_lagrange_coeffs::<E::ScalarField>(
+        // `None` means some proof's challenge landed inside the evaluation
+        // domain: reject rather than panic (see the method docs).
+        let Some(all_lagrange_coeffs) = Self::batch_eval_last_lagrange_coeffs::<E::ScalarField>(
             &vk.domain,
             &challenges,
             r1cs_orig_num_cnstrs,
             instance_size,
-        );
+        ) else {
+            return false;
+        };
 
-        // For each proof k: compute x_A^(k)(r) and v_R^(k) = (x_A + v_a)^2
+        // For each proof k: compute x_A^(k)(zeta) and v_R^(k) = (x_A + v_a)^2
         let v_rs: Vec<E::ScalarField> = proofs_and_inputs
             .par_iter()
             .zip(all_lagrange_coeffs)
@@ -103,29 +112,20 @@ impl<E: Pairing> ZkPari<E> {
         let t_bases: Vec<E::G1Affine> = proofs_and_inputs.iter().map(|(p, _)| p.t_g).collect();
         let u_bases: Vec<E::G1Affine> = proofs_and_inputs.iter().map(|(p, _)| p.u_g).collect();
 
-        // Per block j: C~_j = Sum rho_k * C_ci_j^(k)
-        let c_tildes: Vec<E::G1Affine> = (0..num_blocks)
-            .map(|j| {
-                let c_bases: Vec<E::G1Affine> =
-                    proofs_and_inputs.iter().map(|(p, _)| p.c_ci[j]).collect();
-                <E::G1 as VariableBaseMSM>::msm_unchecked(&c_bases, &rhos).into()
-            })
-            .collect();
-
         // T~, U~ = Sum rho_k * {T, U}^(k)
         let t_tilde: E::G1Affine =
             <E::G1 as VariableBaseMSM>::msm_unchecked(&t_bases, &rhos).into();
         let u_tilde: E::G1Affine =
             <E::G1 as VariableBaseMSM>::msm_unchecked(&u_bases, &rhos).into();
 
-        // V~ = Sum (rho_k * r^(k)) * U^(k)  [full-width scalars]
-        let rho_r: Vec<E::ScalarField> = rhos
+        // V~ = Sum (rho_k * zeta^(k)) * U^(k)  [full-width scalars]
+        let rho_zeta: Vec<E::ScalarField> = rhos
             .iter()
             .zip(&challenges)
-            .map(|(rho, r)| *rho * *r)
+            .map(|(rho, zeta)| *rho * *zeta)
             .collect();
         let v_tilde: E::G1Affine =
-            <E::G1 as VariableBaseMSM>::msm_unchecked(&u_bases, &rho_r).into();
+            <E::G1 as VariableBaseMSM>::msm_unchecked(&u_bases, &rho_zeta).into();
 
         // va~ = Sum rho_k * v_a^(k),  vR~ = Sum rho_k * v_R^(k)
         let v_a_tilde = rhos
@@ -150,14 +150,12 @@ impl<E: Pairing> ZkPari<E> {
         )
         .into();
 
-        let mut g1_terms: Vec<E::G1Affine> = c_tildes;
-        g1_terms.extend([t_tilde, -u_tilde, last_left]);
-        let mut g2_terms: Vec<E::G2Prepared> = vk.delta_h_prep.clone();
-        g2_terms.extend([
-            vk.delta_w_h_prep.clone(),
+        let g1_terms = [t_tilde, -u_tilde, last_left];
+        let g2_terms = [
+            vk.delta_h_prep.clone(),
             vk.tau_h_prep.clone(),
             vk.h_prep.clone(),
-        ]);
+        ];
 
         E::multi_pairing(g1_terms, g2_terms).is_zero()
     }
@@ -166,13 +164,15 @@ impl<E: Pairing> ZkPari<E> {
     /// constants and the geometric sequence once, then batch-inverts the
     /// denominators across all challenges.
     ///
-    /// Returns the Lagrange coefficients per proof.
+    /// Returns the Lagrange coefficients per proof, or `None` if any
+    /// challenge lies inside the evaluation domain (the coefficients are
+    /// undefined there; callers reject in that ~2^-172-per-proof case).
     pub fn batch_eval_last_lagrange_coeffs<F: FftField>(
         domain: &Radix2EvaluationDomain<F>,
         challenges: &[F],
         start_ind: usize,
         count: usize,
-    ) -> Vec<Vec<F>> {
+    ) -> Option<Vec<Vec<F>>> {
         let group_gen = domain.group_gen();
         let group_gen_inv = domain.group_gen_inv();
         let domain_size = domain.size_as_field_element();
@@ -186,9 +186,9 @@ impl<E: Pairing> ZkPari<E> {
             neg_cur *= &group_gen;
         }
 
-        // Lagrange coefficients: L_j(tau) = omega^j * z_H(tau) / (N * (tau - omega^j)).
+        // Lagrange coefficients: L_j(zeta) = omega^j * z_H(zeta) / (N * (zeta - omega^j)).
         // z_H is in the numerator, so we build the denominators
-        // N * omega^(-j) * (tau - omega^j) and batch-invert them.
+        // N * omega^(-j) * (zeta - omega^j) and batch-invert them.
         //
         // Proofs are processed in chunks: within a chunk the flattened
         // denominators share one Montgomery batch inversion (a field
@@ -196,32 +196,34 @@ impl<E: Pairing> ZkPari<E> {
         // would dominate this whole function), and the chunks parallelize
         // over the ambient rayon pool. The shared numerator factor
         // start_gen rides along with the inversion; the per-proof
-        // z_H(tau_k) is applied afterwards.
+        // z_H(zeta_k) is applied afterwards.
         const CHUNK: usize = 1024;
-        let per_chunk: Vec<Vec<Vec<F>>> = challenges
+        let per_chunk: Option<Vec<Vec<Vec<F>>>> = challenges
             .par_chunks(CHUNK)
-            .map(|taus| {
-                let mut flat = Vec::with_capacity(taus.len() * count);
-                for tau in taus {
+            .map(|zetas| {
+                let mut flat = Vec::with_capacity(zetas.len() * count);
+                for zeta in zetas {
                     let mut l_i = domain_size;
                     for neg_elem in &neg_elems {
-                        flat.push(l_i * (*tau + *neg_elem));
+                        flat.push(l_i * (*zeta + *neg_elem));
                         l_i *= &group_gen_inv;
                     }
                 }
                 batch_inversion_and_mul(&mut flat, &start_gen);
 
                 flat.chunks_exact(count)
-                    .zip(taus)
-                    .map(|(coeffs, tau)| {
-                        let z_h = domain.evaluate_vanishing_polynomial(*tau);
-                        assert!(!z_h.is_zero());
-                        coeffs.iter().map(|c| *c * z_h).collect()
+                    .zip(zetas)
+                    .map(|(coeffs, zeta)| {
+                        let z_h = domain.evaluate_vanishing_polynomial(*zeta);
+                        if z_h.is_zero() {
+                            return None;
+                        }
+                        Some(coeffs.iter().map(|c| *c * z_h).collect())
                     })
                     .collect()
             })
             .collect();
 
-        per_chunk.into_iter().flatten().collect()
+        per_chunk.map(|chunks| chunks.into_iter().flatten().collect())
     }
 }

@@ -12,8 +12,8 @@ use ark_r1cs_std::fields::fp::FpVar;
 use ark_r1cs_std::select::CondSelectGadget;
 use ark_relations::gr1cs::{ConstraintSystemRef, SynthesisError};
 
-use super::super::Fr;
 use super::hasher::{hash, hash_var, HashCfg, DOM_NODE};
+use super::Fr;
 
 /// Authentication path: sibling hashes from the leaf level up, and the
 /// leaf-index bit per level (`true` = current node is the *right* child).
@@ -23,8 +23,19 @@ pub struct MerklePath {
     pub index_bits: Vec<bool>,
 }
 
+impl MerklePath {
+    /// An all-zero path of the given depth (for branch-disabled witnesses,
+    /// e.g. the receive-side path in an R_op send).
+    pub fn empty(depth: usize) -> Self {
+        Self {
+            siblings: vec![Fr::from(0u64); depth],
+            index_bits: vec![false; depth],
+        }
+    }
+}
+
 /// Append-only fixed-depth Merkle tree. Keeps every level in memory, which
-/// is fine for benchmark-sized leaf counts: level `j` holds
+/// is fine for test/benchmark-sized leaf counts: level `j` holds
 /// `ceil(num_leaves / 2^j)` nodes and everything to the right is the
 /// all-zero subtree `zeros[j]`.
 pub struct MerkleTree {
@@ -156,9 +167,9 @@ pub fn compute_root_var(
 }
 
 /// Hash `leaf` up `siblings` with the left/right ordering dictated by
-/// externally supplied `bits` (little-endian leaf index). Used by R_recv,
-/// where the bits come from the decomposition of the witnessed position so
-/// the membership proof *binds* that position.
+/// externally supplied `bits` (little-endian leaf index). Used by the
+/// receive branch, where the bits come from the decomposition of the
+/// witnessed position so the membership proof *binds* that position.
 pub fn compute_root_with_bits(
     cfg: &HashCfg,
     leaf: &FpVar<Fr>,

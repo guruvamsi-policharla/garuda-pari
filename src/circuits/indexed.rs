@@ -1,5 +1,5 @@
-//! Indexed Merkle tree (Aztec-style) for the per-account nullifier and tag
-//! trees, with the *insertion proof verified in-circuit*.
+//! Indexed Merkle tree (Aztec-style) for the per-account nullifier trees,
+//! with the *insertion proof verified in-circuit*.
 //!
 //! Leaves form a linked list sorted by value: leaf = (value, next_value,
 //! next_index), hashed as `H(DOM_ILEAF, value, next_value, next_index)`;
@@ -19,7 +19,7 @@
 //! empty slot up to the same intermediate root, the new leaf up to `root'`)
 //! plus three leaf hashes and two 128-bit comparisons.
 //!
-//! Tree keys are the low 128 bits of the (hash-output) nullifier/tag —
+//! Tree keys are the low 128 bits of the (hash-output) nullifier —
 //! full field elements cannot be compared soundly in-circuit without their
 //! own decomposition, and 128 bits keeps collisions negligible while making
 //! the ordering checks cheap.
@@ -34,13 +34,13 @@ use ark_r1cs_std::fields::FieldVar;
 use ark_r1cs_std::select::CondSelectGadget;
 use ark_relations::gr1cs::{ConstraintSystemRef, SynthesisError};
 
-use super::super::Fr;
 use super::hasher::{hash, hash_var, HashCfg, DOM_ILEAF, DOM_NODE};
 use super::merkle::{alloc_path, compute_root_var, MerklePath};
+use super::Fr;
 use super::{enforce_lt_128, enforce_range_bits};
 
 /// Truncate a field element to the low 128 bits — the indexed-tree key of a
-/// nullifier or tag.
+/// nullifier.
 pub fn truncate_to_key(x: Fr) -> Fr {
     let limbs = x.into_bigint().0;
     Fr::from_bigint(BigInt::new([limbs[0], limbs[1], 0, 0])).unwrap()
@@ -101,7 +101,8 @@ impl IndexedInsertion {
 }
 
 /// Fixed-depth indexed Merkle tree, rebuilt eagerly on each insert (fine for
-/// benchmark-sized trees; empty slots to the right are all-zero subtrees).
+/// test/benchmark-sized trees; empty slots to the right are all-zero
+/// subtrees).
 pub struct IndexedMerkleTree {
     cfg: HashCfg,
     pub depth: usize,
@@ -248,11 +249,18 @@ pub fn key_from_field_var(x: &FpVar<Fr>) -> Result<FpVar<Fr>, SynthesisError> {
 }
 
 /// Enforce that inserting `key` (a 128-bit tree key with native value
-/// `key_val`) transitions the indexed tree from `root_old` to `root_new`.
+/// `key_val`) transitions the indexed tree from `root_old` to `root_new` —
+/// but only when `enforce` is true.
 ///
 /// This is `mt.AccVerifyInsert(root_old, key, pi_mt) = root_new` in-circuit;
 /// soundness of the non-membership argument follows from the sorted
 /// linked-list invariant, which every accepted insertion preserves.
+///
+/// The three root equalities are gated on `enforce` (R_op's send branch
+/// disables them); the leaf range checks and the non-membership orderings
+/// stay unconditional, so a disabled branch must still witness *some* valid
+/// insertion — inserting the derived key into an empty tree always works.
+#[allow(clippy::too_many_arguments)]
 pub fn enforce_indexed_insert(
     cs: ConstraintSystemRef<Fr>,
     cfg: &HashCfg,
@@ -261,6 +269,7 @@ pub fn enforce_indexed_insert(
     root_old: &FpVar<Fr>,
     root_new: &FpVar<Fr>,
     ins: &IndexedInsertion,
+    enforce: &Boolean<Fr>,
 ) -> Result<(), SynthesisError> {
     // The low leaf, range-checked so the orderings below are sound.
     let low_value = FpVar::new_witness(cs.clone(), || Ok(ins.low_leaf.value))?;
@@ -276,7 +285,7 @@ pub fn enforce_indexed_insert(
         DOM_ILEAF,
         &[low_value.clone(), low_next.clone(), low_next_index.clone()],
     )?;
-    compute_root_var(cfg, &low_hash, &low_path)?.enforce_equal(root_old)?;
+    compute_root_var(cfg, &low_hash, &low_path)?.conditional_enforce_equal(root_old, enforce)?;
 
     // 2. Non-membership: low.value < key < low.next_value, where a zero
     //    next_value means "list maximum" and compares as 2^128.
@@ -301,11 +310,13 @@ pub fn enforce_indexed_insert(
     let mid_root = compute_root_var(cfg, &low_updated_hash, &low_path)?;
 
     // 5. The new slot is empty under the intermediate root...
-    compute_root_var(cfg, &FpVar::zero(), &new_path)?.enforce_equal(&mid_root)?;
+    compute_root_var(cfg, &FpVar::zero(), &new_path)?
+        .conditional_enforce_equal(&mid_root, enforce)?;
 
     // 6. ...and holds the new leaf under root_new.
     let new_leaf_hash = hash_var(cfg, DOM_ILEAF, &[key.clone(), low_next, low_next_index])?;
-    compute_root_var(cfg, &new_leaf_hash, &new_path)?.enforce_equal(root_new)?;
+    compute_root_var(cfg, &new_leaf_hash, &new_path)?
+        .conditional_enforce_equal(root_new, enforce)?;
 
     Ok(())
 }

@@ -1,16 +1,24 @@
-//! The Sapling-style hash instantiation shared by all private-transfer
+//! The Sapling-style hash instantiation shared by all private-payment
 //! primitives: Pedersen over Jubjub for everything structural (Merkle
 //! nodes, indexed-tree leaves, commitments) and SHA-256 for the scheme's
-//! single CRPRF call site (nullifier derivation in R_recv).
+//! single CRPRF call site (nullifier derivation).
 //!
 //! Every hash in the scheme goes through [`hash`] / [`hash_var`], routed by
 //! its domain tag:
 //!
-//!   Com_acct(b, kappa, root_null; r) = H(DOM_ACCT, b, kappa, root, r) Pedersen
-//!   CRPRF_kappa(recv, pos)           = H(DOM_NULL, kappa, pos)        SHA-256
-//!   Com_rec(v, Sen, Rec; r'')        = H(DOM_REC,  v, S, R, r'')      Pedersen
-//!   Merkle node                    = H(DOM_NODE, left, right)   Pedersen
-//!   Indexed-tree leaf              = H(DOM_ILEAF, value, nv, ni) Pedersen
+//!   Com_acct(b, kappa, root_null; r)  = H(DOM_ACCT, b, kappa, root, r)  Pedersen
+//!   CRPRF_kappa(recv, pos)            = H(DOM_NULL, kappa, pos)         SHA-256
+//!   Com_rec(v, Sen, Rec; r'')         = H(DOM_REC,  v, S, R, r'')       Pedersen
+//!   Com_rec(v, Sen, Rec, type; r'')   = H(DOM_REC,  v, S, R, t, r'')    Pedersen
+//!   Merkle node                       = H(DOM_NODE, left, right)        Pedersen
+//!   Indexed-tree leaf                 = H(DOM_ILEAF, value, nv, ni)     Pedersen
+//!
+//! The receipt commitment has two arities: the unlinkable construction's
+//! three data slots, and the operation-hiding construction's four (the
+//! trailing *type* slot distinguishes real receipts, type 1, from the dummy
+//! receipts a hidden receive publishes, type 0). A deployment uses exactly
+//! one of the two constructions, so the arities never coexist under one
+//! ledger.
 //!
 //! The paper's `recv` PRF label *is* the DOM_NULL domain byte; the key
 //! kappa comes first in the preimage, then the receipt position.
@@ -30,14 +38,14 @@
 //! randomness windows a doubling chain of a *single* base so that term is
 //! exactly r*H (Sapling's windowed Pedersen commitment) — identical circuit
 //! cost — and would derive all generators as nothing-up-my-sleeve points
-//! rather than from this benchmark's fixed seed.
+//! rather than from this instantiation's fixed seed.
 //!
 //! **SHA-256**: the 256-bit digest is truncated to its low 253 bits and
 //! repacked as a field element — always `< r`, so native and in-circuit
 //! outputs agree bit for bit. With fixed-length input and the key in front,
 //! SHA-256(dom || kappa || pos) is a standard PRF instantiation. The call
-//! is 2 compression functions; only R_recv pays it (once) — R_send has no
-//! PRF call site at all.
+//! is 2 compression functions; only the receive branch pays it (once) —
+//! R_send has no PRF call site at all.
 
 use ark_crypto_primitives::crh::sha256::constraints::Sha256Gadget;
 use ark_crypto_primitives::crh::sha256::{digest::Digest, Sha256};
@@ -54,7 +62,7 @@ use ark_std::rand::rngs::StdRng;
 use ark_std::rand::SeedableRng;
 use ark_std::UniformRand;
 
-use super::super::Fr;
+use super::Fr;
 
 /// Domain-separation tags (small values on purpose: they serialize as a
 /// single byte). NULL routes to SHA-256; everything else to Pedersen.
@@ -66,9 +74,9 @@ pub const DOM_NODE: u64 = 5;
 /// Indexed-tree leaf: `H(DOM_ILEAF, value, next_value, next_index)`.
 pub const DOM_ILEAF: u64 = 6;
 
-/// The largest Pedersen preimage: Com_acct / Com_rec's 1-byte tag + 4 field
-/// elements (three data slots plus randomness).
-const PEDERSEN_MAX_BYTES: usize = 1 + 4 * 32;
+/// The largest Pedersen preimage: the operation-hiding Com_rec's 1-byte tag
+/// + 5 field elements (four data slots plus randomness).
+const PEDERSEN_MAX_BYTES: usize = 1 + 5 * 32;
 
 /// The CRPRF call site, which needs a genuine PRF rather than a CRH.
 fn is_prf(dom: u64) -> bool {

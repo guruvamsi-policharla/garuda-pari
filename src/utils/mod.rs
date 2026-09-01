@@ -1,29 +1,18 @@
-//! Shared utilities: MSM helpers, batched field inversion, the Fiat-Shamir
-//! transcript, and the protocol's challenge derivation.
+//! Shared utilities: MSM helpers, the Fiat-Shamir transcript, and the
+//! protocol's challenge derivation.
 
 pub mod transcript;
 
 use crate::data_structures::VerifyingKey;
 use ark_ec::pairing::Pairing;
 use ark_ec::VariableBaseMSM;
-use ark_ff::{BigInteger, Field, PrimeField};
+use ark_ff::{BigInteger, PrimeField};
 use transcript::IOPTranscript;
-
-/// Takes as input a struct, and converts them to a series of bytes. All traits
-/// that implement `CanonicalSerialize` can be automatically converted to bytes
-/// in this manner.
-#[macro_export]
-macro_rules! to_bytes {
-    ($x:expr) => {{
-        let mut buf = ark_std::vec![];
-        ark_serialize::CanonicalSerialize::serialize_compressed($x, &mut buf).map(|_| buf)
-    }};
-}
 
 /////////////////////////// Fiat-Shamir challenge ///////////////////////////
 
-/// Compute the Fiat-Shamir challenge `r`. Binds the verifying key, the
-/// public input, and all first-message commitments `(C_ci_1, ..., C_ci_J, T)`.
+/// Compute the Fiat-Shamir challenge `zeta`. Binds the verifying key, the
+/// public input, and the first-message commitment `T`.
 ///
 /// The verifying key is absorbed once, when the key is built
 /// ([`VerifyingKey::new`]); this clones that seeded state rather than
@@ -32,30 +21,31 @@ macro_rules! to_bytes {
 pub(crate) fn compute_chall<E: Pairing>(
     vk: &VerifyingKey<E>,
     public_input: &[E::ScalarField],
-    c_cis: &[E::G1Affine],
     t_g: &E::G1Affine,
 ) -> E::ScalarField {
     let mut transcript = vk.transcript().clone();
-    append_input_and_comms::<E>(&mut transcript, public_input, c_cis, t_g);
-    transcript.get_and_append_challenge("r".as_bytes()).unwrap()
+    append_input_and_comm::<E>(&mut transcript, public_input, t_g);
+    transcript.get_and_append_challenge(b"zeta")
 }
 
-fn append_input_and_comms<E: Pairing>(
+fn append_input_and_comm<E: Pairing>(
     transcript: &mut IOPTranscript<E::ScalarField>,
     public_input: &[E::ScalarField],
-    c_cis: &[E::G1Affine],
     t_g: &E::G1Affine,
 ) {
-    let _ = transcript.append_serializable_element(b"input", &public_input.to_vec());
-    for c_ci in c_cis {
-        let _ = transcript.append_serializable_element(b"comm_ci", c_ci);
-    }
-    let _ = transcript.append_serializable_element(b"comm", t_g);
+    transcript.append_serializable_element(b"input", &public_input.to_vec());
+    transcript.append_serializable_element(b"comm", t_g);
 }
 
 /////////////////////////// MSM helpers ///////////////////////////
 
-/// Compute an MSM using the windowed non-adjacent form.
+/// Compute an MSM using a 2-bit windowed non-adjacent form.
+///
+/// Used for the verifier's single 3-term MSM
+/// `zeta U - v_a (alpha G) - v_R (beta G)`: sharing one doubling chain across
+/// the three points beats three independent scalar multiplications by ~30%
+/// and the library MSM by ~15% on BLS12-381 G1 (see the ignored
+/// `verifier_msm` test for the measurement).
 pub fn msm_bigint_wnaf<V: VariableBaseMSM>(
     bases: &[V::MulBase],
     scalars: &[<V::ScalarField as PrimeField>::BigInt],
@@ -94,7 +84,7 @@ pub fn msm_bigint_wnaf<V: VariableBaseMSM>(
 
     // We're traversing windows from high to low.
     lowest
-        + &window_sums.rev().fold(zero, |mut total, sum_i| {
+        + window_sums.rev().fold(zero, |mut total, sum_i| {
             total += sum_i;
             for _ in 0..C {
                 total.double_in_place();
@@ -143,44 +133,4 @@ fn make_digits<const W: usize>(
         }
         digit
     })
-}
-
-/// Given a vector of field elements {v_i}, compute the vector {coeff * v_i^(-1)}.
-/// This method is explicitly single-threaded.
-pub fn batch_inversion_and_mul<F: Field>(v: &mut [F], coeff: &F) {
-    // Montgomery's Trick and Fast Implementation of Masked AES
-    // Genelle, Prouff and Quisquater
-    // Section 3.2
-    // but with an optimization to multiply every element in the returned vector by
-    // coeff
-
-    // First pass: compute [a, ab, abc, ...]
-    let mut prod = Vec::with_capacity(v.len());
-    let mut tmp = F::one();
-    for f in v.iter().filter(|f| !f.is_zero()) {
-        tmp *= f;
-        prod.push(tmp);
-    }
-
-    // Invert `tmp`.
-    tmp = tmp.inverse().unwrap(); // Guaranteed to be nonzero.
-
-    // Multiply product by coeff, so all inverses will be scaled by coeff
-    tmp *= coeff;
-
-    // Second pass: iterate backwards to compute inverses
-    for (f, s) in v
-        .iter_mut()
-        // Backwards
-        .rev()
-        // Ignore normalized elements
-        .filter(|f| !f.is_zero())
-        // Backwards, skip last element, fill in one for last term.
-        .zip(prod.into_iter().rev().skip(1).chain(Some(F::one())))
-    {
-        // tmp := tmp * f; f := tmp * s = 1/f
-        let new_tmp = tmp * *f;
-        *f = tmp * &s;
-        tmp = new_tmp;
-    }
 }

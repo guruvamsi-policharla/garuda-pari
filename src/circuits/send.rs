@@ -8,7 +8,7 @@
 //!   com  = Com_acct(b, kappa, root_null; r)
 //!   com' = Com_acct(b - v, kappa, root_null; r')
 //!   rho  = Com_rec(v, S, R; r'')
-//!   1 <= v <= b   and   b, v, b - v in [0, 2^64)
+//!   0 <= v <= b   and   b, v, b - v in [0, 2^64)
 //!
 //! There is no hashing beyond the three Pedersen commitment openings:
 //! the PRF key and the owner's indexed-nullifier-tree root are bound
@@ -16,20 +16,21 @@
 //! Nullifier derivation is the receiver's job (from the receipt's MMR
 //! position under the receiver's key, see `recv.rs`), so a send touches no
 //! tree and no PRF, and the circuit has no depth parameter. The paper's
-//! `R in Accounts` line is not enforced here: the receiver need not be
-//! registered when the receipt is created. There are no committed-input
-//! blocks because account commitments are hash values chained by the
-//! ledger — one commitment is the account's entire public state.
+//! `Rec in N_lambda` check (identifier well-formedness) is not enforced
+//! here: identifiers are plain field elements in this instantiation, and
+//! the receiver need not be registered when the receipt is created. There
+//! are no committed-input blocks because account commitments are hash
+//! values chained by the ledger — one commitment is the account's entire
+//! public state.
 
 use ark_r1cs_std::alloc::AllocVar;
 use ark_r1cs_std::eq::EqGadget;
 use ark_r1cs_std::fields::fp::FpVar;
-use ark_r1cs_std::fields::FieldVar;
 use ark_relations::gr1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
 
-use super::super::Fr;
 use super::enforce_range_64;
 use super::hasher::{hash, hash_var, HashCfg, DOM_ACCT, DOM_REC};
+use super::Fr;
 
 #[derive(Clone)]
 pub struct SendCircuit {
@@ -123,12 +124,13 @@ impl ConstraintSynthesizer<Fr> for SendCircuit {
         // rho = Com_rec(v, S, R; r'')
         hash_var(&self.cfg, DOM_REC, &[v.clone(), sen, rec, r_receipt])?.enforce_equal(&receipt)?;
 
-        // 1 <= v <= b and b, v, b - v in B = [0, 2^64): the three range
-        // checks make the subtraction non-wrapping, and v != 0 gives v >= 1.
+        // 0 <= v <= b and b, v, b - v in B = [0, 2^64): the three range
+        // checks make the subtraction non-wrapping, which gives v <= b.
+        // v = 0 is allowed, matching the paper's relation (and the dummy
+        // receipts of the operation-hiding construction need it).
         enforce_range_64(cs.clone(), &b, self.b)?;
         enforce_range_64(cs.clone(), &v, self.v)?;
         enforce_range_64(cs, &b_new, self.b.wrapping_sub(self.v))?;
-        v.enforce_not_equal(&FpVar::zero())?;
 
         Ok(())
     }

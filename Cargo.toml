@@ -16,16 +16,21 @@ ark-ec = { version = "0.6.0", default-features = false }
 ark-poly = { version = "0.6.0", default-features = false }
 ark-relations = { version = "0.6.0", default-features = false }
 merlin = { version = "3.0.0", default-features = false }
-displaydoc = { version = "0.2.3", default-features = false }
 rayon = { version = "1.5.2" }
 
+# The payment circuits (feature "circuits")
+ark-bls12-381 = { version = "0.6.0", default-features = false, features = ["curve"], optional = true }
+ark-crypto-primitives = { version = "0.6", features = ["crh", "constraints"], optional = true }
+ark-ed-on-bls12-381 = { version = "0.6.0", features = ["r1cs"], optional = true }
+ark-r1cs-std = { version = "0.6", optional = true }
+
 [dev-dependencies]
-# Curves for tests, examples, and benchmarks
+# Enables the payment-circuit feature for tests and benches without imposing
+# it on library consumers (cargo unifies the self-dependency's features into
+# every dev target's build of the lib).
+zkpari = { path = ".", features = ["circuits"] }
+# Curve for tests and benchmarks
 ark-bls12-381 = { version = "0.6.0", default-features = false, features = ["curve"] }
-ark-bn254 = { version = "0.6.0", default-features = false, features = ["curve"] }
-ark-crypto-primitives = { version = "0.6", features = ["crh", "constraints"] }
-ark-ed-on-bls12-381 = { version = "0.6.0", features = ["r1cs"] }
-ark-r1cs-std = "0.6"
 
 [[bench]]
 name = "batch_verify"
@@ -50,6 +55,13 @@ harness = false
 [features]
 default = ["std", "parallel"]
 std = ["ark-ff/std", "ark-poly/std", "ark-relations/std", "ark-std/std", "ark-serialize/std"]
+circuits = [
+    "std",
+    "dep:ark-bls12-381",
+    "dep:ark-crypto-primitives",
+    "dep:ark-ed-on-bls12-381",
+    "dep:ark-r1cs-std",
+]
 print-trace = ["ark-std/print-trace"]
 parallel = [
     "std",

@@ -5,32 +5,28 @@ use ark_ff::{Field, Zero};
 use ark_poly::{EvaluationDomain, Radix2EvaluationDomain};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
-use crate::circuit::{
-    assert_instance_outlining_complete, blocks_to_witness_indices, r1cs_conversion_witness_map,
-    remap_blocks_through_conversion, ZkPariCircuit,
-};
+use crate::circuit::assert_instance_outlining_complete;
 use crate::data_structures::{ProvingKey, SuccinctIndex, Trapdoor, VerifyingKey};
+use crate::utils::transcript::IOPTranscript;
 use crate::ZkPari;
 use ark_relations::{
     gr1cs::{
         self,
         instance_outliner::{outline_sr1cs, InstanceOutliner},
         predicate::polynomial_constraint::SR1CS_PREDICATE_LABEL,
-        ConstraintSystem, OptimizationGoal, SynthesisError, SynthesisMode, R1CS_PREDICATE_LABEL,
+        ConstraintSynthesizer, ConstraintSystem, Matrix, OptimizationGoal, SynthesisError,
+        SynthesisMode,
     },
     sr1cs::Sr1csAdapter,
 };
 use ark_std::{end_timer, rand::RngCore, start_timer, vec::Vec, UniformRand};
 
 impl<E: Pairing> ZkPari<E> {
-    /// Generate proving and verifying keys.
+    /// Generate proving and verifying keys for any arkworks circuit.
     ///
-    /// The circuit declares its committed-input blocks (see [`ZkPariCircuit`]);
-    /// block `j` is committed in `C_ci_j` under its own trapdoor `delta_j`,
-    /// and all remaining witness variables are committed in `T` under
-    /// `delta_w`. Plain arkworks circuits can be passed as
-    /// [`crate::Uncommitted`] for proofs without committed inputs.
-    pub fn keygen<C: ZkPariCircuit<E::ScalarField>, R: RngCore>(
+    /// Circuits that natively register the SR1CS predicate are used as-is;
+    /// plain R1CS circuits are converted by the SR1CS adapter.
+    pub fn keygen<C: ConstraintSynthesizer<E::ScalarField>, R: RngCore>(
         circuit: C,
         rng: &mut R,
     ) -> (ProvingKey<E>, VerifyingKey<E>)
@@ -49,7 +45,7 @@ impl<E: Pairing> ZkPari<E> {
     /// [`Self::simulate`] can forge accepting transcripts for tests,
     /// benchmarks, and load generation. A real deployment must use
     /// [`Self::keygen`] and discard the trapdoor.
-    pub fn keygen_with_trapdoor<C: ZkPariCircuit<E::ScalarField>, R: RngCore>(
+    pub fn keygen_with_trapdoor<C: ConstraintSynthesizer<E::ScalarField>, R: RngCore>(
         circuit: C,
         rng: &mut R,
     ) -> (ProvingKey<E>, VerifyingKey<E>, Trapdoor<E>)
@@ -57,32 +53,29 @@ impl<E: Pairing> ZkPari<E> {
         E: Pairing,
         E::ScalarField: Field,
     {
-        let (cs, block_indices) = Self::circuit_to_keygen_cs(circuit).unwrap();
-        // Check if the constraint system has only one predicate which is Squared R1CS
-        #[cfg(debug_assertions)]
-        {
-            assert_eq!(cs.num_predicates(), 1);
-            assert_eq!(
-                cs.num_constraints(),
-                cs.get_predicate_num_constraints(SR1CS_PREDICATE_LABEL)
-                    .unwrap()
-            );
-        }
+        let cs = Self::circuit_to_keygen_cs(circuit).unwrap();
+        // The constraint system must consist of exactly one predicate, the
+        // Square R1CS one. A circuit that also emitted plain R1CS rows (e.g.
+        // an ark-r1cs-std gadget mixed into a native-SR1CS circuit) would
+        // otherwise have those rows silently dropped by the
+        // `to_matrices()[SR1CS_PREDICATE_LABEL]` lookups below, producing
+        // keys for a weaker relation. Both checks are O(1).
+        assert_eq!(
+            cs.num_predicates(),
+            1,
+            "ZK-Pari supports exactly one predicate (SR1CS); this circuit registered more"
+        );
+        assert_eq!(
+            cs.num_constraints(),
+            cs.get_predicate_num_constraints(SR1CS_PREDICATE_LABEL)
+                .expect("the single predicate must be SR1CS"),
+            "every constraint must be SR1CS"
+        );
 
         /////////////////////// Extract the constraint system information ///////////////////////
         let instance_len = cs.num_instance_variables();
         let num_constraints = cs.num_constraints();
         let num_witness = cs.num_witness_variables();
-        let block_sizes: Vec<usize> = block_indices.iter().map(Vec::len).collect();
-
-        // Mark the committed witnesses; everything else is committed in T
-        let mut is_committed = vec![false; num_witness];
-        for block in &block_indices {
-            for &w in block {
-                is_committed[w] = true;
-            }
-        }
-        let ordinary_indices: Vec<usize> = (0..num_witness).filter(|w| !is_committed[*w]).collect();
 
         /////////////////////// Generators ///////////////////////
         let timer_sample_generators = start_timer!(|| "Sample generators");
@@ -94,30 +87,23 @@ impl<E: Pairing> ZkPari<E> {
         let timer_trapdoor_gen = start_timer!(|| "Trapdoor generation and exponentiations");
         let alpha = E::ScalarField::rand(rng);
         let beta = E::ScalarField::rand(rng);
-        // One delta_j per committed-input block, plus delta_w for the witnesses
-        let deltas: Vec<E::ScalarField> = (0..block_indices.len())
-            .map(|_| E::ScalarField::rand(rng))
-            .collect();
-        let delta_w = E::ScalarField::rand(rng);
+        let delta = E::ScalarField::rand(rng);
         let tau = E::ScalarField::rand(rng);
 
         let alpha_g: <E as Pairing>::G1 = g * alpha;
         let beta_g = g * beta;
-        let delta_h: Vec<E::G2Affine> = deltas.iter().map(|d| (h * d).into()).collect();
-        let delta_w_h = h * delta_w;
+        let delta_h = h * delta;
         let tau_h = h * tau;
 
-        let delta_inverses: Vec<E::ScalarField> =
-            deltas.iter().map(|d| d.inverse().unwrap()).collect();
-        let delta_w_inverse = delta_w.inverse().unwrap();
+        let delta_inverse = delta.inverse().unwrap();
         end_timer!(timer_trapdoor_gen);
 
         /////////////////////// Computing the FFT domain ///////////////////////
         let timer_fft_domain = start_timer!(|| "Computing the FFT domain");
         let domain = Radix2EvaluationDomain::new(num_constraints).unwrap();
-        // tau must lie outside the interpolation domain K
-        let v_k_at_tau = domain.evaluate_vanishing_polynomial(tau);
-        assert_ne!(v_k_at_tau, E::ScalarField::zero());
+        // tau must lie outside the interpolation domain H
+        let v_h_at_tau = domain.evaluate_vanishing_polynomial(tau);
+        assert_ne!(v_h_at_tau, E::ScalarField::zero());
         end_timer!(timer_fft_domain);
         let domain_size = domain.size();
 
@@ -126,23 +112,12 @@ impl<E: Pairing> ZkPari<E> {
         let (a, b) = Self::compute_ai_bi_at_tau(tau, &cs, domain).unwrap();
         end_timer!(timer_compute_a_b);
 
-        // A committed input must appear in some constraint, otherwise its CRS
-        // basis element is the identity and the commitment would ignore it
-        for block in &block_indices {
-            for &w in block {
-                assert!(
-                    !(a[instance_len + w].is_zero() && b[instance_len + w].is_zero()),
-                    "committed input (witness variable {w}) does not appear in any constraint; \
-                     its commitment basis element would be the identity"
-                );
-            }
-        }
-
         /////////////////////// Succinct Index ///////////////////////
+        let matrices = &cs.to_matrices().unwrap()[SR1CS_PREDICATE_LABEL];
         let succinct_index = SuccinctIndex {
             num_constraints,
             instance_len,
-            committed_input_blocks: block_sizes,
+            matrix_digest: Self::hash_index(matrices, num_constraints, instance_len),
         };
 
         /////////////////////// Powers of tau ///////////////////////
@@ -190,54 +165,34 @@ impl<E: Pairing> ZkPari<E> {
         /////////////////////// Commitment Keys ///////////////////////
         let timer_commit_keys = start_timer!(|| "Computing Committing Keys");
 
-        // Per block j:
-        //   Sigma_ci_j = [(alpha a_i(tau) + beta b_i(tau))/delta_j G] for i in block j
-        //   Gamma_ci_j = (beta v_K(tau)/delta_j) G: blinding direction of C_ci_j
-        let timer_sigma_ci = start_timer!(|| "Computing sigma_ci");
-        let mut sigma_ci = Vec::with_capacity(block_indices.len());
-        let mut gamma_ci = Vec::with_capacity(block_indices.len());
-        for (block, delta_j_inverse) in block_indices.iter().zip(&delta_inverses) {
-            let alpha_over_delta_j = alpha * delta_j_inverse;
-            let beta_over_delta_j = beta * delta_j_inverse;
-            let sigma_ci_powers = block
-                .par_iter()
-                .map(|&w| {
-                    a[instance_len + w] * alpha_over_delta_j
-                        + b[instance_len + w] * beta_over_delta_j
-                })
-                .collect::<Vec<_>>();
-            sigma_ci.push(table.batch_mul(&sigma_ci_powers));
-            gamma_ci.push((g * (beta * v_k_at_tau * delta_j_inverse)).into());
-        }
-        end_timer!(timer_sigma_ci);
-
-        // Sigma_W = [(alpha a_i(tau) + beta b_i(tau))/delta_w G] for the
-        // ordinary witnesses, in ascending witness-index order
+        // Sigma_W = [(alpha a_i(tau) + beta b_i(tau))/delta G] for the
+        // witnesses, in ascending witness-index order
         let timer_sigma_w = start_timer!(|| "Computing sigma_w");
-        let alpha_over_delta_w = alpha * delta_w_inverse;
-        let beta_over_delta_w = beta * delta_w_inverse;
-        let sigma_w_powers = ordinary_indices
+        let alpha_over_delta = alpha * delta_inverse;
+        let beta_over_delta = beta * delta_inverse;
+        let sigma_w_powers = (0..num_witness)
+            .collect::<Vec<_>>()
             .par_iter()
             .map(|&w| {
-                a[instance_len + w] * alpha_over_delta_w + b[instance_len + w] * beta_over_delta_w
+                a[instance_len + w] * alpha_over_delta + b[instance_len + w] * beta_over_delta
             })
             .collect::<Vec<_>>();
         let sigma_w = table.batch_mul(&sigma_w_powers);
         end_timer!(timer_sigma_w);
 
-        // A-side mask keys: (alpha v_K(tau)/delta_w) G and (alpha tau v_K(tau)/delta_w) G
-        let sigma_mask_const: E::G1Affine = (g * (alpha * v_k_at_tau * delta_w_inverse)).into();
+        // A-side mask keys: (alpha v_H(tau)/delta) G and (alpha tau v_H(tau)/delta) G
+        let sigma_mask_const: E::G1Affine = (g * (alpha * v_h_at_tau * delta_inverse)).into();
         let sigma_mask_linear: E::G1Affine =
-            (g * (alpha * tau * v_k_at_tau * delta_w_inverse)).into();
+            (g * (alpha * tau * v_h_at_tau * delta_inverse)).into();
 
-        // Sigma_Q^comm = [(beta v_K(tau) tau^i / delta_w) G]_{i=0}^{m+2}
-        let timer_q_comm = start_timer!(|| "Computing sigma_q_comm");
-        let beta_v_k_over_delta_w = beta * v_k_at_tau * delta_w_inverse;
-        let sigma_q_comm_powers = powers_of_tau[0..domain_size + 3]
+        // Sigma_Q = [(beta v_H(tau) tau^i / delta) G]_{i=0}^{m+2}
+        let timer_q_comm = start_timer!(|| "Computing sigma_q");
+        let beta_v_h_over_delta = beta * v_h_at_tau * delta_inverse;
+        let sigma_q_powers = powers_of_tau[0..domain_size + 3]
             .par_iter()
-            .map(|tau_to_i| *tau_to_i * beta_v_k_over_delta_w)
+            .map(|tau_to_i| *tau_to_i * beta_v_h_over_delta)
             .collect::<Vec<_>>();
-        let sigma_q_comm = table.batch_mul(&sigma_q_comm_powers);
+        let sigma_q = table.batch_mul(&sigma_q_powers);
         end_timer!(timer_q_comm);
         end_timer!(timer_commit_keys);
         end_timer!(timer_pk_gen);
@@ -250,21 +205,17 @@ impl<E: Pairing> ZkPari<E> {
             g.into(),
             alpha_g.into(),
             beta_g.into(),
-            delta_h,
-            delta_w_h.into(),
+            delta_h.into(),
             tau_h.into(),
             h.into(),
             domain,
         );
 
         let pk = ProvingKey {
-            sigma_ci,
-            gamma_ci,
-            committed_witness_indices: block_indices,
             sigma_w,
             sigma_mask_const,
             sigma_mask_linear,
-            sigma_q_comm,
+            sigma_q,
             sigma_a,
             sigma_r,
             verifying_key: vk.clone(),
@@ -276,8 +227,7 @@ impl<E: Pairing> ZkPari<E> {
         let trapdoor = Trapdoor {
             alpha,
             beta,
-            deltas,
-            delta_w,
+            delta,
             tau,
             g: g.into(),
             instance_a_at_tau: a[..instance_len].to_vec(),
@@ -287,13 +237,33 @@ impl<E: Pairing> ZkPari<E> {
         (pk, vk, trapdoor)
     }
 
+    /// The paper's `HashIdx`: digest the canonical SR1CS matrices (plus the
+    /// counts that fix their interpretation) into 32 bytes.
+    ///
+    /// Stored in the [`SuccinctIndex`] and absorbed into the key's
+    /// Fiat-Shamir transcript, this binds every challenge to the exact
+    /// circuit: two different circuits of identical shape set up under the
+    /// same trapdoor get different challenges, so a proof for one cannot
+    /// verify under the other's key.
+    fn hash_index(
+        matrices: &[Matrix<E::ScalarField>],
+        num_constraints: usize,
+        instance_len: usize,
+    ) -> [u8; 32] {
+        let mut t = IOPTranscript::<E::ScalarField>::new(b"ZK-Pari HashIdx");
+        t.append_serializable_element(b"num_constraints", &(num_constraints as u64));
+        t.append_serializable_element(b"instance_len", &(instance_len as u64));
+        for (matrix, label) in matrices.iter().zip([b"A", b"B"]) {
+            t.append_serializable_element(label, matrix);
+        }
+        t.challenge_bytes32(b"digest")
+    }
+
     /// Synthesize the circuit in setup mode and return the finalized SR1CS
-    /// constraint system together with the declared committed-input blocks
-    /// (as witness indices).
-    #[allow(clippy::type_complexity)]
-    pub fn circuit_to_keygen_cs<C: ZkPariCircuit<E::ScalarField>>(
+    /// constraint system.
+    pub fn circuit_to_keygen_cs<C: ConstraintSynthesizer<E::ScalarField>>(
         circuit: C,
-    ) -> Result<(ConstraintSystem<E::ScalarField>, Vec<Vec<usize>>), SynthesisError>
+    ) -> Result<ConstraintSystem<E::ScalarField>, SynthesisError>
     where
         E: Pairing,
         E::ScalarField: Field,
@@ -303,27 +273,16 @@ impl<E: Pairing> ZkPari<E> {
         let cs: gr1cs::ConstraintSystemRef<E::ScalarField> = ConstraintSystem::new_ref();
         cs.set_mode(SynthesisMode::Setup);
         cs.set_optimization_goal(OptimizationGoal::Constraints);
-        let blocks = circuit.synthesize(cs.clone())?;
-        let mut block_indices = blocks_to_witness_indices(&blocks);
+        circuit.generate_constraints(cs.clone())?;
         cs.finalize();
-        // Circuits that natively register the SR1CS predicate skip the R1CS-to-SR1CS conversion.
-        // The conversion does NOT preserve witness indices (it rebuilds the
-        // witness space by first use, interleaved with square variables and
-        // public-input copies), so the declared committed-input indices are
-        // remapped into the converted numbering. The subsequent instance
-        // outlining only appends witness variables, so the (remapped) indices
-        // stay valid through it.
+        // Circuits that natively register the SR1CS predicate skip the
+        // R1CS-to-SR1CS conversion.
         let native_sr1cs = cs.has_predicate(SR1CS_PREDICATE_LABEL);
 
         let timer_inlining = start_timer!(|| "Inlining constraints");
         let mut sr1cs_inner = if native_sr1cs {
             cs.into_inner().unwrap()
         } else {
-            let conversion_map = r1cs_conversion_witness_map(
-                &cs.to_matrices().unwrap()[R1CS_PREDICATE_LABEL],
-                cs.num_instance_variables(),
-            );
-            block_indices = remap_blocks_through_conversion(&block_indices, &conversion_map);
             let sr1cs_cs = Sr1csAdapter::r1cs_to_sr1cs(&cs).unwrap();
             sr1cs_cs.set_instance_outliner(InstanceOutliner {
                 pred_label: SR1CS_PREDICATE_LABEL.to_string(),
@@ -339,7 +298,7 @@ impl<E: Pairing> ZkPari<E> {
             .expect("instance outlining failed");
         end_timer!(timer_inlining);
         end_timer!(timer_cs_startup);
-        Ok((sr1cs_inner, block_indices))
+        Ok(sr1cs_inner)
     }
 
     #[allow(clippy::type_complexity)]
@@ -358,8 +317,13 @@ impl<E: Pairing> ZkPari<E> {
         let matrices = &new_cs.to_matrices().unwrap()[SR1CS_PREDICATE_LABEL];
 
         // The verifier's public-input reconstruction depends on outlining
-        // having confined every instance column to the trailing rows.
-        assert_instance_outlining_complete(matrices, new_cs.num_instance_variables(), num_constraints);
+        // having confined every instance column to the trailing rows, which
+        // must be exactly the outlining equalities.
+        assert_instance_outlining_complete(
+            matrices,
+            new_cs.num_instance_variables(),
+            num_constraints,
+        );
 
         let mut a = vec![E::ScalarField::zero(); num_variables];
         let mut b = vec![E::ScalarField::zero(); num_variables];

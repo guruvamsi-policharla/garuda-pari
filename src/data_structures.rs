@@ -1,49 +1,32 @@
+use crate::utils::transcript::IOPTranscript;
 use ark_ec::pairing::Pairing;
-use ark_ec::VariableBaseMSM;
 use ark_ff::Field;
 use ark_poly::Radix2EvaluationDomain;
-use crate::utils::transcript::IOPTranscript;
-use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
-use ark_std::rand::RngCore;
-use core::ops::{Add, Sub};
+use ark_serialize::{
+    CanonicalDeserialize, CanonicalSerialize, Compress, SerializationError, Valid, Validate,
+};
 
-/// The proving key for Pari (vanishing-polynomial mask construction).
+/// The proving key for ZK-Pari (vanishing-polynomial mask construction).
 ///
-/// Notation follows the ZK-Pari note: the columns of the Square R1CS matrices
-/// are interpolated over the domain `K`, the basis is extended with the mask
-/// directions `a_{k+2} = v_K(X)`, `a_{k+3} = X v_K(X)` (A-side) and
-/// `b_{k+1} = v_K(X)` (B-side, folded into the committed-input commitments).
-///
-/// The committed inputs declared by the circuit (see
-/// [`crate::ZkPariCircuit`]) are grouped into independently committed *blocks*:
-/// block `j` has its own trapdoor `delta_j`, commitment key `sigma_ci[j]`,
-/// blinding generator `gamma_ci[j]`, and commitment `C_ci_j` in the proof.
+/// Notation follows the paper: the columns of the Square R1CS matrices are
+/// interpolated over the domain `H`, and the basis is extended with the mask
+/// directions `a_{k+1} = v_H(X)`, `a_{k+2} = X v_H(X)` on the A-side.
 #[derive(Clone)]
 pub struct ProvingKey<E>
 where
     E: Pairing,
     E::ScalarField: Field,
 {
-    /// Per-block committed-input commitment keys
-    /// `Sigma_ci_j = [(alpha a_i(tau) + beta b_i(tau))/delta_j G]_{i in block j}`,
-    /// in declaration order.
-    pub sigma_ci: Vec<Vec<E::G1Affine>>,
-    /// Per-block blinding generators `Gamma_ci_j = (beta v_K(tau)/delta_j) G`.
-    pub gamma_ci: Vec<E::G1Affine>,
-    /// Per-block witness indices of the committed inputs declared by the
-    /// circuit at key generation, remapped into the converted SR1CS witness
-    /// numbering on the R1CS path (native-SR1CS circuits keep their indices).
-    pub committed_witness_indices: Vec<Vec<usize>>,
     /// Witness commitment key
-    /// `Sigma_W = [(alpha a_i(tau) + beta b_i(tau))/delta_w G]` for the
-    /// ordinary (non-committed) witnesses, in ascending witness-index order.
+    /// `Sigma_W = [(alpha a_i(tau) + beta b_i(tau))/delta G]` for the
+    /// witnesses, in ascending witness-index order.
     pub sigma_w: Vec<E::G1Affine>,
-    /// A-side mask key for `eta_1`: `(alpha v_K(tau)/delta_w) G` (direction `a_{k+2} = v_K`).
+    /// A-side mask key for `eta_1`: `(alpha v_H(tau)/delta) G` (direction `a_{k+1} = v_H`).
     pub sigma_mask_const: E::G1Affine,
-    /// A-side mask key for `eta_2`: `(alpha tau v_K(tau)/delta_w) G` (direction `a_{k+3} = X v_K`).
+    /// A-side mask key for `eta_2`: `(alpha tau v_H(tau)/delta) G` (direction `a_{k+2} = X v_H`).
     pub sigma_mask_linear: E::G1Affine,
-    /// Quotient commitment key `Sigma_Q^comm = [(beta v_K(tau) tau^i/delta_w) G]_{i=0}^{m+2}`.
-    pub sigma_q_comm: Vec<E::G1Affine>,
+    /// Quotient commitment key `Sigma_Q = [(beta v_H(tau) tau^i/delta) G]_{i=0}^{m+2}`.
+    pub sigma_q: Vec<E::G1Affine>,
     /// A-side opening key `Sigma_A = [alpha tau^i G]_{i=0}^{m}`.
     pub sigma_a: Vec<E::G1Affine>,
     /// Batched B-side/quotient opening key `Sigma_R = [beta tau^i G]_{i=0}^{2m+1}`.
@@ -51,31 +34,27 @@ where
     pub verifying_key: VerifyingKey<E>,
 }
 
-/// The verifying key for Pari.
+/// The verifying key for ZK-Pari.
 ///
 /// Carries a Fiat-Shamir transcript already seeded with the key material
 /// (see [`Self::transcript`]). The key is identical on every verification, so
 /// it is absorbed once at construction and each challenge derivation just
 /// clones that fixed-size Strobe state. Challenge derivation is therefore
-/// O(1) in the size of the key rather than linear in it, which matters here:
-/// the key carries one `G2Prepared` per committed-input block, so hashing it
-/// per verification would cost milliseconds at high block counts.
+/// O(1) in the size of the key rather than linear in it.
 ///
-/// The key is deliberately **not** serializable, and does not implement
-/// `Debug`. Both would mean hand-writing impls around the transcript field,
-/// and nothing in the protocol needs either — only [`Proof`] goes on the wire.
-/// Add them back if key distribution ever needs them.
+/// Serialization writes the group elements and the domain; the prepared `G2`
+/// points and the seeded transcript are derived state, rebuilt by
+/// deserialization (via [`Self::new`]), so a round-tripped key verifies
+/// identically.
 #[derive(Clone)]
 pub struct VerifyingKey<E: Pairing> {
     pub succinct_index: SuccinctIndex,
     pub g: E::G1Affine,
     pub alpha_g: E::G1Affine,
     pub beta_g: E::G1Affine,
-    /// Per-block `delta_j H`.
-    pub delta_h: Vec<E::G2Affine>,
-    pub delta_h_prep: Vec<E::G2Prepared>,
-    pub delta_w_h: E::G2Affine,
-    pub delta_w_h_prep: E::G2Prepared,
+    /// `delta H` (the witness-commitment trapdoor in G2).
+    pub delta_h: E::G2Affine,
+    pub delta_h_prep: E::G2Prepared,
     pub tau_h: E::G2Affine,
     pub tau_h_prep: E::G2Prepared,
     pub h: E::G2Affine,
@@ -95,8 +74,7 @@ impl<E: Pairing> VerifyingKey<E> {
         g: E::G1Affine,
         alpha_g: E::G1Affine,
         beta_g: E::G1Affine,
-        delta_h: Vec<E::G2Affine>,
-        delta_w_h: E::G2Affine,
+        delta_h: E::G2Affine,
         tau_h: E::G2Affine,
         h: E::G2Affine,
         domain: Radix2EvaluationDomain<E::ScalarField>,
@@ -106,10 +84,8 @@ impl<E: Pairing> VerifyingKey<E> {
             g,
             alpha_g,
             beta_g,
-            delta_h_prep: delta_h.iter().map(|d| (*d).into()).collect(),
             delta_h,
-            delta_w_h,
-            delta_w_h_prep: delta_w_h.into(),
+            delta_h_prep: delta_h.into(),
             tau_h,
             tau_h_prep: tau_h.into(),
             h,
@@ -125,18 +101,19 @@ impl<E: Pairing> VerifyingKey<E> {
     ///
     /// The prepared `G2` points are deliberately not absorbed: they are Miller
     /// loop precomputation of `delta_h`, `tau_h`, and `h`, which are. Binding
-    /// the key does not mean binding its precomputation.
+    /// the key does not mean binding its precomputation. The succinct index
+    /// carries the matrix digest, so the transcript binds the circuit, not
+    /// just its shape.
     fn seed_transcript(&mut self) {
         let mut t = IOPTranscript::new(crate::ZkPari::<E>::SNARK_NAME);
-        let _ = t.append_serializable_element(b"index", &self.succinct_index);
-        let _ = t.append_serializable_element(b"g", &self.g);
-        let _ = t.append_serializable_element(b"alpha_g", &self.alpha_g);
-        let _ = t.append_serializable_element(b"beta_g", &self.beta_g);
-        let _ = t.append_serializable_element(b"delta_h", &self.delta_h);
-        let _ = t.append_serializable_element(b"delta_w_h", &self.delta_w_h);
-        let _ = t.append_serializable_element(b"tau_h", &self.tau_h);
-        let _ = t.append_serializable_element(b"h", &self.h);
-        let _ = t.append_serializable_element(b"domain", &self.domain);
+        t.append_serializable_element(b"index", &self.succinct_index);
+        t.append_serializable_element(b"g", &self.g);
+        t.append_serializable_element(b"alpha_g", &self.alpha_g);
+        t.append_serializable_element(b"beta_g", &self.beta_g);
+        t.append_serializable_element(b"delta_h", &self.delta_h);
+        t.append_serializable_element(b"tau_h", &self.tau_h);
+        t.append_serializable_element(b"h", &self.h);
+        t.append_serializable_element(b"domain", &self.domain);
         self.transcript = t;
     }
 
@@ -152,42 +129,161 @@ impl<E: Pairing> VerifyingKey<E> {
     }
 }
 
-/// The succinct index for Pari.
-#[derive(CanonicalSerialize, CanonicalDeserialize, Clone, Debug)]
+impl<E: Pairing> Valid for VerifyingKey<E> {
+    fn check(&self) -> Result<(), SerializationError> {
+        self.g.check()?;
+        self.alpha_g.check()?;
+        self.beta_g.check()?;
+        self.delta_h.check()?;
+        self.tau_h.check()?;
+        self.h.check()
+    }
+}
+
+impl<E: Pairing> CanonicalSerialize for VerifyingKey<E> {
+    fn serialize_with_mode<W: std::io::Write>(
+        &self,
+        mut writer: W,
+        compress: Compress,
+    ) -> Result<(), SerializationError> {
+        self.succinct_index
+            .serialize_with_mode(&mut writer, compress)?;
+        self.g.serialize_with_mode(&mut writer, compress)?;
+        self.alpha_g.serialize_with_mode(&mut writer, compress)?;
+        self.beta_g.serialize_with_mode(&mut writer, compress)?;
+        self.delta_h.serialize_with_mode(&mut writer, compress)?;
+        self.tau_h.serialize_with_mode(&mut writer, compress)?;
+        self.h.serialize_with_mode(&mut writer, compress)?;
+        self.domain.serialize_with_mode(&mut writer, compress)
+    }
+
+    fn serialized_size(&self, compress: Compress) -> usize {
+        self.succinct_index.serialized_size(compress)
+            + self.g.serialized_size(compress)
+            + self.alpha_g.serialized_size(compress)
+            + self.beta_g.serialized_size(compress)
+            + self.delta_h.serialized_size(compress)
+            + self.tau_h.serialized_size(compress)
+            + self.h.serialized_size(compress)
+            + self.domain.serialized_size(compress)
+    }
+}
+
+impl<E: Pairing> CanonicalDeserialize for VerifyingKey<E> {
+    fn deserialize_with_mode<R: std::io::Read>(
+        mut reader: R,
+        compress: Compress,
+        validate: Validate,
+    ) -> Result<Self, SerializationError> {
+        let succinct_index = SuccinctIndex::deserialize_with_mode(&mut reader, compress, validate)?;
+        let g = E::G1Affine::deserialize_with_mode(&mut reader, compress, validate)?;
+        let alpha_g = E::G1Affine::deserialize_with_mode(&mut reader, compress, validate)?;
+        let beta_g = E::G1Affine::deserialize_with_mode(&mut reader, compress, validate)?;
+        let delta_h = E::G2Affine::deserialize_with_mode(&mut reader, compress, validate)?;
+        let tau_h = E::G2Affine::deserialize_with_mode(&mut reader, compress, validate)?;
+        let h = E::G2Affine::deserialize_with_mode(&mut reader, compress, validate)?;
+        let domain = Radix2EvaluationDomain::deserialize_with_mode(&mut reader, compress, validate)?;
+        // `new` rebuilds the derived state: prepared G2 points and the seeded
+        // transcript. The absorbed bytes are identical to the original key's,
+        // so challenge derivation is unchanged.
+        Ok(Self::new(
+            succinct_index,
+            g,
+            alpha_g,
+            beta_g,
+            delta_h,
+            tau_h,
+            h,
+            domain,
+        ))
+    }
+}
+
+impl<E: Pairing> Valid for ProvingKey<E> {
+    fn check(&self) -> Result<(), SerializationError> {
+        self.verifying_key.check()
+    }
+}
+
+impl<E: Pairing> CanonicalSerialize for ProvingKey<E> {
+    fn serialize_with_mode<W: std::io::Write>(
+        &self,
+        mut writer: W,
+        compress: Compress,
+    ) -> Result<(), SerializationError> {
+        self.sigma_w.serialize_with_mode(&mut writer, compress)?;
+        self.sigma_mask_const
+            .serialize_with_mode(&mut writer, compress)?;
+        self.sigma_mask_linear
+            .serialize_with_mode(&mut writer, compress)?;
+        self.sigma_q.serialize_with_mode(&mut writer, compress)?;
+        self.sigma_a.serialize_with_mode(&mut writer, compress)?;
+        self.sigma_r.serialize_with_mode(&mut writer, compress)?;
+        self.verifying_key
+            .serialize_with_mode(&mut writer, compress)
+    }
+
+    fn serialized_size(&self, compress: Compress) -> usize {
+        self.sigma_w.serialized_size(compress)
+            + self.sigma_mask_const.serialized_size(compress)
+            + self.sigma_mask_linear.serialized_size(compress)
+            + self.sigma_q.serialized_size(compress)
+            + self.sigma_a.serialized_size(compress)
+            + self.sigma_r.serialized_size(compress)
+            + self.verifying_key.serialized_size(compress)
+    }
+}
+
+impl<E: Pairing> CanonicalDeserialize for ProvingKey<E> {
+    fn deserialize_with_mode<R: std::io::Read>(
+        mut reader: R,
+        compress: Compress,
+        validate: Validate,
+    ) -> Result<Self, SerializationError> {
+        Ok(Self {
+            sigma_w: Vec::deserialize_with_mode(&mut reader, compress, validate)?,
+            sigma_mask_const: E::G1Affine::deserialize_with_mode(&mut reader, compress, validate)?,
+            sigma_mask_linear: E::G1Affine::deserialize_with_mode(&mut reader, compress, validate)?,
+            sigma_q: Vec::deserialize_with_mode(&mut reader, compress, validate)?,
+            sigma_a: Vec::deserialize_with_mode(&mut reader, compress, validate)?,
+            sigma_r: Vec::deserialize_with_mode(&mut reader, compress, validate)?,
+            verifying_key: VerifyingKey::deserialize_with_mode(&mut reader, compress, validate)?,
+        })
+    }
+}
+
+/// The succinct index for ZK-Pari.
+#[derive(CanonicalSerialize, CanonicalDeserialize, Clone, Debug, PartialEq, Eq)]
 pub struct SuccinctIndex {
     /// Number of SR1CS constraints (after instance outlining).
     pub num_constraints: usize,
     /// Number of instance variables (including the leading constant one).
     pub instance_len: usize,
-    /// Sizes of the committed-input blocks declared by the circuit.
-    pub committed_input_blocks: Vec<usize>,
+    /// The paper's `HashIdx(i)`: a 32-byte digest of the canonical SR1CS
+    /// matrices, computed at key generation. Absorbed into the key's
+    /// Fiat-Shamir transcript (via the index), it binds proofs to the exact
+    /// circuit — two same-shape circuits under one setup get different
+    /// challenges, so a proof for one cannot verify under the other.
+    pub matrix_digest: [u8; 32],
 }
 
-impl SuccinctIndex {
-    /// Total number of committed inputs across all blocks.
-    pub fn num_committed_inputs(&self) -> usize {
-        self.committed_input_blocks.iter().sum()
-    }
-}
-
-/// The setup trapdoor `(alpha, beta, delta_j, delta_w, tau)` plus the instance
+/// The setup trapdoor `(alpha, beta, delta, tau)` plus the instance
 /// polynomial evaluations at `tau`.
 ///
 /// This is the toxic waste of the trusted setup. An honest setup discards it;
 /// retaining it breaks soundness, since it lets [`crate::ZkPari::simulate`]
-/// forge accepting transcripts for any committed-input commitment without a
-/// witness. Use it only for the honest-verifier zero-knowledge *simulator*
-/// (testing, benchmarking, or load generation) — never in a real deployment.
-#[derive(Clone, Debug, CanonicalSerialize, CanonicalDeserialize)]
+/// forge accepting transcripts without a witness. Use it only for the
+/// honest-verifier zero-knowledge *simulator* (testing, benchmarking, or load
+/// generation) — never in a real deployment. It is deliberately not
+/// serializable: toxic waste should not be handed a wire format.
+#[derive(Clone, Debug)]
 pub struct Trapdoor<E: Pairing> {
     /// A-side trapdoor scalar.
     pub alpha: E::ScalarField,
     /// B-side trapdoor scalar.
     pub beta: E::ScalarField,
-    /// Per-block committed-input trapdoors `delta_j`.
-    pub deltas: Vec<E::ScalarField>,
-    /// Witness-commitment trapdoor `delta_w`.
-    pub delta_w: E::ScalarField,
+    /// Witness-commitment trapdoor `delta`.
+    pub delta: E::ScalarField,
     /// Evaluation point trapdoor `tau`.
     pub tau: E::ScalarField,
     /// CRS generator `G`.
@@ -199,95 +295,14 @@ pub struct Trapdoor<E: Pairing> {
     pub instance_b_at_tau: Vec<E::ScalarField>,
 }
 
-/// A Pari proof: `(2 + #blocks) G1 + 1 F` elements.
-///
-/// Any block commitment that the verifier can recompute from public state
-/// (e.g. an aggregate of ledger commitments) need not be transmitted: the
-/// verifier reassembles the proof with the recomputed point. The transmitted
-/// material is then `2 G1 + 1 F` plus one `G1` per *fresh* block commitment.
+/// A ZK-Pari proof: `2 G1 + 1 F` — exactly 128 bytes compressed on
+/// BLS12-381.
 #[derive(CanonicalSerialize, CanonicalDeserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Proof<E: Pairing> {
-    /// Per-block committed-input commitments `C_ci_j` (hiding Pedersen vector
-    /// commitments).
-    pub c_ci: Vec<E::G1Affine>,
     /// Witness/mask/quotient commitment `T`.
     pub t_g: E::G1Affine,
     /// Batched KZG opening proof `U`.
     pub u_g: E::G1Affine,
-    /// Masked A-side evaluation `v_a = z_A(r) - x_A(r)`.
+    /// Masked A-side evaluation `v_a = z_A(zeta) - x_A(zeta)`.
     pub v_a: E::ScalarField,
-}
-
-/// Opening (blinding) randomness `rho_ci_j` of a committed-input commitment
-/// `C_ci_j = sum_i x_i Sigma_ci_j[i] + rho_ci_j Gamma_ci_j`.
-///
-/// If the proof creates a fresh commitment, `rho_ci_j` is sampled by the
-/// prover; if the application already fixes `C_ci_j`, the matching opening is
-/// supplied as auxiliary input via [`crate::ZkPari::prove_with_openings`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CommittedInputOpening<F: Field> {
-    pub rho: F,
-}
-
-impl<F: Field> CommittedInputOpening<F> {
-    pub fn rand<R: RngCore>(rng: &mut R) -> Self {
-        Self { rho: F::rand(rng) }
-    }
-
-    pub fn zero() -> Self {
-        Self { rho: F::zero() }
-    }
-}
-
-impl<F: Field> Add for &CommittedInputOpening<F> {
-    type Output = CommittedInputOpening<F>;
-
-    fn add(self, rhs: Self) -> CommittedInputOpening<F> {
-        CommittedInputOpening {
-            rho: self.rho + rhs.rho,
-        }
-    }
-}
-
-impl<F: Field> Sub for &CommittedInputOpening<F> {
-    type Output = CommittedInputOpening<F>;
-
-    fn sub(self, rhs: Self) -> CommittedInputOpening<F> {
-        CommittedInputOpening {
-            rho: self.rho - rhs.rho,
-        }
-    }
-}
-
-impl<E: Pairing> ProvingKey<E> {
-    /// Pedersen-commit to a vector of committed-input values under the CRS
-    /// basis of block `block`:
-    ///
-    /// `C_ci_j = sum_i values[i] * Sigma_ci_j[i] + opening.rho * Gamma_ci_j`
-    ///
-    /// The values must be in declaration order. This equals
-    /// `proof.c_ci[block]` when the same values are assigned to the block's
-    /// declared variables and the same opening is supplied via
-    /// [`crate::ZkPari::prove_with_openings`].
-    pub fn pedersen_commit(
-        &self,
-        block: usize,
-        values: &[E::ScalarField],
-        opening: &CommittedInputOpening<E::ScalarField>,
-    ) -> E::G1Affine {
-        assert!(
-            block < self.sigma_ci.len(),
-            "block index {block} out of range ({} blocks)",
-            self.sigma_ci.len()
-        );
-        assert_eq!(
-            values.len(),
-            self.sigma_ci[block].len(),
-            "expected {} committed-input values for block {block}, got {}",
-            self.sigma_ci[block].len(),
-            values.len()
-        );
-        let acc = E::G1::msm_unchecked(&self.sigma_ci[block], values);
-        (acc + self.gamma_ci[block] * opening.rho).into()
-    }
 }

@@ -10,16 +10,12 @@
 //!   - Proving is O(m log m) FFTs plus O(m) MSM work; the `ns/constraint`
 //!     column exposes how much of the growth is the log factor.
 //!   - Verification and proof size are independent of `m` — both are flat
-//!     down the table, which is the point of the scheme. `proof B` counts the
-//!     proof's elements, `(2 + #blocks) G1 + 1 F`; the `CanonicalSerialize`
-//!     encoding is 8 bytes larger (a redundant `u64` length prefix on the
-//!     `c_ci` vector).
+//!     down the table, which is the point of the scheme. `proof B` is the
+//!     compressed encoding, exactly the proof's elements `2 G1 + 1 F`.
 //!   - `prove` includes circuit synthesis (constraint generation and witness
 //!     assignment), which the library does not separate out. For this chain
 //!     circuit synthesis is trivial arithmetic, so the column is dominated by
 //!     the cryptographic work.
-//!
-//! Committed-input blocks are fixed at 1 here; experiment 1b sweeps them.
 //!
 //! Threads: single-threaded by default. Set `ZKPARI_BENCH_THREADS=0` for all
 //! cores, or `=N` for N.
@@ -35,8 +31,6 @@ use zkpari::ZkPari;
 /// log2 of the SR1CS constraint count. 2^20 needs ~2.5 GB peak RSS; going
 /// beyond that is memory-bound rather than time-bound on a laptop.
 const LOG2_SIZES: &[u32] = &[10, 12, 14, 16, 18, 20];
-
-const BLOCKS: usize = 1;
 
 /// Proving iterations to take the median over; large circuits get fewer.
 fn iters_for(log2: u32) -> usize {
@@ -69,13 +63,13 @@ fn run() {
     println!("Threads: {}.", thread_label());
     println!("Circuit: native-SR1CS squaring chain, w_i = w_{{i-1}}^2, final value");
     println!("         bound to the single public input. Constraint count is exact");
-    println!("         (= domain size). Committed-input blocks fixed at {BLOCKS}.");
+    println!("         (= domain size).");
     println!();
 
     let mut rows = Vec::new();
 
     for &log2 in LOG2_SIZES {
-        let circuit = SquareChain::for_log2_constraints(log2, BLOCKS, 3);
+        let circuit = SquareChain::for_log2_constraints(log2, 3);
         let public_input = circuit.public_input();
         let iters = iters_for(log2);
 
@@ -112,7 +106,7 @@ fn run() {
             keygen_ms,
             prove_ms,
             verify_us,
-            proof_bytes: proof_element_bytes(&proof),
+            proof_bytes: compressed_size(&proof),
         });
     }
 

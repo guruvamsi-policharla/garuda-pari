@@ -1,21 +1,21 @@
 //! Honest-verifier zero-knowledge simulator (Theorem 1).
 //!
-//! Given the setup [`Trapdoor`], the simulator produces an accepting transcript
-//! `(C_ci, T, U, v_a)` for any committed-input commitment `C_ci` *without a
-//! witness*. The output is statistically indistinguishable from an honest
-//! proof (distance at most `1/(|F| - |K|)`), yet costs only a handful of group
-//! operations instead of full circuit synthesis and the prover MSMs.
+//! Given the setup [`Trapdoor`], the simulator produces an accepting
+//! transcript `(T, U, v_a)` for any public input *without a witness*. The
+//! output is statistically indistinguishable from an honest proof (distance
+//! at most `1/(|F| - |H|)`), yet costs only a handful of group operations
+//! instead of full circuit synthesis and the prover MSMs.
 //!
 //! In the non-interactive (Fiat-Shamir) setting the simulator works because the
 //! first message `T` is independent of the challenge: the simulator forms `T`
-//! from a uniform `y`, derives `r = FS(vk, x, C_ci, T)` exactly as the verifier
+//! from a uniform `y`, derives `zeta = FS(vk, x, T)` exactly as the verifier
 //! does, and then solves the single pairing equation for the unique opening
 //! `U`. The result passes [`ZkPari::verify`] unchanged.
 //!
-//! This is **not** a prover: a simulated transcript attests nothing about the
-//! committed values (it has no witness, so the "range" is vacuous). Its uses
-//! are zero-knowledge testing, verifier benchmarking, and load generation —
-//! and it requires the trapdoor, which an honest deployment destroys.
+//! This is **not** a prover: a simulated transcript attests nothing (it has
+//! no witness). Its uses are zero-knowledge testing, verifier benchmarking,
+//! and load generation — and it requires the trapdoor, which an honest
+//! deployment destroys.
 
 use crate::data_structures::{Proof, Trapdoor, VerifyingKey};
 use crate::utils::compute_chall;
@@ -27,51 +27,33 @@ use ark_std::rand::RngCore;
 use ark_std::UniformRand;
 
 impl<E: Pairing> ZkPari<E> {
-    /// Simulates an accepting proof for the committed-input commitments
-    /// `c_ci` (one per block) under `public_input`, using the setup
+    /// Simulates an accepting proof for `public_input` using the setup
     /// `trapdoor`.
     ///
-    /// The returned [`Proof`] verifies against `vk` with these exact `c_ci`.
-    /// It carries no witness and proves no statement about the committed
-    /// values; see the module documentation.
+    /// The returned [`Proof`] verifies against `vk`. It carries no witness
+    /// and proves no statement; see the module documentation.
     ///
     /// # Panics
     ///
-    /// Panics if `c_ci.len()` does not match the number of committed-input
-    /// blocks, or in the astronomically unlikely event that the Fiat-Shamir
-    /// challenge equals the trapdoor `tau`.
+    /// Panics if the public input length does not match the instance, or in
+    /// the astronomically unlikely events that the Fiat-Shamir challenge
+    /// equals the trapdoor `tau` or lands inside the evaluation domain.
     pub fn simulate(
         trapdoor: &Trapdoor<E>,
         vk: &VerifyingKey<E>,
-        c_ci: &[E::G1Affine],
         public_input: &[E::ScalarField],
         rng: &mut impl RngCore,
     ) -> Proof<E> {
-        Self::simulate_inner(trapdoor, vk, c_ci, public_input, rng)
-    }
-
-    fn simulate_inner(
-        trapdoor: &Trapdoor<E>,
-        vk: &VerifyingKey<E>,
-        c_ci: &[E::G1Affine],
-        public_input: &[E::ScalarField],
-        rng: &mut impl RngCore,
-    ) -> Proof<E> {
-        assert_eq!(
-            c_ci.len(),
-            trapdoor.deltas.len(),
-            "one committed-input commitment per block"
-        );
         assert_eq!(
             public_input.len(),
             vk.succinct_index.instance_len - 1,
             "public input length must match the instance"
         );
 
-        let delta_w_inv = trapdoor
-            .delta_w
+        let delta_inv = trapdoor
+            .delta
             .inverse()
-            .expect("delta_w is a nonzero trapdoor scalar");
+            .expect("delta is a nonzero trapdoor scalar");
 
         // Instance contributions at tau: x_hat_A(tau), x_hat_B(tau), over the
         // public assignment x = (1, public_input...).
@@ -86,69 +68,60 @@ impl<E: Pairing> ZkPari<E> {
             },
         );
 
-        // First message: T = [(alpha (y - x_hat_A(tau)) + beta (y^2 - x_hat_B(tau))) / delta_w] G
-        //                    - sum_j (delta_j / delta_w) C_ci_j.
-        // `y` stands in for the honest z_A(tau); `v_a` stands in for z_A(r) - x_A(r).
+        // First message:
+        // T = [(alpha (y - x_hat_A(tau)) + beta (y^2 - x_hat_B(tau))) / delta] G.
+        // `y` stands in for the honest z_A(tau); `v_a` stands in for
+        // z_A(zeta) - x_A(zeta).
         let y = E::ScalarField::rand(rng);
         let v_a = E::ScalarField::rand(rng);
 
         let t_coeff = (trapdoor.alpha * (y - x_hat_a_tau)
             + trapdoor.beta * (y.square() - x_hat_b_tau))
-            * delta_w_inv;
-        let mut t_proj = vk.g.into_group() * t_coeff;
-        for (commitment, delta_j) in c_ci.iter().zip(&trapdoor.deltas) {
-            t_proj -= commitment.into_group() * (*delta_j * delta_w_inv);
-        }
-        let t_g = t_proj.into_affine();
+            * delta_inv;
+        let t_g = (vk.g.into_group() * t_coeff).into_affine();
 
         // Challenge: identical Fiat-Shamir derivation to the verifier. T does
-        // not depend on r, so deriving r here is consistent.
-        let r = compute_chall::<E>(vk, public_input, c_ci, &t_g);
+        // not depend on zeta, so deriving zeta here is consistent.
+        let zeta = compute_chall::<E>(vk, public_input, &t_g);
         assert_ne!(
-            r, trapdoor.tau,
+            zeta, trapdoor.tau,
             "Fiat-Shamir challenge collided with the trapdoor tau"
         );
 
-        // v_R = (v_a + x_A(r))^2 - x_B(r), with x_B(r) = 0 after outlining.
-        let x_a_r = Self::instance_eval_a_at(vk, public_input, r);
-        let v_r = (v_a + x_a_r).square();
+        // v_R = (v_a + x_A(zeta))^2 - x_B(zeta), with x_B(zeta) = 0 after
+        // outlining.
+        let x_a_zeta = Self::instance_eval_a_at(vk, public_input, zeta);
+        let v_r = (v_a + x_a_zeta).square();
 
         // Solve the verification equation for the unique accepting U:
-        //   U = [ sum_j delta_j C_ci_j + delta_w T - (alpha v_a + beta v_R) G ] / (tau - r).
-        let inv = (trapdoor.tau - r)
+        //   U = [ delta T - (alpha v_a + beta v_R) G ] / (tau - zeta).
+        let inv = (trapdoor.tau - zeta)
             .inverse()
-            .expect("tau - r is nonzero (checked above)");
-        let mut u_proj = t_g.into_group() * (trapdoor.delta_w * inv);
-        for (commitment, delta_j) in c_ci.iter().zip(&trapdoor.deltas) {
-            u_proj += commitment.into_group() * (*delta_j * inv);
-        }
-        u_proj -= vk.g.into_group() * ((trapdoor.alpha * v_a + trapdoor.beta * v_r) * inv);
+            .expect("tau - zeta is nonzero (checked above)");
+        let u_proj = t_g.into_group() * (trapdoor.delta * inv)
+            - vk.g.into_group() * ((trapdoor.alpha * v_a + trapdoor.beta * v_r) * inv);
         let u_g = u_proj.into_affine();
 
-        Proof {
-            c_ci: c_ci.to_vec(),
-            t_g,
-            u_g,
-            v_a,
-        }
+        Proof { t_g, u_g, v_a }
     }
 
-    /// Computes the instance contribution `x_A(r) = sum_i x_i a_i(r)` to the
-    /// A-side polynomial at `r`, using the same last-Lagrange evaluation the
-    /// verifier uses.
+    /// Computes the instance contribution `x_A(zeta) = sum_i x_i a_i(zeta)`
+    /// to the A-side polynomial at `zeta`, using the same last-Lagrange
+    /// evaluation the verifier uses.
     fn instance_eval_a_at(
         vk: &VerifyingKey<E>,
         public_input: &[E::ScalarField],
-        r: E::ScalarField,
+        zeta: E::ScalarField,
     ) -> E::ScalarField {
         let instance_size = vk.succinct_index.instance_len;
         let r1cs_orig_num_cnstrs = vk.succinct_index.num_constraints - instance_size;
         let lagrange_coeffs = Self::eval_last_lagrange_coeffs::<E::ScalarField>(
             &vk.domain,
-            r,
+            zeta,
             r1cs_orig_num_cnstrs,
             instance_size,
-        );
+        )
+        .expect("challenge landed inside the evaluation domain (~2^-172)");
         let px = core::iter::once(E::ScalarField::ONE).chain(public_input.iter().copied());
         lagrange_coeffs
             .into_iter()

@@ -1,150 +1,17 @@
+//! Constraint-system shape checks run at key generation.
+//!
+//! ZK-Pari accepts any arkworks [`ConstraintSynthesizer`]: circuits that
+//! natively register the SR1CS predicate are used as-is, everything else is
+//! converted by `ark_relations::sr1cs::Sr1csAdapter`. After instance
+//! outlining, the verifier reconstructs the public contribution as a
+//! Lagrange sum over the trailing `instance_len` rows and takes `x_B = 0`
+//! outright — the checks in this module pin the matrices to exactly that
+//! shape, once, at key generation.
+//!
+//! [`ConstraintSynthesizer`]: ark_relations::gr1cs::ConstraintSynthesizer
+
 use ark_ff::Field;
-use ark_relations::gr1cs::{
-    ConstraintSynthesizer, ConstraintSystemRef, Matrix, SynthesisError, Variable,
-};
-use ark_std::collections::{BTreeMap, BTreeSet};
-
-/// A circuit for ZK-Pari: synthesizes constraints and *declares* its
-/// committed-input blocks.
-///
-/// Block `j` is an ordered list of witness [`Variable`]s; the proof exposes
-/// one Pedersen vector commitment `C_ci_j` per block (under the CRS basis
-/// `(Sigma_ci_j, Gamma_ci_j)`, with the values in declaration order).
-///
-/// Declared variables may be allocated anywhere in the circuit, in any
-/// order — including values produced mid-circuit by gadgets. The only
-/// requirements, checked at key generation, are that every declared variable
-/// is a witness variable, is declared at most once, and appears in at least
-/// one constraint (otherwise its CRS basis element would be the identity and
-/// the commitment would ignore it).
-///
-/// Synthesis must be deterministic: key generation and proving re-synthesize
-/// the circuit and rely on identical variable assignment (this is the same
-/// assumption the rest of the SNARK already makes about the constraint
-/// matrices).
-pub trait ZkPariCircuit<F: Field> {
-    /// Synthesize the constraints and return the committed-input blocks.
-    fn synthesize(self, cs: ConstraintSystemRef<F>) -> Result<Vec<Vec<Variable>>, SynthesisError>;
-}
-
-/// Adapter for plain arkworks circuits with no committed inputs.
-///
-/// Wrap any [`ConstraintSynthesizer`] to use it with ZK-Pari:
-/// `ZkPari::<E>::keygen(Uncommitted(circuit), rng)`.
-#[derive(Clone)]
-pub struct Uncommitted<C>(pub C);
-
-impl<F: Field, C: ConstraintSynthesizer<F>> ZkPariCircuit<F> for Uncommitted<C> {
-    fn synthesize(self, cs: ConstraintSystemRef<F>) -> Result<Vec<Vec<Variable>>, SynthesisError> {
-        self.0.generate_constraints(cs)?;
-        Ok(Vec::new())
-    }
-}
-
-/// Witness-index map of `Sr1csAdapter::r1cs_to_sr1cs[_with_assignment]`:
-/// old witness index -> witness index in the converted constraint system.
-///
-/// The adapter does *not* preserve witness indices: it rebuilds the witness
-/// space from scratch, scanning the R1CS rows in order (per row: the A-,
-/// then B-, then C-side linear combination, terms in order) and allocating
-/// the next new witness index to each previously unseen variable — original
-/// *instance* variables included, since they get witness copies — followed
-/// by one fresh square witness per row. This function replays that scan over
-/// the same matrices the adapter reads, so declared committed-input indices
-/// can be remapped into the converted numbering. The prover cross-checks the
-/// result against the converted assignment, so any upstream change to the
-/// adapter's allocation order fails loudly there.
-pub(crate) fn r1cs_conversion_witness_map<F: Field>(
-    r1cs_matrices: &[Matrix<F>],
-    num_instance: usize,
-) -> BTreeMap<usize, usize> {
-    let num_rows = r1cs_matrices.iter().map(Vec::len).min().unwrap_or(0);
-    // Old absolute variable index -> new witness index
-    let mut new_index: BTreeMap<usize, usize> = BTreeMap::new();
-    let mut next = 0usize;
-    for row in 0..num_rows {
-        for matrix in r1cs_matrices {
-            for &(_, index) in &matrix[row] {
-                // Variable::One stays Variable::One; everything else gets a
-                // new witness on first use
-                if index == 0 {
-                    continue;
-                }
-                new_index.entry(index).or_insert_with(|| {
-                    let assigned = next;
-                    next += 1;
-                    assigned
-                });
-            }
-        }
-        // The adapter allocates one square witness per R1CS row
-        next += 1;
-    }
-    // Keep only the original witnesses, rebased to witness-vector indices
-    new_index
-        .into_iter()
-        .filter(|&(old, _)| old >= num_instance)
-        .map(|(old, new)| (old - num_instance, new))
-        .collect()
-}
-
-/// Remap declared committed-input blocks through the R1CS-to-SR1CS
-/// conversion's witness map (see [`r1cs_conversion_witness_map`]).
-///
-/// Panics if a declared variable appears in no constraint: it then has no
-/// column in the converted system, so no commitment basis element exists
-/// for it and the commitment would silently ignore the value.
-pub(crate) fn remap_blocks_through_conversion(
-    blocks: &[Vec<usize>],
-    map: &BTreeMap<usize, usize>,
-) -> Vec<Vec<usize>> {
-    blocks
-        .iter()
-        .map(|block| {
-            block
-                .iter()
-                .map(|w| {
-                    *map.get(w).unwrap_or_else(|| {
-                        panic!(
-                            "committed input (witness variable {w}) does not appear in any \
-                             constraint; it has no column in the converted SR1CS system"
-                        )
-                    })
-                })
-                .collect()
-        })
-        .collect()
-}
-
-/// Convert declared blocks of [`Variable`]s into blocks of witness indices,
-/// enforcing that every declared variable is a witness and that no variable
-/// is declared twice.
-pub(crate) fn blocks_to_witness_indices(blocks: &[Vec<Variable>]) -> Vec<Vec<usize>> {
-    let mut seen = BTreeSet::new();
-    blocks
-        .iter()
-        .map(|block| {
-            block
-                .iter()
-                .map(|v| {
-                    assert!(
-                        v.is_witness(),
-                        "committed inputs must be witness variables (instance variables are \
-                         already public)"
-                    );
-                    let index = v
-                        .get_variable_index(0)
-                        .expect("witness variables always carry an index");
-                    assert!(
-                        seen.insert(index),
-                        "witness variable {index} is declared as a committed input more than once"
-                    );
-                    index
-                })
-                .collect()
-        })
-        .collect()
-}
+use ark_relations::gr1cs::Matrix;
 
 /// Panic unless instance outlining left the matrices in the shape the verifier
 /// assumes: every instance column confined to the trailing `num_instance`
@@ -192,6 +59,58 @@ pub(crate) fn assert_instance_outlining_complete<F: Field>(
                      `lc!() + x - y`) so it is outlined."
                 );
             }
+        }
+    }
+    assert_outlining_rows_shape(matrices, num_instance, num_constraints);
+}
+
+/// The positive counterpart to [`assert_instance_outlining_complete`]: the
+/// trailing `num_instance` rows must be *exactly* the outlining equalities,
+/// in instance order — row `outline_start + i` of the A matrix is
+/// `x_i - w_i` (coefficient `+1` on instance variable `i`, `-1` on its
+/// witness copy) with an empty B side.
+///
+/// `ark-relations` 0.6.0's `perform_instance_outlining` always builds the
+/// outline map with one entry per instance variable (constant included) and
+/// `outline_sr1cs` appends exactly this shape, so this is hardening against
+/// upstream drift rather than a live hole. The verifier's `x_A`
+/// reconstruction assumes the `+1` coefficient and the row order; the `x_B =
+/// 0` shortcut assumes the empty B rows.
+fn assert_outlining_rows_shape<F: Field>(
+    matrices: &[Matrix<F>],
+    num_instance: usize,
+    num_constraints: usize,
+) {
+    let outline_start = num_constraints.saturating_sub(num_instance);
+    let (a, b) = (&matrices[0], &matrices[1]);
+    for i in 0..num_instance {
+        let row = outline_start + i;
+        assert!(
+            b[row].is_empty(),
+            "outlining row {row} has a nonempty B side; the verifier assumes x_B = 0"
+        );
+        let terms = &a[row];
+        assert_eq!(
+            terms.len(),
+            2,
+            "outlining row {row} of the A matrix must be exactly `x_{i} - w` (2 terms), \
+             found {} terms",
+            terms.len()
+        );
+        let instance_term = terms.iter().find(|&&(_, idx)| idx == i);
+        let witness_term = terms.iter().find(|&&(_, idx)| idx >= num_instance);
+        match (instance_term, witness_term) {
+            (Some((ci, _)), Some((cw, _))) => {
+                assert!(
+                    *ci == F::one() && *cw == -F::one(),
+                    "outlining row {row} must be `x_{i} - w` with coefficients (+1, -1); \
+                     the verifier's public-input reconstruction assumes the +1 on x_{i}"
+                );
+            }
+            _ => panic!(
+                "outlining row {row} of the A matrix is not `x_{i} - w`: expected one term \
+                 on instance variable {i} and one on its witness copy"
+            ),
         }
     }
 }

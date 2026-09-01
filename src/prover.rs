@@ -1,24 +1,20 @@
 use std::rc::Rc;
 
-use crate::circuit::{
-    blocks_to_witness_indices, r1cs_conversion_witness_map, remap_blocks_through_conversion,
-    ZkPariCircuit,
-};
-use crate::data_structures::{CommittedInputOpening, Proof, ProvingKey};
+use crate::data_structures::{Proof, ProvingKey};
 use crate::utils::compute_chall;
 use crate::ZkPari;
 use ark_ec::{pairing::Pairing, VariableBaseMSM};
 use ark_ff::{AdditiveGroup, Field, Zero};
 use ark_poly::{
-    univariate::DensePolynomial, DenseUVPolynomial, EvaluationDomain, Evaluations,
-    GeneralEvaluationDomain, Polynomial,
+    univariate::DensePolynomial, DenseUVPolynomial, EvaluationDomain, Evaluations, Polynomial,
+    Radix2EvaluationDomain,
 };
 use ark_relations::{
     gr1cs::{
         self,
         instance_outliner::{outline_sr1cs, InstanceOutliner},
         predicate::polynomial_constraint::SR1CS_PREDICATE_LABEL,
-        ConstraintSystem, Matrix, OptimizationGoal, SynthesisError, R1CS_PREDICATE_LABEL,
+        ConstraintSynthesizer, ConstraintSystem, Matrix, OptimizationGoal, SynthesisError,
     },
     sr1cs::Sr1csAdapter,
 };
@@ -28,64 +24,39 @@ use ark_std::{cfg_iter_mut, end_timer, rand::RngCore, start_timer, UniformRand};
 use rayon::prelude::*;
 
 impl<E: Pairing> ZkPari<E> {
-    /// Produce a proof, sampling fresh blinding randomness for every
-    /// committed-input commitment `C_ci_j`.
-    pub fn prove<C: ZkPariCircuit<E::ScalarField>, R: RngCore>(
-        circuit: C,
-        pk: &ProvingKey<E>,
-        rng: &mut R,
-    ) -> Result<Proof<E>, SynthesisError>
-    where
-        E::ScalarField: Field,
-    {
-        let openings: Vec<CommittedInputOpening<E::ScalarField>> = (0..pk.sigma_ci.len())
-            .map(|_| CommittedInputOpening::rand(rng))
-            .collect();
-        Self::prove_inner(circuit, pk, &openings, rng)
-    }
-
-    /// Produce a proof with caller-supplied openings `rho_ci_j` (one per
-    /// committed-input block), so that `proof.c_ci[j]` equals the commitment
-    /// produced by [`ProvingKey::pedersen_commit`] on the same
-    /// committed-input values.
+    /// Produce a proof for `circuit` under `pk`.
     ///
-    /// Use this when a block commitment is (derived from) public state, e.g.
-    /// a ledger commitment or a verifier-computed aggregate of ledger
-    /// commitments, and the proof must open it.
-    pub fn prove_with_openings<C: ZkPariCircuit<E::ScalarField>, R: RngCore>(
+    /// Returns [`SynthesisError::Unsatisfiable`] if the witnessed assignment
+    /// does not satisfy the constraints (detected via a nonzero remainder in
+    /// the vanishing-polynomial division, so unsatisfiable inputs cannot
+    /// silently yield garbage proofs in release builds).
+    pub fn prove<C: ConstraintSynthesizer<E::ScalarField>, R: RngCore>(
         circuit: C,
         pk: &ProvingKey<E>,
-        openings: &[CommittedInputOpening<E::ScalarField>],
-        rng: &mut R,
-    ) -> Result<Proof<E>, SynthesisError>
-    where
-        E::ScalarField: Field,
-    {
-        Self::prove_inner(circuit, pk, openings, rng)
-    }
-
-    fn prove_inner<C: ZkPariCircuit<E::ScalarField>, R: RngCore>(
-        circuit: C,
-        pk: &ProvingKey<E>,
-        openings: &[CommittedInputOpening<E::ScalarField>],
         rng: &mut R,
     ) -> Result<Proof<E>, SynthesisError>
     where
         E::ScalarField: Field,
     {
         let timer_p = start_timer!(|| "Total Proving time");
-        let (cs, block_indices) = Self::circuit_to_prover_cs(circuit)?;
-        // Check if the constraint system has only one predicate which is Squared R1CS
+        let cs = Self::circuit_to_prover_cs(circuit)?;
+        // The constraint system must consist of exactly one predicate, the
+        // Square R1CS one; anything else would be silently dropped by the
+        // `to_matrices()[SR1CS_PREDICATE_LABEL]` lookup below. O(1) checks,
+        // enforced in all builds (see keygen for the same guard).
+        assert_eq!(
+            cs.num_predicates(),
+            1,
+            "ZK-Pari supports exactly one predicate (SR1CS); this circuit registered more"
+        );
+        assert_eq!(
+            cs.num_constraints(),
+            cs.get_predicate_num_constraints(SR1CS_PREDICATE_LABEL)
+                .expect("the single predicate must be SR1CS"),
+            "every constraint must be SR1CS"
+        );
         #[cfg(debug_assertions)]
-        {
-            assert_eq!(cs.num_predicates(), 1);
-            assert_eq!(
-                cs.num_constraints(),
-                cs.get_predicate_num_constraints(SR1CS_PREDICATE_LABEL)
-                    .unwrap()
-            );
-            assert!(cs.is_satisfied().unwrap());
-        }
+        assert!(cs.is_satisfied().unwrap());
 
         /////////////////////// Extract the constraint system information ///////////////////////
         let timer_extract_info = start_timer!(|| "Extract constraint system information");
@@ -93,37 +64,26 @@ impl<E: Pairing> ZkPari<E> {
         let instance_assignment = &cs.assignments.instance_assignment;
         let witness_assignment = &cs.assignments.witness_assignment;
         let matrices = &cs.to_matrices().unwrap()[SR1CS_PREDICATE_LABEL];
-        // The circuit must declare exactly the committed inputs the keys were
-        // generated for
-        assert_eq!(
-            block_indices, pk.committed_witness_indices,
-            "the circuit declared different committed-input blocks than the proving key"
-        );
-        assert_eq!(
-            openings.len(),
-            block_indices.len(),
-            "expected one opening per committed-input block ({}), got {}",
-            block_indices.len(),
-            openings.len()
-        );
         end_timer!(timer_extract_info);
 
-        /////////////////////// Computing the evaluation domain ///////////////////////
-        let timer_eval_domain = start_timer!(|| "Computing the evaluation domain");
-        let domain = GeneralEvaluationDomain::<E::ScalarField>::new(num_constraints).unwrap();
+        /////////////////////// The evaluation domain ///////////////////////
+        // The proving key already carries the domain (via its verifying key);
+        // using it keeps prover and verifier on the same domain type.
+        let domain = pk.verifying_key.domain;
         let domain_size = domain.size();
-        end_timer!(timer_eval_domain);
+        assert_eq!(
+            domain_size,
+            Radix2EvaluationDomain::<E::ScalarField>::new(num_constraints)
+                .unwrap()
+                .size(),
+            "circuit size does not match the proving key's domain"
+        );
 
         /////////////////////// Sampling the masks ///////////////////////
-        // h(X) = eta_1 + eta_2 X masks the A-side; the blocks' openings mask
-        // the B-side as (rho_ci_1 + ... + rho_ci_J) v_K through the
-        // committed-input commitments.
+        // h(X) = eta_1 + eta_2 X masks the A-side.
         let timer_masks = start_timer!(|| "Sampling vanishing-polynomial masks");
         let eta_1 = E::ScalarField::rand(rng);
         let eta_2 = E::ScalarField::rand(rng);
-        let rho_ci: E::ScalarField = openings
-            .iter()
-            .fold(E::ScalarField::zero(), |acc, o| acc + o.rho);
         end_timer!(timer_masks);
 
         /////////////////////// Computing polynomials z_A, z_B, w_A ///////////////////////
@@ -148,27 +108,33 @@ impl<E: Pairing> ZkPari<E> {
         let w_a_hat = Evaluations::from_vec_and_domain(w_a, domain).interpolate();
         end_timer!(timer_interp);
 
-        // x_A(r) is needed for the debug consistency check below; the masks on
-        // z_A and w_A are identical, so the unmasked difference already equals
-        // x_A.
+        // x_A(zeta) is needed for the debug consistency check below; the
+        // masks on z_A and w_A are identical, so the unmasked difference
+        // already equals x_A.
         #[cfg(debug_assertions)]
         let (z_a_hat_check, z_b_hat_check) = (z_a_hat.clone(), z_b_hat.clone());
 
         /////////////////////// Computing the quotient polynomial ///////////////////////
         // The masked quotient is computed by expansion, never squaring the
         // masked (degree m+1) polynomial. With z := z_A^orig, b := z_B^orig,
-        // h := eta_1 + eta_2 X and v := v_K = X^m - 1:
+        // h := eta_1 + eta_2 X and v := v_H = X^m - 1:
         //
-        //   (z + h v)^2 - (b + rho v) = (z^2 - b) + v (2 h z + h^2 v - rho)
+        //   (z + h v)^2 - b = (z^2 - b) + v (2 h z + h^2 v)
         //
-        // so q~ = q_orig + 2 h z + h^2 v - rho with q_orig = (z^2 - b)/v_K.
+        // so q~ = q_orig + 2 h z + h^2 v with q_orig = (z^2 - b)/v_H.
         // This keeps every FFT at size <= 2m (squaring degree m+1 would round
         // the multiplication domain up to 4m).
         let timer_quotient = start_timer!(|| "Computing the quotient polynomial");
-        let (q_orig, _remainder) =
+        let (q_orig, remainder) =
             (&z_a_hat * &z_a_hat - &z_b_hat).divide_by_vanishing_poly(domain);
-        #[cfg(debug_assertions)]
-        assert!(_remainder.is_zero(), "constraint system is not satisfied");
+        // A nonzero remainder means the assignment does not satisfy the
+        // constraints. Rejecting here (in every build) is what keeps release
+        // builds from emitting proofs that can never verify.
+        if !remainder.is_zero() {
+            end_timer!(timer_quotient);
+            end_timer!(timer_p);
+            return Err(SynthesisError::Unsatisfiable);
+        }
 
         let mut q_coeffs = q_orig.coeffs;
         q_coeffs.resize(domain_size + 3, E::ScalarField::zero());
@@ -179,11 +145,11 @@ impl<E: Pairing> ZkPari<E> {
             q_coeffs[i] += two_eta_1 * z_i;
             q_coeffs[i + 1] += two_eta_2 * z_i;
         }
-        // + h^2 v_K = (eta_1^2 + 2 eta_1 eta_2 X + eta_2^2 X^2)(X^m - 1), - rho
+        // + h^2 v_H = (eta_1^2 + 2 eta_1 eta_2 X + eta_2^2 X^2)(X^m - 1)
         let eta_1_sq = eta_1.square();
         let eta_cross = (eta_1 * eta_2).double();
         let eta_2_sq = eta_2.square();
-        q_coeffs[0] -= eta_1_sq + rho_ci;
+        q_coeffs[0] -= eta_1_sq;
         q_coeffs[1] -= eta_cross;
         q_coeffs[2] -= eta_2_sq;
         q_coeffs[domain_size] += eta_1_sq;
@@ -205,17 +171,15 @@ impl<E: Pairing> ZkPari<E> {
                     DensePolynomial::from_coefficients_vec(coeffs)
                 };
             let z_a_masked = mask_poly(&z_a_hat_check, eta_1, eta_2);
-            let z_b_masked = mask_poly(&z_b_hat_check, rho_ci, E::ScalarField::zero());
             let (q_check, rem) =
-                (&z_a_masked * &z_a_masked - &z_b_masked).divide_by_vanishing_poly(domain);
+                (&z_a_masked * &z_a_masked - &z_b_hat_check).divide_by_vanishing_poly(domain);
             assert!(rem.is_zero());
             assert_eq!(q_tilde, q_check, "expanded quotient mismatch");
         }
         end_timer!(timer_quotient);
 
         /////////////////////// Applying the vanishing-polynomial masks ///////////////////////
-        // w_A(X) += (eta_1 + eta_2 X) v_K(X); the B-side mask is folded into
-        // R(X) below.
+        // w_A(X) += (eta_1 + eta_2 X) v_H(X).
         let timer_masking = start_timer!(|| "Masking the polynomials");
         #[cfg(debug_assertions)]
         let x_a_poly_check = &z_a_hat - &w_a_hat;
@@ -230,65 +194,29 @@ impl<E: Pairing> ZkPari<E> {
         };
         end_timer!(timer_masking);
 
-        /////////////////////// Computing the commitments (C_ci_j, T) ///////////////////////
+        /////////////////////// Computing the commitment T ///////////////////////
         let timer_batch_commit = start_timer!(|| "Batch commitment");
 
-        // Per block j: C_ci_j = sum_i x_i Sigma_ci_j[i] + rho_ci_j Gamma_ci_j,
-        // with the values gathered from the declared witness indices
-        let mut c_cis = Vec::with_capacity(block_indices.len());
-        for ((block, sigma_ci_j), (gamma_ci_j, opening)) in block_indices
-            .iter()
-            .zip(&pk.sigma_ci)
-            .zip(pk.gamma_ci.iter().zip(openings))
-        {
-            let block_values: Vec<E::ScalarField> =
-                block.iter().map(|&w| witness_assignment[w]).collect();
-            let c_ci_j: E::G1Affine = (E::G1::msm_unchecked(sigma_ci_j, &block_values)
-                + *gamma_ci_j * opening.rho)
-                .into();
-            c_cis.push(c_ci_j);
-        }
-
-        // T = sum_j w_j Sigma_W[j] + eta_1 Sigma_W[k+2] + eta_2 Sigma_W[k+3]
-        //     + sum_i q~[i] Sigma_Q^comm[i]
-        // where the sum ranges over the ordinary (non-committed) witnesses in
-        // ascending index order, matching Sigma_W. Computed as one MSM to
-        // amortize the Pippenger buckets.
-        let mut is_committed = vec![false; witness_assignment.len()];
-        for block in &block_indices {
-            for &w in block {
-                is_committed[w] = true;
-            }
-        }
-        let ordinary_witnesses: Vec<E::ScalarField> = witness_assignment
-            .iter()
-            .zip(&is_committed)
-            .filter(|(_, committed)| !**committed)
-            .map(|(value, _)| *value)
-            .collect();
-        debug_assert_eq!(ordinary_witnesses.len(), pk.sigma_w.len());
-        // Separate MSMs over the SRS slices (avoids copying the bases)
-        let t_w = E::G1::msm_unchecked(&pk.sigma_w, &ordinary_witnesses);
+        // T = sum_j w_j Sigma_W[j] + eta_1 Sigma_W[k+1] + eta_2 Sigma_W[k+2]
+        //     + sum_i q~[i] Sigma_Q[i]
+        // Separate MSMs over the SRS slices (avoids copying the bases).
+        debug_assert_eq!(witness_assignment.len(), pk.sigma_w.len());
+        let t_w = E::G1::msm_unchecked(&pk.sigma_w, witness_assignment);
         let t_mask = E::G1::msm_unchecked(
             &[pk.sigma_mask_const, pk.sigma_mask_linear],
             &[eta_1, eta_2],
         );
-        let t_q = E::G1::msm_unchecked(&pk.sigma_q_comm[..q_tilde.coeffs.len()], &q_tilde.coeffs);
+        let t_q = E::G1::msm_unchecked(&pk.sigma_q[..q_tilde.coeffs.len()], &q_tilde.coeffs);
         let t: E::G1Affine = (t_w + t_mask + t_q).into();
         end_timer!(timer_batch_commit);
 
         /////////////////////// Computing the challenge ///////////////////////
         let timer_init_transcript = start_timer!(|| "Computing Challenge");
-        let challenge = compute_chall::<E>(
-            &pk.verifying_key,
-            &instance_assignment[1..].to_vec(),
-            &c_cis,
-            &t,
-        );
+        let challenge = compute_chall::<E>(&pk.verifying_key, &instance_assignment[1..], &t);
         end_timer!(timer_init_transcript);
 
         /////////////////////// Masked evaluation at the challenge ///////////////////////
-        // v_a = z_A(r) - x_A(r) = w_A^masked(r)
+        // v_a = z_A(zeta) - x_A(zeta) = w_A^masked(zeta)
         let timer_eval = start_timer!(|| "Evaluating v_a");
         let v_a = w_a_masked.evaluate(&challenge);
         end_timer!(timer_eval);
@@ -297,36 +225,34 @@ impl<E: Pairing> ZkPari<E> {
         let timer_opening = start_timer!(|| "Batch Opening");
         let timer_open_poly = start_timer!(|| "Computing the opening polynomials");
 
-        // R(X) = z_B(X) - x_B(X) + v_K(X) q~(X)
-        //      = z_B^orig(X) + rho_ci v_K(X) + v_K(X) q~(X)
+        // R(X) = z_B(X) - x_B(X) + v_H(X) q~(X) = z_B(X) + v_H(X) q~(X)
         // (x_B = 0 after instance outlining, and w_B == z_B)
         let mut r_coeffs = z_b_hat.coeffs;
         r_coeffs.resize(
             (domain_size + 1).max(q_tilde.coeffs.len() + domain_size),
             E::ScalarField::zero(),
         );
-        r_coeffs[0] -= rho_ci;
-        r_coeffs[domain_size] += rho_ci;
         for (i, q_i) in q_tilde.coeffs.iter().enumerate() {
             r_coeffs[i] -= q_i;
             r_coeffs[i + domain_size] += q_i;
         }
         let r_poly = DensePolynomial::from_coefficients_vec(r_coeffs);
 
-        // v_R = R(r) = (v_a + x_A(r))^2 - x_B(r); recomputed by the verifier from v_a
+        // v_R = R(zeta) = (v_a + x_A(zeta))^2 - x_B(zeta); recomputed by the
+        // verifier from v_a
         let v_r = r_poly.evaluate(&challenge);
         #[cfg(debug_assertions)]
         {
-            let x_a_at_r = x_a_poly_check.evaluate(&challenge);
+            let x_a_at_zeta = x_a_poly_check.evaluate(&challenge);
             assert_eq!(
                 v_r,
-                (v_a + x_a_at_r).square(),
-                "v_R must equal (v_a + x_A(r))^2"
+                (v_a + x_a_at_zeta).square(),
+                "v_R must equal (v_a + x_A(zeta))^2"
             );
         }
 
-        // W_A(X) = (z_A(X) - x_A(X) - v_a)/(X - r), of degree <= m
-        // W_R(X) = (R(X) - v_R)/(X - r), of degree <= 2m+1
+        // W_A(X) = (z_A(X) - x_A(X) - v_a)/(X - zeta), of degree <= m
+        // W_R(X) = (R(X) - v_R)/(X - zeta), of degree <= 2m+1
         let one = E::ScalarField::ONE;
         let chall_vanishing_poly = DensePolynomial::from_coefficients_vec(vec![-challenge, one]);
         let v_a_poly = DensePolynomial::from_coefficients_vec(vec![v_a]);
@@ -351,7 +277,6 @@ impl<E: Pairing> ZkPari<E> {
         end_timer!(timer_opening);
 
         let output = Ok(Proof {
-            c_ci: c_cis,
             t_g: t,
             u_g: u,
             v_a,
@@ -362,12 +287,10 @@ impl<E: Pairing> ZkPari<E> {
     }
 
     /// Synthesize the circuit in proving mode and return the finalized SR1CS
-    /// constraint system (with assignments) together with the declared
-    /// committed-input blocks (as witness indices).
-    #[allow(clippy::type_complexity)]
-    pub fn circuit_to_prover_cs<C: ZkPariCircuit<E::ScalarField>>(
+    /// constraint system (with assignments).
+    pub fn circuit_to_prover_cs<C: ConstraintSynthesizer<E::ScalarField>>(
         circuit: C,
-    ) -> Result<(ConstraintSystem<E::ScalarField>, Vec<Vec<usize>>), SynthesisError>
+    ) -> Result<ConstraintSystem<E::ScalarField>, SynthesisError>
     where
         E: Pairing,
         E::ScalarField: Field,
@@ -377,55 +300,22 @@ impl<E: Pairing> ZkPari<E> {
         let timer_synthesize_circuit = start_timer!(|| "Synthesize Circuit");
         let cs: gr1cs::ConstraintSystemRef<E::ScalarField> = ConstraintSystem::new_ref();
         cs.set_optimization_goal(OptimizationGoal::Constraints);
-        let blocks = circuit.synthesize(cs.clone())?;
-        let mut block_indices = blocks_to_witness_indices(&blocks);
+        circuit.generate_constraints(cs.clone())?;
         end_timer!(timer_synthesize_circuit);
         let timer_inlining = start_timer!(|| "Inlining constraints");
         cs.finalize();
         end_timer!(timer_inlining);
 
         let sr1cs_timer = start_timer!(|| "Convert to SR1CS");
-        // Circuits that natively register the SR1CS predicate skip the R1CS-to-SR1CS conversion.
-        // The conversion does NOT preserve witness indices (it rebuilds the
-        // witness space by first use, interleaved with square variables and
-        // public-input copies), so the declared committed-input indices are
-        // remapped into the converted numbering — the same remapping keygen
-        // applied. The subsequent instance outlining only appends witness
-        // variables, so the (remapped) indices stay valid through it.
+        // Circuits that natively register the SR1CS predicate skip the
+        // R1CS-to-SR1CS conversion.
         let native_sr1cs = cs.has_predicate(SR1CS_PREDICATE_LABEL);
         let mut sr1cs_inner = if native_sr1cs {
             cs.into_inner().unwrap()
         } else {
-            let conversion_map = r1cs_conversion_witness_map(
-                &cs.to_matrices().unwrap()[R1CS_PREDICATE_LABEL],
-                cs.num_instance_variables(),
-            );
             let mut inner = cs.into_inner().unwrap();
-            let declared_values: Vec<Vec<E::ScalarField>> = block_indices
-                .iter()
-                .map(|block| {
-                    block
-                        .iter()
-                        .map(|&w| inner.assignments.witness_assignment[w])
-                        .collect()
-                })
-                .collect();
-            block_indices = remap_blocks_through_conversion(&block_indices, &conversion_map);
             let sr1cs_cs = Sr1csAdapter::r1cs_to_sr1cs_with_assignment(&mut inner).unwrap();
-            let sr1cs_inner = sr1cs_cs.into_inner().unwrap();
-            // The remapped indices must carry the declared variables' values;
-            // this catches any drift between the adapter's allocation order
-            // and r1cs_conversion_witness_map.
-            for (block, values) in block_indices.iter().zip(&declared_values) {
-                for (&w, value) in block.iter().zip(values) {
-                    assert_eq!(
-                        sr1cs_inner.assignments.witness_assignment[w], *value,
-                        "R1CS-to-SR1CS conversion witness map out of sync with the adapter's \
-                         allocation order"
-                    );
-                }
-            }
-            sr1cs_inner
+            sr1cs_cs.into_inner().unwrap()
         };
 
         sr1cs_inner
@@ -436,7 +326,7 @@ impl<E: Pairing> ZkPari<E> {
             .expect("instance outlining failed");
         end_timer!(sr1cs_timer);
         end_timer!(timer_cs_startup);
-        Ok((sr1cs_inner, block_indices))
+        Ok(sr1cs_inner)
     }
 
     /// Evaluate the constraint rows once over the full assignment, returning
@@ -451,7 +341,7 @@ impl<E: Pairing> ZkPari<E> {
     ///   instance contribution subtracts `x_i`.
     #[allow(clippy::type_complexity)]
     pub(crate) fn compute_za_zb_wa(
-        domain: GeneralEvaluationDomain<E::ScalarField>,
+        domain: Radix2EvaluationDomain<E::ScalarField>,
         a_mat: &Matrix<E::ScalarField>,
         b_mat: &Matrix<E::ScalarField>,
         instance_assignment: &[E::ScalarField],
