@@ -1,8 +1,9 @@
 # Experiment 4 — sharded batch-verification throughput (BLS12-381)
 
 Machine: Apple M5 Pro, 18 cores (6 performance + 12 efficiency)
-Date: 2026-08-31 (final sharded-only run; earlier intra-mode run below)
-Commit: 3e9900b + working tree
+Date: 2026-09-02 (re-measured after committed inputs were removed from the
+      library; earlier sharded and intra-mode runs below)
+Commit: 7b1657e
 Run: `cargo bench --bench throughput` (manages its own thread pools;
      `ZKPARI_BENCH_THREADS` is ignored)
 Sampling: median of 3 passes per cell. Run-to-run spread at high thread
@@ -12,28 +13,26 @@ stable to 0.1%.
 ## Goal and verdict
 
 **Goal: 1,000,000 verifications per second on 8 threads.**
-**Verdict: not met at 8 threads (559k proofs/s), met on the full machine —
-1,090,592 proofs/s at 18 threads, with 16 threads within 1% of the goal
-(992,637). The shortfall at 8 threads is core topology (6 P-cores), not
-threading; see the analysis.**
+**Verdict: not met at 8 threads (538k proofs/s), met on the full machine —
+1,017,948 proofs/s at 18 threads, with 16 threads 3% short (970,676). The
+shortfall at 8 threads is core topology (6 P-cores), not threading; see
+the analysis.**
 
 ## Setup
 
 - **Sharded**: the proof backlog is split into per-thread chunks; each OS
-  thread runs its own `batch_verify` over 65,536 proofs inside a
+  thread runs its own `batch_verify` over 80,000 proofs inside a
   single-threaded rayon pool. Nothing is shared across threads, so
   *everything* parallelizes — challenges, Lagrange coefficients, rho
   sampling, MSMs, and the final pairings.
-- **Weak scaling**: every thread always verifies 65,536 proofs, so batch
+- **Weak scaling**: every thread always verifies 80,000 proofs, so batch
   amortization is identical across rows and the table isolates thread
   scaling. (Amortization vs batch size is experiment 2; the tail past
   2^16 was measured at under 2% in the earlier run.)
 - A 1-thread pass is measured as the baseline for the efficiency column;
   the presented rows are T in {4, 8, 16, 18}.
-- 0 committed-input blocks throughout: the private-transfer circuits
-  (`R_send`/`R_recv`) have none, and blocks only add per-proof MSM work.
-- Pool of 1,179,648 simulated claims (HVZK simulator, same soundness
-  argument as experiment 2), built once in ~16.5 s on all cores.
+- Pool of 1,440,000 simulated claims (HVZK simulator, same soundness
+  argument as experiment 2), built once in ~22 s on all cores.
 - The earlier revision of this bench also measured "intra" mode (one
   T-thread `batch_verify` call over a T-times-larger batch). It tracks
   sharded within noise up to 8 threads and falls behind past that, so the
@@ -65,17 +64,17 @@ All 22 library tests pass (including batch-verify accept and reject
 paths). Experiment 2's tables were re-measured after these changes; see
 the note there.
 
-## Results (2026-08-31)
+## Results (2026-09-02)
 
 ```
-  baseline (1 thread): 777.0 ms, 11.86 us/proof, 84344 proofs/s
+  baseline (1 thread): 924.5 ms, 11.56 us/proof, 86532 proofs/s
 
   threads │  wall ms │ us/proof │ proofs/s │   eff │ payments/s
   ────────┼──────────┼──────────┼──────────┼───────┼───────────
-        4 │    811.7 │     3.10 │   322946 │ 0.96x │     161473
-        8 │    937.5 │     1.79 │   559224 │ 0.83x │     279612
-       16 │   1056.4 │     1.01 │   992637 │ 0.74x │     496318
-       18 │   1081.7 │     0.92 │  1090592 │ 0.72x │     545296
+        4 │   1016.8 │     3.18 │   314710 │ 0.91x │     157355
+        8 │   1189.9 │     1.86 │   537862 │ 0.78x │     268931
+       16 │   1318.7 │     1.03 │   970676 │ 0.70x │     485338
+       18 │   1414.6 │     0.98 │  1017948 │ 0.65x │     508974
 
   eff = measured throughput / (baseline x T).
   One payment = one R_send proof + one R_recv proof.
@@ -83,21 +82,22 @@ the note there.
 
 ## Analysis
 
-- **The machine crosses 1M proofs/s at 18 threads** (1.09M), and 16
-  threads is within 1% of it. In payment terms (one send + one receive
-  proof per transfer) that is ~545K payments/s on the full machine.
+- **The machine crosses 1M proofs/s at 18 threads** (1.02M), and 16
+  threads is 3% short. In payment terms (one send + one receive proof
+  per transfer) that is ~509K payments/s on the full machine.
 - **Efficiency decays with the core mix, not with contention.** The
-  threads share nothing; eff drops from 0.96x at 4 threads (all P-cores)
-  to 0.72x at 18 because rows past ~6 threads schedule shards onto
+  threads share nothing; eff drops from 0.91x at 4 threads (all P-cores)
+  to 0.65x at 18 because rows past ~6 threads schedule shards onto
   E-cores and the join barrier waits for the slowest one. Per-thread
-  per-proof cost inflates from 11.86 us (T=1) to 16.5 us (T=18). On 8
+  per-proof cost inflates from 11.56 us (T=1) to 17.7 us (T=18). On 8
   true P-cores the 8-thread row would land around ~670k/s.
-- **This run is 10-14% above the 2026-08-26 numbers** (559k vs 505k at
-  8T, 1,091k vs 954k at 18T). The sharded code path is unchanged; the
-  earlier run interleaved intra-mode passes between sharded cells and
-  held a 2x larger claim pool (2^21 vs ~2^20.2), so we attribute the gap
-  to thermal state and memory footprint. Differences at high T within
-  ~15% should be treated as environmental.
+- **Single-threaded per-proof cost improved 11.86 -> 11.56 us** vs the
+  2026-08-31 run (committed-input removal trimmed the challenge phase;
+  see experiment 2). High-thread rows moved -5% to -7% the other way
+  (1,018k vs 1,091k at 18T) with a larger per-thread chunk (80,000 vs
+  65,536) and pool (1.44M vs 1.18M claims); consistent with the stated
+  ~5-15% environmental spread at high T, and the ranking and conclusions
+  are unchanged.
 - **Measurement-model caveat**: the join barrier slightly understates
   steady-state throughput on heterogeneous cores (a real validator
   streams batches, so no thread waits at a barrier). The effect is
@@ -135,9 +135,9 @@ threads.
 ## The remaining gap to 1M/s on 8 threads
 
 Hitting the goal on 8 threads needs <= 8.0 us per proof per thread; the
-single-thread floor is 11.86 us, split: T~ MSM 2.7, U~ MSM 2.8, V~ MSM
-5.3 (full-width scalars), challenge 0.8, Lagrange+instance ~0.4. Known
-levers, none implemented:
+single-thread floor is 11.56 us, split (from experiment 2b, N=65536):
+T~ MSM 2.6, U~ MSM 2.6, V~ MSM 5.1 (full-width scalars), challenge 0.5,
+Lagrange+instance ~0.4. Known levers, none implemented:
 
 - **GLV decomposition for the V~ MSM** (the one full-width MSM): a 2N-point
   128-bit MSM instead of an N-point 255-bit one, ~25% cheaper there,
@@ -156,5 +156,5 @@ levers, none implemented:
 
 At 100K TPS with one `R_send` + one `R_recv` proof per transfer, the
 validator needs 200k verifications/s. That is met at **4 threads**
-(323k/s) with ~60% headroom; the full machine sustains ~545K payments/s,
-5.4x the target.
+(315k/s) with ~57% headroom; the full machine sustains ~509K payments/s,
+5x the target.

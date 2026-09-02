@@ -1,8 +1,10 @@
 # Experiment 3 (phase 3a) — payment circuits (BLS12-381)
 
 Machine: Apple M5 Pro, 18 cores
-Date: 2026-08-31
-Commit: 3e9900b + working tree
+Date: 2026-09-02 (previous runs 2026-08-26/27/31; this run adds the
+      operation-hiding R_op rows and drops the committed-input-based
+      confidential-transfer rows, removed with committed inputs)
+Commit: 7b1657e
 Profile: `cargo bench` (release)
 Threads: **single-threaded** (the default). Set `ZKPARI_BENCH_THREADS=0`
          for all cores, or `=N` for N.
@@ -11,14 +13,8 @@ Sampling: prove = median of 5; verify = mean over a >=100 ms budget loop;
 
 ## Circuits
 
-Two payment flavours, one table:
-
-- **Confidential transfer** (Zether-style): a native-SR1CS range proof on the
-  amount, declared as the single committed-input block, so the proof's `C_ci`
-  *is* the ledger's Pedersen commitment. Balances chain homomorphically under
-  the one CRS basis. Proof = 3 G1 + 1 F (176 B); since `C_ci` is ledger
-  state, the incremental proof material is 2 G1 + 1 F. Bit width swept over
-  {32, 64}. See `examples/confidential_transfer.rs` for the full flow.
+The paper's private-transfer relations, now living in `src/circuits/`
+behind the `circuits` feature:
 
 - **Private transfer** (the paper's R_send / R_recv): unlinkable payments.
   An account's entire public state is **one hash commitment**
@@ -54,9 +50,23 @@ Two payment flavours, one table:
   key, the sender cannot evaluate it and never learns when (or whether)
   its payment is claimed.
 
+- **Operation hiding** (the paper's R_op, §"Hiding the operation type"):
+  one circuit for both operations over the shared statement
+  `(A, com, com', rho, rootrho)` (|x| = 6), with a witness bit selecting
+  the branch. The selector muxes the balance delta, the committed
+  nullifier roots, and the published receipt's preimage, and gates the
+  receive-only equalities (the MMR root check and the indexed-insert root
+  checks). Receipts gain a trailing *type* slot: sends publish their real
+  receipt with type 1, receives publish a dummy fixed to type 0, and the
+  in-circuit consumed receipt pins type = 1 — so dummies are unspendable
+  and the MMR grows by exactly one leaf per operation either way. Both
+  branches synthesize the **identical** constraint count (asserted in the
+  bench gate and unit tests), so neither the wire format nor the proving
+  cost leaks the operation type.
+
 ### Hash instantiation: the Sapling split
 
-The scheme's hashes (`benches/common/private/hasher.rs`) follow Sapling:
+The scheme's hashes (`src/circuits/hasher.rs`) follow Sapling:
 **Pedersen over Jubjub** for everything structural — Merkle nodes,
 indexed-tree leaves, and the account/receipt commitments — and **SHA-256**
 for the single CRPRF call site (nullifier derivation; R_recv pays it once,
@@ -144,18 +154,18 @@ pins `rho` to its true position, and the position pins the nullifier) and
 rejected as a forged proof, and that replaying the receive against Bob's
 updated commitment is rejected.
 
-## Results (`cargo bench --bench circuits`)
+## Results (2026-09-02, `cargo bench --bench circuits`)
 
 ```
-  circuit                  │    r1cs │    sr1cs │   domain │ |x| │ blocks │ keygen ms │ prove ms │ verify us │ proof B
-  ─────────────────────────┼─────────┼──────────┼──────────┼─────┼────────┼───────────┼──────────┼───────────┼────────
-  confidential range 32b   │       — │       34 │       64 │   1 │      1 │       6.9 │      4.8 │     813.5 │    176
-  confidential range 64b   │       — │       66 │      128 │   1 │      1 │       9.9 │      7.7 │     811.2 │    176
-  R_send                   │   19294 │    38597 │    65536 │   5 │      0 │    1808.3 │   1523.0 │     722.9 │    128
-  R_recv d10               │  370021 │   740051 │  1048576 │   5 │      0 │   29240.8 │  20936.2 │     792.2 │    128
-  R_recv d20               │  497361 │   994731 │  1048576 │   5 │      0 │   32560.7 │  22581.2 │     760.0 │    128
+  circuit                  │    r1cs │    sr1cs │   domain │ |x| │ keygen ms │ prove ms │ verify us │ proof B
+  ─────────────────────────┼─────────┼──────────┼──────────┼─────┼───────────┼──────────┼───────────┼────────
+  R_send                   │   19293 │    38595 │    65536 │   5 │    1896.8 │   1577.1 │     747.5 │    128
+  R_recv d10               │  370020 │   740049 │  1048576 │   5 │   28672.8 │  20867.5 │     760.3 │    128
+  R_recv d20               │  497360 │   994729 │  1048576 │   5 │   31594.8 │  21896.1 │     750.0 │    128
+  R_op d10                 │  378369 │   756749 │  1048576 │   6 │   30677.4 │  21022.7 │     742.5 │    128
+  R_op d20                 │  505709 │  1011429 │  1048576 │   6 │   30553.9 │  21558.5 │     756.2 │    128
 
-  |x| counts the leading constant 1. Proofs are (2 + blocks) G1 + 1 F.
+  |x| counts the leading constant 1. Proofs are 2 G1 + 1 F.
 ```
 
 Where the constraints go: R_send is exactly its three Pedersen openings
@@ -166,9 +176,14 @@ R_recv, a Pedersen tree level is ~3.2k R1CS (x1 per receipt-path level =
 ~128k for the depth-40 opening, x4 per nullifier-tree level inside the
 indexed insertion = ~12.7k/level), the single SHA-256 nullifier call is
 ~79k (2 compressions plus the byte decompositions of key and position),
-and the commitments/leaf hashes fill the rest. Both R_recv rows land in
-the same 2^20 FFT domain — d20 fits with ~5% headroom (994,731 of
-1,048,576) — which is why their prove times cluster at 21-23 s.
+and the commitments/leaf hashes fill the rest. R_op costs R_recv + 8,349
+R1CS at either depth: it hashes two receipts instead of one (the published
+receipt — real or dummy, over a muxed preimage — plus the consumed one),
+both with the wider 5-slot preimage that carries the type slot, and adds
+the selector muxes and conditional gating, which are cheap. All heavy rows
+land in the same 2^20 FFT domain — R_op d20 fits with ~3.5% headroom
+(1,011,429 of 1,048,576) — which is why their prove times cluster at
+21-22 s.
 
 ## Construction history
 
@@ -246,22 +261,26 @@ machine): R_send was 1,970 R1CS / 159 ms and R_recv (receipt depth 32)
 
 ## Reading the numbers
 
-- A confidential transfer needs two 64-bit range proofs (amount + remaining
-  balance), so the prover-side cost of a full transfer is ~15 ms
-  single-threaded; the two `C_ci` values double as the ledger commitments.
-- A private *send* is ~1.5 s single-threaded (2^16 domain) — cheap enough
+- A private *send* is ~1.6 s single-threaded (2^16 domain) — cheap enough
   to be interactive. The receive carries all the heavy machinery
-  (~21-23 s: the depth-40 receipt opening, the SHA-256 nullifier, and the
+  (~21-22 s: the depth-40 receipt opening, the SHA-256 nullifier, and the
   indexed-tree insertion) but is asynchronous by design: Bob can claim
   whenever he likes, against any anchor in the ledger's retained history.
   These are client-side costs and parallelize.
-- Verification is flat (~0.72-0.79 ms) and *independent of everything*:
-  with zero blocks it is 3 pairings + a 5-element public-input evaluation.
+- Hiding the operation type costs a receive almost nothing (+2.2% R1CS,
+  prove within noise) — but it costs a *send* the full receive machinery,
+  since every operation now proves the R_op circuit (~21 s instead of
+  ~1.6 s). That is the real price of operation hiding, and it is a
+  deployment choice: run R_send/R_recv for cheap sends and visible
+  operation types, or R_op for full uniformity.
+- Verification is flat (~0.74-0.76 ms) and *independent of everything*:
+  3 pairings + a 5- or 6-element public-input evaluation.
   The wire format per operation matches the paper's submit lines —
-  `(Sen, com', rho)` for a send, `(Rec, com', rootrho)` for a receive
-  (`com` comes from ledger state; no nullifier and no tree root ever
-  appear) — three field elements plus the 128 B proof. No insertion
-  proof, no receipt path.
+  `(Sen, com', rho)` for a send, `(Rec, com', rootrho)` for a receive,
+  `(A, com', rho, rootrho)` under operation hiding (`com` comes from
+  ledger state; no nullifier and no tree root ever appear) — three or four
+  field elements plus the 128 B proof. No insertion proof, no receipt
+  path.
 - Trade summary for moving `AccVerifyInsert` in-circuit: the prover carries
   the 4-chain insertion (~12.7k R1CS per nullifier-tree level); the ledger
   sheds ~2-3 x depth hashes per transaction and ~0.4-1 KB per transaction

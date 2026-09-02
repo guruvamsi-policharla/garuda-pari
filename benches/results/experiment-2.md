@@ -1,16 +1,49 @@
 # Experiment 2 — batch vs individual verification (BLS12-381)
 
 Machine: Apple M5 Pro, 18 cores
-Date: 2026-08-26 (first run 2026-08-24; re-measured after the batch-verify
-      optimizations made for experiment 4, see note below)
-Commit: 3e9900b + working tree
+Date: 2026-09-02 (first run 2026-08-24; re-measured 2026-08-26 after the
+      batch-verify optimizations, and again 2026-09-02 after committed
+      inputs were removed from the library — plain ZK-Pari)
+Commit: 7b1657e
 Profile: `cargo bench --bench batch_verify` (release)
 Threads: **single-threaded** (the default). Set `ZKPARI_BENCH_THREADS=0` for
          all cores, or `=N` for N.
 Circuit:  2^12 SR1CS constraints (batch cost is independent of circuit size).
 Sampling: mean over a >=150 ms budget loop.
 
-## 2026-08-26 update
+## Results (2026-09-02, `cargo bench --bench batch_verify`)
+
+Committed inputs are gone, so the blocks dimension of the earlier grids
+collapsed: every proof is 2 G1 + 1 F and individual verification is 3
+pairings.
+
+```
+Per-proof cost of individual verification (3 pairings): 711.6 us
+
+2a. Amortised batch cost per proof: us (speedup vs individual)
+          N │    wall ms │     us/proof │  speedup
+  ──────────┼────────────┼──────────────┼─────────
+          1 │        0.7 │       696.38 │     1.0x
+        256 │        7.5 │        29.35 │    24.2x
+       4096 │       63.9 │        15.59 │    45.6x
+      65536 │      734.5 │        11.21 │    63.5x
+
+2b. Where the time goes at N=65536 (ms)
+  Phases are re-executed against the public API — the library carries no
+  instrumentation — and their total is checked against `batch_verify`.
+  challenge │ lagrange │ instance │   T~ MSM │   U~ MSM │   V~ MSM │ pairing │    sum │ measured
+  ──────────┼──────────┼──────────┼──────────┼──────────┼──────────┼─────────┼────────┼─────────
+       33.8 │     21.4 │      2.2 │    169.8 │    170.3 │    331.1 │    0.58 │  729.2 │    734.5
+```
+
+The three MSMs are ~92% of the total; the challenge phase (one seeded-
+transcript clone + absorb per proof) is most of the rest. Relative to the
+2026-08-26 zero-block row, per-proof cost improved 12.31 -> 11.21 us
+(-9%), largely the challenge phase (54.7 -> 33.8 ms): with committed
+inputs gone, challenge derivation no longer absorbs the per-proof `C_ci`
+commitments.
+
+## 2026-08-26 update (historical)
 
 Two library changes made for experiment 4 moved these numbers and the
 tables below were re-measured:
@@ -75,8 +108,15 @@ construction, not by coincidence.
 on every run. It reported differences of 0.0%, -0.1%, and -0.3% across runs,
 i.e. exactly the predicted result, and was removed as redundant.)
 
-A genuine proof is still generated and verified at every block count, so the
-keys under test are exercised by real proving.
+A genuine proof is still generated and verified once, so the keys under
+test are exercised by real proving.
+
+## Earlier results (2026-08-26, committed-input build)
+
+These tables predate the removal of committed inputs; `blocks` swept the
+number of committed-input blocks, each adding one pairing to individual
+verification and one N-term MSM (`C~`) to the batch. The 0-block rows are
+the direct ancestors of the current results above.
 
 ```
 Per-proof cost of individual verification
