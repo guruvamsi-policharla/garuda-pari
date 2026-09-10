@@ -1,12 +1,13 @@
 //! Witness-level tests for the payment circuits: satisfiability, statement
 //! binding (every public input tampered), wrong receipt position,
-//! double-receive, overflow, and native-vs-in-circuit hash agreement.
+//! double-receive, overflow, and native-vs-in-circuit hash agreement —
+//! under both hash instantiations (Pedersen/Jubjub and Poseidon).
 //!
 //! Everything here works at the constraint-system level (no SNARK), so toy
 //! tree depths keep the suite fast; the benches' end-to-end flow covers
 //! prove/verify against the ledger protocol.
 
-use ark_ff::UniformRand;
+use ark_ff::{UniformRand, Zero};
 use ark_r1cs_std::alloc::AllocVar;
 use ark_r1cs_std::fields::fp::FpVar;
 use ark_r1cs_std::GR1CSVar;
@@ -14,16 +15,20 @@ use ark_relations::gr1cs::{ConstraintSynthesizer, ConstraintSystem};
 use ark_std::rand::rngs::StdRng;
 use ark_std::rand::{Rng, SeedableRng};
 
-use super::hasher::{hash, hash_var, HashCfg, DOM_ACCT, DOM_ILEAF, DOM_NODE, DOM_NULL, DOM_REC};
-use super::indexed::{truncate_to_key, IndexedInsertion, IndexedMerkleTree};
+use super::hasher::{hash, hash_var, HashCfg, HashKind, DOM_ACCT, DOM_NODE, DOM_REC};
 use super::merkle::{MerklePath, MerkleTree};
 use super::op::OpCircuit;
 use super::recv::RecvCircuit;
 use super::send::SendCircuit;
+use super::smt::{roots_from_siblings, SmtInsertion, SparseMerkleTree};
 use super::Fr;
 
 const RECEIPT_DEPTH: usize = 6;
-const ACCT_DEPTH: usize = 4;
+/// The nullifier tree covers a wider position space than the receipt tree
+/// (as in a deployment, where it spans the log's lifetime).
+const NULL_DEPTH: usize = 8;
+
+const BACKENDS: [HashKind; 2] = [HashKind::Pedersen, HashKind::Poseidon];
 
 fn rng() -> StdRng {
     StdRng::seed_from_u64(20_260_901)
@@ -68,7 +73,6 @@ fn random_send(cfg: &HashCfg, rng: &mut StdRng) -> SendCircuit {
         sen: Fr::rand(rng),
         b,
         v: rng.gen_range(1..=b),
-        kappa: Fr::rand(rng),
         root_null: Fr::rand(rng),
         r: Fr::rand(rng),
         r_new: Fr::rand(rng),
@@ -78,13 +82,12 @@ fn random_send(cfg: &HashCfg, rng: &mut StdRng) -> SendCircuit {
 }
 
 /// A receive instance whose consumed receipt sits in a small receipt tree
-/// among unrelated leaves; returns the circuit and the tree (for
-/// wrong-position tests).
-fn random_recv(cfg: &HashCfg, rng: &mut StdRng) -> (RecvCircuit, MerkleTree) {
-    let mut null_tree = IndexedMerkleTree::new(cfg, ACCT_DEPTH);
-    for _ in 0..2 {
-        null_tree.insert(truncate_to_key(Fr::rand(rng)));
-    }
+/// among unrelated leaves, claimed into a nullifier tree that already holds
+/// two other positions; returns the circuit and both trees.
+fn random_recv(cfg: &HashCfg, rng: &mut StdRng) -> (RecvCircuit, MerkleTree, SparseMerkleTree) {
+    let mut null_tree = SparseMerkleTree::new(cfg, NULL_DEPTH);
+    null_tree.insert(0);
+    null_tree.insert(rng.gen_range(3u64..1 << NULL_DEPTH));
 
     let mut recv = RecvCircuit {
         cfg: cfg.clone(),
@@ -92,7 +95,6 @@ fn random_recv(cfg: &HashCfg, rng: &mut StdRng) -> (RecvCircuit, MerkleTree) {
         root: Fr::from(0u64), // set below
         b: rng.gen_range(0u64..u64::MAX / 2),
         v: rng.gen_range(1u64..u64::MAX / 4),
-        kappa: Fr::rand(rng),
         r: Fr::rand(rng),
         r_new: Fr::rand(rng),
         r_receipt: Fr::rand(rng),
@@ -102,7 +104,7 @@ fn random_recv(cfg: &HashCfg, rng: &mut StdRng) -> (RecvCircuit, MerkleTree) {
             siblings: vec![],
             index_bits: vec![],
         },
-        null_insert: IndexedInsertion::placeholder(),
+        null_insert: SmtInsertion::placeholder(),
     };
 
     let mut tree = MerkleTree::new(cfg, RECEIPT_DEPTH);
@@ -113,7 +115,7 @@ fn random_recv(cfg: &HashCfg, rng: &mut StdRng) -> (RecvCircuit, MerkleTree) {
     recv.root = tree.root();
     recv.path = tree.path(index);
     recv.attach_nullifier_insertion(&mut null_tree);
-    (recv, tree)
+    (recv, tree, null_tree)
 }
 
 /// An operation-hiding send: real receipt out, branch-disabled tree gadgets.
@@ -125,7 +127,6 @@ fn random_op_send(cfg: &HashCfg, rng: &mut StdRng) -> OpCircuit {
         acct: Fr::rand(rng),
         b,
         v: rng.gen_range(1..=b),
-        kappa: Fr::rand(rng),
         r: Fr::rand(rng),
         r_new: Fr::rand(rng),
         root_null: Fr::rand(rng),
@@ -135,17 +136,17 @@ fn random_op_send(cfg: &HashCfg, rng: &mut StdRng) -> OpCircuit {
         root: Fr::rand(rng), // a send does not constrain the anchor
         pos: 0,
         path: MerklePath::empty(RECEIPT_DEPTH),
-        null_insert: IndexedInsertion::placeholder(),
+        null_insert: SmtInsertion::placeholder(),
     };
-    op.attach_dummy_insertion(ACCT_DEPTH);
+    op.attach_dummy_insertion(NULL_DEPTH);
     op
 }
 
 /// An operation-hiding receive: dummy receipt out, consuming a type-1
 /// receipt from a small tree.
 fn random_op_receive(cfg: &HashCfg, rng: &mut StdRng) -> OpCircuit {
-    let mut null_tree = IndexedMerkleTree::new(cfg, ACCT_DEPTH);
-    null_tree.insert(truncate_to_key(Fr::rand(rng)));
+    let mut null_tree = SparseMerkleTree::new(cfg, NULL_DEPTH);
+    null_tree.insert(0);
 
     let mut op = OpCircuit {
         cfg: cfg.clone(),
@@ -153,7 +154,6 @@ fn random_op_receive(cfg: &HashCfg, rng: &mut StdRng) -> OpCircuit {
         acct: Fr::rand(rng),
         b: rng.gen_range(0u64..u64::MAX / 2),
         v: rng.gen_range(1u64..u64::MAX / 4),
-        kappa: Fr::rand(rng),
         r: Fr::rand(rng),
         r_new: Fr::rand(rng),
         root_null: Fr::from(0u64), // receive ignores this field
@@ -166,7 +166,7 @@ fn random_op_receive(cfg: &HashCfg, rng: &mut StdRng) -> OpCircuit {
             siblings: vec![],
             index_bits: vec![],
         },
-        null_insert: IndexedInsertion::placeholder(),
+        null_insert: SmtInsertion::placeholder(),
     };
 
     let mut tree = MerkleTree::new(cfg, RECEIPT_DEPTH);
@@ -183,36 +183,110 @@ fn random_op_receive(cfg: &HashCfg, rng: &mut StdRng) -> OpCircuit {
 // Hash agreement
 // ---------------------------------------------------------------------------
 
-/// Native and in-circuit hashes must agree bit for bit, for every domain
-/// (both the Pedersen and the SHA-256 path) and both receipt arities.
+/// Native and in-circuit hashes must agree bit for bit, for every domain,
+/// both receipt arities, and both backends.
 #[test]
 fn hash_native_matches_circuit() {
     let mut rng = rng();
-    let cfg = HashCfg::new();
-    let cs = ConstraintSystem::<Fr>::new_ref();
-    let inputs: Vec<Fr> = (0..5).map(|_| Fr::rand(&mut rng)).collect();
-    let vars: Vec<FpVar<Fr>> = inputs
-        .iter()
-        .map(|x| FpVar::new_witness(cs.clone(), || Ok(*x)).unwrap())
-        .collect();
+    for kind in BACKENDS {
+        let cfg = HashCfg::of(kind);
+        let cs = ConstraintSystem::<Fr>::new_ref();
+        let inputs: Vec<Fr> = (0..5).map(|_| Fr::rand(&mut rng)).collect();
+        let vars: Vec<FpVar<Fr>> = inputs
+            .iter()
+            .map(|x| FpVar::new_witness(cs.clone(), || Ok(*x)).unwrap())
+            .collect();
 
-    for (dom, arity) in [
-        (DOM_ACCT, 4),
-        (DOM_NULL, 2),
-        (DOM_REC, 4),
-        (DOM_REC, 5),
-        (DOM_NODE, 2),
-        (DOM_ILEAF, 3),
-    ] {
-        let native = hash(&cfg, dom, &inputs[..arity]);
-        let circuit = hash_var(&cfg, dom, &vars[..arity]).unwrap();
-        assert_eq!(
-            circuit.value().unwrap(),
-            native,
-            "hash mismatch for domain {dom} at arity {arity}"
+        for (dom, arity) in [
+            (DOM_ACCT, 3),
+            (DOM_REC, 4),
+            (DOM_REC, 5),
+            (DOM_NODE, 2),
+        ] {
+            let native = hash(&cfg, dom, &inputs[..arity]);
+            let circuit = hash_var(&cfg, dom, &vars[..arity]).unwrap();
+            assert_eq!(
+                circuit.value().unwrap(),
+                native,
+                "{kind:?}: hash mismatch for domain {dom} at arity {arity}"
+            );
+        }
+        assert!(cs.is_satisfied().unwrap());
+    }
+}
+
+/// Domain tags and arities must separate: the same inputs under different
+/// tags, or a prefix of them, hash differently.
+#[test]
+fn hash_domains_separate() {
+    let mut rng = rng();
+    for kind in BACKENDS {
+        let cfg = HashCfg::of(kind);
+        let inputs: Vec<Fr> = (0..3).map(|_| Fr::rand(&mut rng)).collect();
+        assert_ne!(
+            hash(&cfg, DOM_ACCT, &inputs),
+            hash(&cfg, DOM_REC, &inputs),
+            "{kind:?}: domain tags do not separate"
+        );
+        assert_ne!(
+            hash(&cfg, DOM_ACCT, &inputs[..2]),
+            hash(&cfg, DOM_ACCT, &inputs),
+            "{kind:?}: arities do not separate"
         );
     }
-    assert!(cs.is_satisfied().unwrap());
+}
+
+// ---------------------------------------------------------------------------
+// Sparse Merkle tree
+// ---------------------------------------------------------------------------
+
+/// The insertion witness recomputes both roots along the same siblings, the
+/// empty tree's root is the default digest, and a claimed position reads
+/// back as claimed.
+#[test]
+fn smt_insertion_witness_is_consistent() {
+    let mut rng = rng();
+    for kind in BACKENDS {
+        let cfg = HashCfg::of(kind);
+        let mut tree = SparseMerkleTree::new(&cfg, NULL_DEPTH);
+        let empty_root = tree.root();
+        let mut expected = Fr::zero();
+        for _ in 0..NULL_DEPTH {
+            expected = hash(&cfg, DOM_NODE, &[expected, expected]);
+        }
+        assert_eq!(empty_root, expected, "{kind:?}: empty root");
+
+        let pids: Vec<u64> = (0..5).map(|_| rng.gen_range(0..1u64 << NULL_DEPTH)).collect();
+        let mut seen = std::collections::HashSet::new();
+        for pid in pids {
+            if !seen.insert(pid) {
+                continue;
+            }
+            let before = tree.root();
+            let ins = tree.insert(pid);
+            assert_eq!(ins.old_root, before);
+            assert_eq!(ins.new_root, tree.root());
+            assert_eq!(ins.depth(), NULL_DEPTH);
+            assert_eq!(
+                roots_from_siblings(&cfg, pid, &ins.siblings),
+                (ins.old_root, ins.new_root),
+                "{kind:?}: VerifyInsert roots"
+            );
+            assert!(tree.contains(pid));
+            assert_ne!(ins.old_root, ins.new_root);
+        }
+    }
+}
+
+/// Claiming the same position twice is unwitnessable: the tree refuses to
+/// produce the witness.
+#[test]
+#[should_panic(expected = "already claimed")]
+fn smt_rejects_duplicate_position() {
+    let cfg = HashCfg::new();
+    let mut tree = SparseMerkleTree::new(&cfg, NULL_DEPTH);
+    tree.insert(7);
+    tree.insert(7);
 }
 
 // ---------------------------------------------------------------------------
@@ -222,15 +296,17 @@ fn hash_native_matches_circuit() {
 #[test]
 fn send_satisfiable_and_statement_binding() {
     let mut rng = rng();
-    let cfg = HashCfg::new();
-    let send = random_send(&cfg, &mut rng);
-    assert!(satisfied(send.clone()));
-    // Statement: (S, com, com', rho) — every slot must bind.
-    for slot in 0..4 {
-        assert!(
-            !satisfied_with_tampered_input(send.clone(), slot, &mut rng),
-            "tampered send statement slot {slot} still satisfiable"
-        );
+    for kind in BACKENDS {
+        let cfg = HashCfg::of(kind);
+        let send = random_send(&cfg, &mut rng);
+        assert!(satisfied(send.clone()), "{kind:?}");
+        // Statement: (S, com, com', rho) — every slot must bind.
+        for slot in 0..4 {
+            assert!(
+                !satisfied_with_tampered_input(send.clone(), slot, &mut rng),
+                "{kind:?}: tampered send statement slot {slot} still satisfiable"
+            );
+        }
     }
 }
 
@@ -263,15 +339,17 @@ fn send_overdraft_unsatisfiable() {
 #[test]
 fn recv_satisfiable_and_statement_binding() {
     let mut rng = rng();
-    let cfg = HashCfg::new();
-    let (recv, _tree) = random_recv(&cfg, &mut rng);
-    assert!(satisfied(recv.clone()));
-    // Statement: (R, com, com', root_rho) — every slot must bind.
-    for slot in 0..4 {
-        assert!(
-            !satisfied_with_tampered_input(recv.clone(), slot, &mut rng),
-            "tampered recv statement slot {slot} still satisfiable"
-        );
+    for kind in BACKENDS {
+        let cfg = HashCfg::of(kind);
+        let (recv, _tree, _null_tree) = random_recv(&cfg, &mut rng);
+        assert!(satisfied(recv.clone()), "{kind:?}");
+        // Statement: (R, com, com', root_rho) — every slot must bind.
+        for slot in 0..4 {
+            assert!(
+                !satisfied_with_tampered_input(recv.clone(), slot, &mut rng),
+                "{kind:?}: tampered recv statement slot {slot} still satisfiable"
+            );
+        }
     }
 }
 
@@ -279,8 +357,8 @@ fn recv_satisfiable_and_statement_binding() {
 fn recv_allows_zero_amount() {
     let mut rng = rng();
     let cfg = HashCfg::new();
-    let mut null_tree = IndexedMerkleTree::new(&cfg, ACCT_DEPTH);
-    let (mut recv, mut tree) = random_recv(&cfg, &mut rng);
+    let mut null_tree = SparseMerkleTree::new(&cfg, NULL_DEPTH);
+    let (mut recv, mut tree, _) = random_recv(&cfg, &mut rng);
     recv.v = 0;
     // The receipt changed with v, so re-anchor it.
     let index = tree.append(recv.receipt());
@@ -293,30 +371,56 @@ fn recv_allows_zero_amount() {
 
 /// The same receipt claimed at a wrong position must be unsatisfiable: the
 /// path ordering is driven by the witnessed position's bits, and the
-/// position feeds the nullifier.
+/// position is the nullifier.
 #[test]
 fn recv_wrong_position_unsatisfiable() {
     let mut rng = rng();
     let cfg = HashCfg::new();
-    let (mut recv, tree) = random_recv(&cfg, &mut rng);
-    let mut fresh_tree = IndexedMerkleTree::new(&cfg, ACCT_DEPTH);
+    let (mut recv, tree, _) = random_recv(&cfg, &mut rng);
+    let mut fresh_tree = SparseMerkleTree::new(&cfg, NULL_DEPTH);
     recv.pos = 0; // slot 0 holds someone else's receipt
     recv.path = tree.path(0);
     recv.attach_nullifier_insertion(&mut fresh_tree);
     assert!(!satisfied(recv));
 }
 
-/// Receiving the same receipt twice is unwitnessable: the indexed tree
-/// rejects the duplicate nullifier outright.
+/// Receiving the same receipt twice is unsatisfiable in-circuit: with the
+/// position already claimed, no sibling path hashes leaf 0 up to the
+/// committed root (the leaf-0 chain of `VerifyInsert` fails).
 #[test]
-#[should_panic(expected = "duplicate key")]
-fn double_receive_rejected_by_indexed_tree() {
+fn double_receive_unsatisfiable() {
+    let mut rng = rng();
+    for kind in BACKENDS {
+        let cfg = HashCfg::of(kind);
+        let (mut recv, _tree, null_tree) = random_recv(&cfg, &mut rng);
+        // `null_tree` already holds `recv.pos`. Forge the replay witness:
+        // the true siblings under the current root, with the current root
+        // as the old root (what com would open to) and the honest new root.
+        let siblings = null_tree.siblings(recv.pos);
+        let (_, new_root) = roots_from_siblings(&cfg, recv.pos, &siblings);
+        recv.null_insert = SmtInsertion {
+            old_root: null_tree.root(),
+            new_root,
+            pid: recv.pos,
+            siblings,
+        };
+        assert!(!satisfied(recv), "{kind:?}: double receive satisfiable");
+    }
+}
+
+/// A position above the receipt tree's range cannot be claimed: the
+/// nullifier tree's high position bits are pinned to zero, so a replay at
+/// `pos + 2^receipt_depth` is unsatisfiable even though that leaf is free.
+#[test]
+fn recv_high_position_bits_pinned() {
     let mut rng = rng();
     let cfg = HashCfg::new();
-    let mut null_tree = IndexedMerkleTree::new(&cfg, ACCT_DEPTH);
-    let (mut recv, _tree) = random_recv(&cfg, &mut rng);
-    recv.attach_nullifier_insertion(&mut null_tree); // first receive
-    recv.attach_nullifier_insertion(&mut null_tree); // replay: panics
+    let (mut recv, _tree, mut null_tree) = random_recv(&cfg, &mut rng);
+    // The honest insertion of `pos` stays in `null_tree`; try to claim the
+    // aliased position with the same MMR opening.
+    let alias = recv.pos + (1 << RECEIPT_DEPTH);
+    recv.null_insert = null_tree.insert(alias);
+    assert!(!satisfied(recv));
 }
 
 /// Crediting past 2^64 must be unsatisfiable (the b + v range check).
@@ -324,8 +428,8 @@ fn double_receive_rejected_by_indexed_tree() {
 fn recv_credit_overflow_unsatisfiable() {
     let mut rng = rng();
     let cfg = HashCfg::new();
-    let mut null_tree = IndexedMerkleTree::new(&cfg, ACCT_DEPTH);
-    let (mut recv, mut tree) = random_recv(&cfg, &mut rng);
+    let mut null_tree = SparseMerkleTree::new(&cfg, NULL_DEPTH);
+    let (mut recv, mut tree, _) = random_recv(&cfg, &mut rng);
     recv.b = u64::MAX - 1;
     recv.v = 2;
     let index = tree.append(recv.receipt());
@@ -343,36 +447,40 @@ fn recv_credit_overflow_unsatisfiable() {
 #[test]
 fn op_send_satisfiable_and_statement_binding() {
     let mut rng = rng();
-    let cfg = HashCfg::new();
-    let op = random_op_send(&cfg, &mut rng);
-    assert!(satisfied(op.clone()));
-    // Statement: (A, com, com', rho, root_rho). The first four slots bind;
-    // the anchor is deliberately unconstrained in the send branch (the
-    // ledger checks it natively, identically for both operations).
-    for slot in 0..4 {
+    for kind in BACKENDS {
+        let cfg = HashCfg::of(kind);
+        let op = random_op_send(&cfg, &mut rng);
+        assert!(satisfied(op.clone()), "{kind:?}");
+        // Statement: (A, com, com', rho, root_rho). The first four slots
+        // bind; the anchor is deliberately unconstrained in the send branch
+        // (the ledger checks it natively, identically for both operations).
+        for slot in 0..4 {
+            assert!(
+                !satisfied_with_tampered_input(op.clone(), slot, &mut rng),
+                "{kind:?}: tampered op-send statement slot {slot} still satisfiable"
+            );
+        }
         assert!(
-            !satisfied_with_tampered_input(op.clone(), slot, &mut rng),
-            "tampered op-send statement slot {slot} still satisfiable"
+            satisfied_with_tampered_input(op.clone(), 4, &mut rng),
+            "{kind:?}: the send branch must not constrain the anchor"
         );
     }
-    assert!(
-        satisfied_with_tampered_input(op.clone(), 4, &mut rng),
-        "the send branch must not constrain the anchor"
-    );
 }
 
 #[test]
 fn op_receive_satisfiable_and_statement_binding() {
     let mut rng = rng();
-    let cfg = HashCfg::new();
-    let op = random_op_receive(&cfg, &mut rng);
-    assert!(satisfied(op.clone()));
-    // The receive branch binds every slot, anchor included.
-    for slot in 0..5 {
-        assert!(
-            !satisfied_with_tampered_input(op.clone(), slot, &mut rng),
-            "tampered op-receive statement slot {slot} still satisfiable"
-        );
+    for kind in BACKENDS {
+        let cfg = HashCfg::of(kind);
+        let op = random_op_receive(&cfg, &mut rng);
+        assert!(satisfied(op.clone()), "{kind:?}");
+        // The receive branch binds every slot, anchor included.
+        for slot in 0..5 {
+            assert!(
+                !satisfied_with_tampered_input(op.clone(), slot, &mut rng),
+                "{kind:?}: tampered op-receive statement slot {slot} still satisfiable"
+            );
+        }
     }
 }
 
@@ -399,7 +507,7 @@ fn op_dummy_receipt_unspendable() {
     );
     let mut tree = MerkleTree::new(&cfg, RECEIPT_DEPTH);
     let index = tree.append(dummy);
-    let mut fresh_null_tree = IndexedMerkleTree::new(&cfg, ACCT_DEPTH);
+    let mut fresh_null_tree = SparseMerkleTree::new(&cfg, NULL_DEPTH);
     op.pos = index as u64;
     op.root = tree.root();
     op.path = tree.path(index);
@@ -412,20 +520,22 @@ fn op_dummy_receipt_unspendable() {
 #[test]
 fn op_branches_are_shape_identical() {
     let mut rng = rng();
-    let cfg = HashCfg::new();
-    let shape = |c: OpCircuit| {
-        let cs = ConstraintSystem::<Fr>::new_ref();
-        c.generate_constraints(cs.clone()).unwrap();
-        cs.finalize();
-        (
-            cs.num_constraints(),
-            cs.num_witness_variables(),
-            cs.num_instance_variables(),
-        )
-    };
-    assert_eq!(
-        shape(random_op_send(&cfg, &mut rng)),
-        shape(random_op_receive(&cfg, &mut rng))
-    );
+    for kind in BACKENDS {
+        let cfg = HashCfg::of(kind);
+        let shape = |c: OpCircuit| {
+            let cs = ConstraintSystem::<Fr>::new_ref();
+            c.generate_constraints(cs.clone()).unwrap();
+            cs.finalize();
+            (
+                cs.num_constraints(),
+                cs.num_witness_variables(),
+                cs.num_instance_variables(),
+            )
+        };
+        assert_eq!(
+            shape(random_op_send(&cfg, &mut rng)),
+            shape(random_op_receive(&cfg, &mut rng)),
+            "{kind:?}"
+        );
+    }
 }
-

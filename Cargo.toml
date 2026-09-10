@@ -20,7 +20,7 @@ rayon = { version = "1.5.2" }
 
 # The payment circuits (feature "circuits")
 ark-bls12-381 = { version = "0.6.0", default-features = false, features = ["curve"], optional = true }
-ark-crypto-primitives = { version = "0.6", features = ["crh", "constraints"], optional = true }
+ark-crypto-primitives = { version = "0.6", features = ["sponge", "constraints"], optional = true }
 ark-ed-on-bls12-381 = { version = "0.6.0", features = ["r1cs"], optional = true }
 ark-r1cs-std = { version = "0.6", optional = true }
 

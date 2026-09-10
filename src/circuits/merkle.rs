@@ -129,47 +129,12 @@ pub fn root_from_path(cfg: &HashCfg, leaf: Fr, path: &MerklePath) -> Fr {
     node
 }
 
-/// A [`MerklePath`] allocated in-circuit. Allocating once lets several root
-/// computations share the same siblings and index bits (as the indexed-tree
-/// insertion gadget requires).
-pub struct PathVars {
-    pub siblings: Vec<FpVar<Fr>>,
-    pub bits: Vec<Boolean<Fr>>,
-}
-
-/// Allocate a path's siblings and index bits as witnesses.
-pub fn alloc_path(
-    cs: ConstraintSystemRef<Fr>,
-    path: &MerklePath,
-) -> Result<PathVars, SynthesisError> {
-    let siblings = path
-        .siblings
-        .iter()
-        .map(|s| FpVar::new_witness(cs.clone(), || Ok(*s)))
-        .collect::<Result<Vec<_>, _>>()?;
-    let bits = path
-        .index_bits
-        .iter()
-        .map(|b| Boolean::new_witness(cs.clone(), || Ok(*b)))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(PathVars { siblings, bits })
-}
-
-/// Hash `leaf` up an allocated path and return the resulting root.
+/// Hash `leaf` up `siblings` with the left/right ordering dictated by
+/// externally supplied `bits` (little-endian leaf index). The bits come from
+/// the witnessed position, so the membership proof *binds* that position;
+/// the same bits select the path in the nullifier tree ([`super::smt`]).
 ///
 /// Costs one node hash plus two conditional selects per level.
-pub fn compute_root_var(
-    cfg: &HashCfg,
-    leaf: &FpVar<Fr>,
-    path: &PathVars,
-) -> Result<FpVar<Fr>, SynthesisError> {
-    compute_root_with_bits(cfg, leaf, &path.siblings, &path.bits)
-}
-
-/// Hash `leaf` up `siblings` with the left/right ordering dictated by
-/// externally supplied `bits` (little-endian leaf index). Used by the
-/// receive branch, where the bits come from the decomposition of the
-/// witnessed position so the membership proof *binds* that position.
 pub fn compute_root_with_bits(
     cfg: &HashCfg,
     leaf: &FpVar<Fr>,
@@ -189,9 +154,9 @@ pub fn compute_root_with_bits(
 /// supplied separately, e.g. from a position decomposition).
 pub fn alloc_siblings(
     cs: ConstraintSystemRef<Fr>,
-    path: &MerklePath,
+    siblings: &[Fr],
 ) -> Result<Vec<FpVar<Fr>>, SynthesisError> {
-    path.siblings
+    siblings
         .iter()
         .map(|s| FpVar::new_witness(cs.clone(), || Ok(*s)))
         .collect()

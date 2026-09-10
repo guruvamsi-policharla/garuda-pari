@@ -7,24 +7,23 @@
 //!   x = (A, com, com', rho, root_rho)
 //! Witness:
 //!   w = (op, w_op)  with  op in {send, receive} and
-//!   w_send    = (b, kappa, root_null, r, r', r'', v, Rec)
-//!   w_receive = (b, kappa, root_null, root_null', r, r', r''',
-//!                rho_in, pos, pi_mmr, null, pi_mt, v, Sen, r'')
+//!   w_send    = (b, root_null, r, r', r'', v, Rec)
+//!   w_receive = (b, root_null, root_null', r, r', r''',
+//!                rho_in, pid, pi_mmr, pi_mt, v, Sen, r'')
 //!
 //! Relation (op = send, with Sen = A):
-//!   com  = Com_acct(b, kappa, root_null; r)
-//!   com' = Com_acct(b - v, kappa, root_null; r')
+//!   com  = Com_acct(b, root_null; r)
+//!   com' = Com_acct(b - v, root_null; r')
 //!   rho  = Com_rec(v, Sen, Rec, 1; r'')
 //!   0 <= v <= b and b, v, b - v in [0, 2^64)
 //!
 //! Relation (op = receive, with Rec = A):
-//!   com    = Com_acct(b, kappa, root_null; r)
-//!   com'   = Com_acct(b + v, kappa, root_null'; r')
+//!   com    = Com_acct(b, root_null; r)
+//!   com'   = Com_acct(b + v, root_null'; r')
 //!   rho_in = Com_rec(v, Sen, Rec, 1; r'')
 //!   rho    = Com_rec(0, 0, 0, 0; r''')            [the published dummy]
-//!   mmr.Verify(root_rho, rho_in, pos, pi_mmr) = 1
-//!   null = CRPRF_kappa(recv, pos)
-//!   mt.AccVerifyInsert(root_null, null, pi_mt) = root_null'
+//!   mmr.Verify(root_rho, rho_in, pid, pi_mmr) = 1
+//!   SMT.VerifyInsert(root_null, pid, pi_mt) = root_null'
 //!   v >= 0 and b, v, b + v in [0, 2^64)
 //!
 //! Receipts gain a trailing *type* slot: a send commits its real receipt
@@ -35,16 +34,14 @@
 //! Circuit-wise the two branches share every gadget: a boolean selector
 //! `op` muxes the balance delta, the committed nullifier roots, and the
 //! published receipt's preimage, and gates the receive-only equalities (the
-//! MMR root check and the indexed-insert root checks) via conditional
+//! MMR root check and the SMT insertion's two root checks) via conditional
 //! enforcement. Both branches therefore pay the same constraint count —
 //! roughly R_recv plus one extra receipt hash — which is exactly the point:
 //! cost, like everything else, is operation-independent.
 //!
-//! A send witness still has to fill the receive-only slots with *something*
-//! satisfiable for the ungated constraints (leaf range checks, orderings):
-//! inserting the derived key into an empty tree always works
-//! ([`OpCircuit::attach_dummy_insertion`]), and the MMR path can be all
-//! zeros since its root equality is gated off.
+//! A send witness fills the receive-only slots with anything of the right
+//! shape: the SMT gadget has no ungated constraints, so an all-zero sibling
+//! path ([`SmtInsertion::disabled`]) and an all-zero MMR path both do.
 
 use ark_r1cs_std::alloc::AllocVar;
 use ark_r1cs_std::boolean::Boolean;
@@ -54,14 +51,10 @@ use ark_r1cs_std::fields::FieldVar;
 use ark_r1cs_std::select::CondSelectGadget;
 use ark_relations::gr1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
 
-use super::enforce_range_64;
-use super::hasher::{hash, hash_var, HashCfg, DOM_ACCT, DOM_NULL, DOM_REC};
-use super::indexed::{
-    enforce_indexed_insert, key_from_field_var, truncate_to_key, IndexedInsertion,
-    IndexedMerkleTree,
-};
+use super::hasher::{hash, hash_var, HashCfg, DOM_ACCT, DOM_REC};
 use super::merkle::{alloc_siblings, compute_root_with_bits, MerklePath, MerkleTree};
-use super::Fr;
+use super::smt::{enforce_smt_insert, SmtInsertion, SparseMerkleTree};
+use super::{alloc_position_bits, enforce_range_64, Fr};
 
 #[derive(Clone)]
 pub struct OpCircuit {
@@ -75,8 +68,6 @@ pub struct OpCircuit {
     pub b: u64,
     /// Amount (debited on send, credited on receive).
     pub v: u64,
-    /// Account PRF key.
-    pub kappa: Fr,
     /// Opening randomness: old account, new account.
     pub r: Fr,
     pub r_new: Fr,
@@ -94,30 +85,29 @@ pub struct OpCircuit {
     /// receive, but part of every statement so the ledger's root-history
     /// check is operation-independent too).
     pub root: Fr,
-    /// Consumed receipt's MMR position and path (receive; on send, zero
-    /// bits and an all-zero path of the right depth).
+    /// Consumed receipt's MMR position (the nullifier) and path (receive;
+    /// on send, zero bits and an all-zero path of the right depth).
     pub pos: u64,
     pub path: MerklePath,
-    /// Nullifier-tree insertion witness. Real on receive; on send, a valid
-    /// insertion of the derived key into an empty tree (branch-disabled,
-    /// see [`Self::attach_dummy_insertion`]).
-    pub null_insert: IndexedInsertion,
+    /// Nullifier-tree insertion witness. Real on receive; on send, an
+    /// all-zero path of the right depth (branch-disabled, see
+    /// [`Self::attach_dummy_insertion`]).
+    pub null_insert: SmtInsertion,
 }
 
 impl OpCircuit {
     /// A satisfiable receive-branch instance of the given depths, for
     /// keygen and constraint counting (both branches share one circuit, so
     /// either would do).
-    pub fn blank(cfg: &HashCfg, receipt_depth: usize, acct_depth: usize) -> Self {
+    pub fn blank(cfg: &HashCfg, receipt_depth: usize, null_depth: usize) -> Self {
         let mut receipt_tree = MerkleTree::new(cfg, receipt_depth);
-        let mut null_tree = IndexedMerkleTree::new(cfg, acct_depth);
+        let mut null_tree = SparseMerkleTree::new(cfg, null_depth);
         let mut blank = Self {
             cfg: cfg.clone(),
             is_send: false,
             acct: Fr::from(0u64),
             b: 0,
             v: 1,
-            kappa: Fr::from(0u64),
             r: Fr::from(0u64),
             r_new: Fr::from(0u64),
             root_null: Fr::from(0u64),
@@ -130,7 +120,7 @@ impl OpCircuit {
                 siblings: vec![],
                 index_bits: vec![],
             },
-            null_insert: IndexedInsertion::placeholder(),
+            null_insert: SmtInsertion::placeholder(),
         };
         blank.pos = receipt_tree.append(blank.receipt_in()) as u64;
         blank.root = receipt_tree.root();
@@ -139,25 +129,18 @@ impl OpCircuit {
         blank
     }
 
-    /// The position-derived nullifier CRPRF_kappa(recv, pos).
-    pub fn nullifier(&self) -> Fr {
-        hash(&self.cfg, DOM_NULL, &[self.kappa, Fr::from(self.pos)])
+    /// Receive: mark the consumed receipt's position as claimed in the
+    /// receiver's tree (mutating the receiver-side state) and attach the
+    /// insertion witness. Requires `pos` to be final.
+    pub fn attach_nullifier_insertion(&mut self, null_tree: &mut SparseMerkleTree) {
+        self.null_insert = null_tree.insert(self.pos);
     }
 
-    /// Receive: insert the derived nullifier into the receiver's tree
-    /// (mutating the receiver-side state) and attach the insertion witness.
-    /// Requires `kappa` and `pos` to be final.
-    pub fn attach_nullifier_insertion(&mut self, null_tree: &mut IndexedMerkleTree) {
-        self.null_insert = null_tree.insert(truncate_to_key(self.nullifier()));
-    }
-
-    /// Send: attach a branch-disabled insertion witness — a valid insertion
-    /// of the derived key into an *empty* tree of the account depth. The
-    /// insert's root equalities are gated off in the send branch, but its
-    /// ungated leaf checks still need a well-formed witness.
-    pub fn attach_dummy_insertion(&mut self, acct_depth: usize) {
-        let mut empty = IndexedMerkleTree::new(&self.cfg, acct_depth);
-        self.null_insert = empty.insert(truncate_to_key(self.nullifier()));
+    /// Send: attach a branch-disabled insertion witness of the nullifier
+    /// tree's depth. The insert's root equalities are gated off in the send
+    /// branch and nothing else in the gadget constrains the path.
+    pub fn attach_dummy_insertion(&mut self, null_depth: usize) {
+        self.null_insert = SmtInsertion::disabled(null_depth);
     }
 
     /// The nullifier root inside `com` (send: unchanged root; receive: the
@@ -192,7 +175,7 @@ impl OpCircuit {
         hash(
             &self.cfg,
             DOM_ACCT,
-            &[Fr::from(self.b), self.kappa, self.root_null_old(), self.r],
+            &[Fr::from(self.b), self.root_null_old(), self.r],
         )
     }
 
@@ -200,12 +183,7 @@ impl OpCircuit {
         hash(
             &self.cfg,
             DOM_ACCT,
-            &[
-                Fr::from(self.b_new()),
-                self.kappa,
-                self.root_null_after(),
-                self.r_new,
-            ],
+            &[Fr::from(self.b_new()), self.root_null_after(), self.r_new],
         )
     }
 
@@ -283,7 +261,6 @@ impl ConstraintSynthesizer<Fr> for OpCircuit {
 
         // Common witness.
         let b = FpVar::new_witness(cs.clone(), || Ok(Fr::from(self.b)))?;
-        let kappa = FpVar::new_witness(cs.clone(), || Ok(self.kappa))?;
         let r = FpVar::new_witness(cs.clone(), || Ok(self.r))?;
         let r_new = FpVar::new_witness(cs.clone(), || Ok(self.r_new))?;
         let r_receipt = FpVar::new_witness(cs.clone(), || Ok(self.r_receipt))?;
@@ -293,19 +270,18 @@ impl ConstraintSynthesizer<Fr> for OpCircuit {
         let root_null_old = FpVar::new_witness(cs.clone(), || Ok(self.root_null_old()))?;
         let root_null_after = FpVar::new_witness(cs.clone(), || Ok(self.root_null_after()))?;
 
-        // The position: allocated as its bits (one per receipt-tree level)
-        // and packed into the field element fed to the PRF. The same bits
-        // drive the path ordering.
-        let pos_bits = (0..self.path.siblings.len())
-            .map(|i| Boolean::new_witness(cs.clone(), || Ok((self.pos >> i) & 1 == 1)))
-            .collect::<Result<Vec<_>, _>>()?;
-        let pos = Boolean::le_bits_to_fp(&pos_bits)?;
+        // The position: one witnessed bit per receipt-tree level,
+        // zero-padded to the nullifier tree's depth. The low bits drive the
+        // MMR path ordering; all of them select the SMT path.
+        let receipt_depth = self.path.siblings.len();
+        let null_depth = self.null_insert.depth();
+        let pid_bits = alloc_position_bits(cs.clone(), self.pos, receipt_depth, null_depth)?;
 
-        // com = Com_acct(b, kappa, root_null; r) — both branches.
+        // com = Com_acct(b, root_null; r) — both branches.
         hash_var(
             &self.cfg,
             DOM_ACCT,
-            &[b.clone(), kappa.clone(), root_null_old.clone(), r],
+            &[b.clone(), root_null_old.clone(), r],
         )?
         .enforce_equal(&com)?;
 
@@ -315,11 +291,11 @@ impl ConstraintSynthesizer<Fr> for OpCircuit {
         let b_new = &b + &v_signed;
         root_null_after.conditional_enforce_equal(&root_null_old, &is_send)?;
 
-        // com' = Com_acct(b', kappa, root_null'; r') — both branches.
+        // com' = Com_acct(b', root_null'; r') — both branches.
         hash_var(
             &self.cfg,
             DOM_ACCT,
-            &[b_new.clone(), kappa.clone(), root_null_after.clone(), r_new],
+            &[b_new.clone(), root_null_after.clone(), r_new],
         )?
         .enforce_equal(&com_new)?;
 
@@ -353,24 +329,20 @@ impl ConstraintSynthesizer<Fr> for OpCircuit {
             ],
         )?;
 
-        // mmr.Verify(root_rho, rho_in, pos, pi_mmr) = 1 — receive only.
-        let siblings = alloc_siblings(cs.clone(), &self.path)?;
-        compute_root_with_bits(&self.cfg, &receipt_in, &siblings, &pos_bits)?
+        // mmr.Verify(root_rho, rho_in, pid, pi_mmr) = 1 — receive only.
+        let siblings = alloc_siblings(cs.clone(), &self.path.siblings)?;
+        compute_root_with_bits(&self.cfg, &receipt_in, &siblings, &pid_bits[..receipt_depth])?
             .conditional_enforce_equal(&root, &is_recv)?;
 
-        // null = CRPRF_kappa(recv, pos), then
-        // mt.AccVerifyInsert(root_null, null, pi_mt) = root_null' — the root
+        // SMT.VerifyInsert(root_null, pid, pi_mt) = root_null' — both root
         // equalities gated on the receive branch.
-        let nullifier = hash_var(&self.cfg, DOM_NULL, &[kappa, pos])?;
-        let null_key = key_from_field_var(&nullifier)?;
-        enforce_indexed_insert(
-            cs.clone(),
+        let null_siblings = alloc_siblings(cs.clone(), &self.null_insert.siblings)?;
+        enforce_smt_insert(
             &self.cfg,
-            &null_key,
-            truncate_to_key(self.nullifier()),
+            &pid_bits,
+            &null_siblings,
             &root_null_old,
             &root_null_after,
-            &self.null_insert,
             &is_recv,
         )?;
 
