@@ -14,8 +14,8 @@
 //!     depth fixed at 40), and the paper's `SMT.VerifyInsert` of that same
 //!     position into the receiver's user-maintained sparse Merkle tree of
 //!     claimed positions (the nullifier *is* the position: no PRF, no key).
-//!     The SMT's depth is the width of the position space, fixed for the
-//!     system's lifetime; the insertion is two hash chains of that depth.
+//!     Both trees are keyed by the same 40-bit position, so they share one
+//!     depth; the insertion is two hash chains of that depth.
 //!     The tree roots are witnesses, bound inside `com` / `com'`; the
 //!     statement is `(R, com, com', root_rho)`.
 //!
@@ -77,17 +77,24 @@ use zkpari::ZkPari;
 /// Hash instantiations benchmarked, in table order.
 const BACKENDS: &[HashKind] = &[HashKind::Pedersen, HashKind::Poseidon];
 
-/// Depth of the global receipt tree (membership path):
-/// 2^40 receipts of capacity, ~4 months of history at 100K TPS.
-const RECEIPT_DEPTH: usize = 40;
+/// Width of the receipt-log position space, in bits: 2^40 receipts over
+/// the system's lifetime (~4 months at 100K TPS).
+///
+/// This single parameter fixes both trees. The receipt tree's membership
+/// path is `POSITION_BITS` hashes deep, and the per-account sparse Merkle
+/// tree of claimed positions is keyed by the same position, so its depth is
+/// the same width (the paper's `l` = bits of `pid`). Making the SMT deeper
+/// than the receipt tree buys nothing: `alloc_position_bits` pins the extra
+/// high bits to zero, so they could never be set. The SMT insertion costs
+/// exactly 2 * POSITION_BITS node hashes; at 64 bits the Pedersen R_op would
+/// cross into the 2^21 SR1CS domain.
+const POSITION_BITS: usize = 40;
 
-/// Depth of the per-account sparse Merkle tree of claimed positions = the
-/// width of the receipt-log position space for the system's lifetime:
-/// 2^48 positions is ~89 years at 100K TPS. Fixed by the position space,
-/// not by per-account activity (no depth sweep). The insertion costs
-/// exactly 2 * NULL_TREE_DEPTH node hashes; at 64 bits the Pedersen R_op
-/// would cross into the 2^21 SR1CS domain.
-const NULL_TREE_DEPTH: usize = 48;
+/// Depth of the global receipt tree (membership path).
+const RECEIPT_DEPTH: usize = POSITION_BITS;
+
+/// Depth of the per-account sparse Merkle tree of claimed positions.
+const NULL_TREE_DEPTH: usize = POSITION_BITS;
 
 const PROVE_ITERS: usize = 5;
 
@@ -185,11 +192,11 @@ fn run() {
     println!("          instantiated as Pedersen/Jubjub (8-bit byte windows) or Poseidon");
     println!("          (width 3, alpha 5, 8 + 57 rounds). No PRF anywhere.");
     println!("Private transfer: nullifier = receipt position (pid); the receiver marks");
-    println!("          it claimed in a sparse Merkle tree over the {NULL_TREE_DEPTH}-bit position");
-    println!("          space, verified in-circuit (SMT.VerifyInsert: 2 x {NULL_TREE_DEPTH} node");
+    println!("          it claimed in a sparse Merkle tree over the {POSITION_BITS}-bit position");
+    println!("          space, verified in-circuit (SMT.VerifyInsert: 2 x {POSITION_BITS} node");
     println!("          hashes); the tree root lives inside the account commitment.");
-    println!("          Receipt-tree opening fixed at depth {RECEIPT_DEPTH} and bound to the");
-    println!("          witnessed position.");
+    println!("          Receipt-tree opening has the same depth ({POSITION_BITS}) and is bound");
+    println!("          to the witnessed position.");
     println!("R_op:     one circuit for both operations; a witness bit selects the");
     println!("          branch, so sends and receives are indistinguishable on the");
     println!("          wire and cost the same to prove.");
