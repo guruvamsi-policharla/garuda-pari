@@ -1,7 +1,10 @@
 use std::rc::Rc;
 
 use crate::data_structures::{Proof, ProvingKey};
+use crate::template::ProverTemplate;
 use crate::utils::compute_chall;
+use crate::utils::msm::msm;
+use crate::utils::poly::{divide_by_linear, join, square_minus_over_vanishing};
 use crate::ZkPari;
 use ark_ec::{pairing::Pairing, VariableBaseMSM};
 use ark_ff::{AdditiveGroup, Field, Zero};
@@ -66,6 +69,74 @@ impl<E: Pairing> ZkPari<E> {
         let matrices = &cs.to_matrices().unwrap()[SR1CS_PREDICATE_LABEL];
         end_timer!(timer_extract_info);
 
+        let output = Self::prove_from_assignment(
+            pk,
+            num_constraints,
+            &matrices[0],
+            &matrices[1],
+            instance_assignment,
+            witness_assignment,
+            rng,
+        );
+        end_timer!(timer_p);
+        output
+    }
+
+    /// Produce a proof for `circuit` under `pk`, reusing the constraint
+    /// structure recorded in `template` (see [`ProverTemplate`]).
+    ///
+    /// Only the circuit's witness values are (re)computed here; the SR1CS
+    /// matrices, the R1CS-to-SR1CS variable layout, and the instance
+    /// outlining all come from the template. Same proof distribution and
+    /// same [`SynthesisError::Unsatisfiable`] behaviour as [`Self::prove`].
+    ///
+    /// # Panics
+    ///
+    /// If `circuit` does not have the template's shape (variable counts).
+    pub fn prove_with_template<C: ConstraintSynthesizer<E::ScalarField>, R: RngCore>(
+        circuit: C,
+        pk: &ProvingKey<E>,
+        template: &ProverTemplate<E::ScalarField>,
+        rng: &mut R,
+    ) -> Result<Proof<E>, SynthesisError>
+    where
+        E::ScalarField: Field,
+    {
+        let timer_p = start_timer!(|| "Total Proving time (template)");
+        let timer_witness = start_timer!(|| "Witness generation");
+        let (instance_assignment, witness_assignment) = template.assignment_for(circuit)?;
+        end_timer!(timer_witness);
+
+        let output = Self::prove_from_assignment(
+            pk,
+            template.num_constraints(),
+            template.a_matrix(),
+            template.b_matrix(),
+            &instance_assignment,
+            &witness_assignment,
+            rng,
+        );
+        end_timer!(timer_p);
+        output
+    }
+
+    /// The cryptographic prover: everything after the constraint system.
+    ///
+    /// `a_mat`/`b_mat` are the SR1CS matrices over `[instance || witness]`
+    /// (instance outlined), `num_constraints` their row count.
+    #[allow(clippy::too_many_arguments)]
+    fn prove_from_assignment<R: RngCore>(
+        pk: &ProvingKey<E>,
+        num_constraints: usize,
+        a_mat: &Matrix<E::ScalarField>,
+        b_mat: &Matrix<E::ScalarField>,
+        instance_assignment: &[E::ScalarField],
+        witness_assignment: &[E::ScalarField],
+        rng: &mut R,
+    ) -> Result<Proof<E>, SynthesisError>
+    where
+        E::ScalarField: Field,
+    {
         /////////////////////// The evaluation domain ///////////////////////
         // The proving key already carries the domain (via its verifying key);
         // using it keeps prover and verifier on the same domain type.
@@ -92,8 +163,8 @@ impl<E: Pairing> ZkPari<E> {
         let timer_compute_za_zb_wa = start_timer!(|| "Computing vectors z_A, z_B, w_A");
         let (z_a, z_b, w_a) = Self::compute_za_zb_wa(
             domain,
-            &matrices[0],
-            &matrices[1],
+            a_mat,
+            b_mat,
             instance_assignment,
             witness_assignment,
             num_constraints,
@@ -125,26 +196,28 @@ impl<E: Pairing> ZkPari<E> {
         // This keeps every FFT at size <= 2m (squaring degree m+1 would round
         // the multiplication domain up to 4m).
         let timer_quotient = start_timer!(|| "Computing the quotient polynomial");
-        let (q_orig, remainder) =
-            (&z_a_hat * &z_a_hat - &z_b_hat).divide_by_vanishing_poly(domain);
         // A nonzero remainder means the assignment does not satisfy the
         // constraints. Rejecting here (in every build) is what keeps release
         // builds from emitting proofs that can never verify.
-        if !remainder.is_zero() {
+        let Some(mut q_coeffs) =
+            square_minus_over_vanishing(&z_a_hat.coeffs, &z_b_hat.coeffs, domain)
+        else {
             end_timer!(timer_quotient);
-            end_timer!(timer_p);
             return Err(SynthesisError::Unsatisfiable);
-        }
+        };
 
-        let mut q_coeffs = q_orig.coeffs;
         q_coeffs.resize(domain_size + 3, E::ScalarField::zero());
-        // + 2 h z
+        // + 2 h z = 2 eta_1 z + 2 eta_2 X z, as two parallel passes over
+        // `z` (the second shifted up by one coefficient).
         let two_eta_1 = eta_1.double();
         let two_eta_2 = eta_2.double();
-        for (i, z_i) in z_a_hat.coeffs.iter().enumerate() {
-            q_coeffs[i] += two_eta_1 * z_i;
-            q_coeffs[i + 1] += two_eta_2 * z_i;
-        }
+        let z_len = z_a_hat.coeffs.len();
+        cfg_iter_mut!(q_coeffs[..z_len])
+            .zip(&z_a_hat.coeffs)
+            .for_each(|(q_i, z_i)| *q_i += two_eta_1 * z_i);
+        cfg_iter_mut!(q_coeffs[1..=z_len])
+            .zip(&z_a_hat.coeffs)
+            .for_each(|(q_i, z_i)| *q_i += two_eta_2 * z_i);
         // + h^2 v_H = (eta_1^2 + 2 eta_1 eta_2 X + eta_2^2 X^2)(X^m - 1)
         let eta_1_sq = eta_1.square();
         let eta_cross = (eta_1 * eta_2).double();
@@ -199,14 +272,17 @@ impl<E: Pairing> ZkPari<E> {
 
         // T = sum_j w_j Sigma_W[j] + eta_1 Sigma_W[k+1] + eta_2 Sigma_W[k+2]
         //     + sum_i q~[i] Sigma_Q[i]
-        // Separate MSMs over the SRS slices (avoids copying the bases).
+        // Separate MSMs over the SRS slices (avoids copying the bases); the
+        // two large ones run concurrently, see `utils::poly::join`.
         debug_assert_eq!(witness_assignment.len(), pk.sigma_w.len());
-        let t_w = E::G1::msm_unchecked(&pk.sigma_w, witness_assignment);
+        let (t_w, t_q) = join(
+            || msm::<E::G1>(&pk.sigma_w, witness_assignment),
+            || msm::<E::G1>(&pk.sigma_q[..q_tilde.coeffs.len()], &q_tilde.coeffs),
+        );
         let t_mask = E::G1::msm_unchecked(
             &[pk.sigma_mask_const, pk.sigma_mask_linear],
             &[eta_1, eta_2],
         );
-        let t_q = E::G1::msm_unchecked(&pk.sigma_q[..q_tilde.coeffs.len()], &q_tilde.coeffs);
         let t: E::G1Affine = (t_w + t_mask + t_q).into();
         end_timer!(timer_batch_commit);
 
@@ -227,22 +303,29 @@ impl<E: Pairing> ZkPari<E> {
 
         // R(X) = z_B(X) - x_B(X) + v_H(X) q~(X) = z_B(X) + v_H(X) q~(X)
         // (x_B = 0 after instance outlining, and w_B == z_B)
+        // Assembled as two parallel passes: `-q~` over the low coefficients
+        // and `+q~` shifted up by m. The regions overlap on [m, m+3), so
+        // the passes run one after the other.
+        let q_len = q_tilde.coeffs.len();
         let mut r_coeffs = z_b_hat.coeffs;
         r_coeffs.resize(
-            (domain_size + 1).max(q_tilde.coeffs.len() + domain_size),
+            (domain_size + 1).max(q_len + domain_size),
             E::ScalarField::zero(),
         );
-        for (i, q_i) in q_tilde.coeffs.iter().enumerate() {
-            r_coeffs[i] -= q_i;
-            r_coeffs[i + domain_size] += q_i;
-        }
+        cfg_iter_mut!(r_coeffs[..q_len])
+            .zip(&q_tilde.coeffs)
+            .for_each(|(r_i, q_i)| *r_i -= q_i);
+        cfg_iter_mut!(r_coeffs[domain_size..domain_size + q_len])
+            .zip(&q_tilde.coeffs)
+            .for_each(|(r_i, q_i)| *r_i += q_i);
         let r_poly = DensePolynomial::from_coefficients_vec(r_coeffs);
 
-        // v_R = R(zeta) = (v_a + x_A(zeta))^2 - x_B(zeta); recomputed by the
-        // verifier from v_a
-        let v_r = r_poly.evaluate(&challenge);
+        // v_R = R(zeta) = (v_a + x_A(zeta))^2 - x_B(zeta) is recomputed by
+        // the verifier from v_a and never sent, so the prover only evaluates
+        // it for the debug consistency check.
         #[cfg(debug_assertions)]
         {
+            let v_r = r_poly.evaluate(&challenge);
             let x_a_at_zeta = x_a_poly_check.evaluate(&challenge);
             assert_eq!(
                 v_r,
@@ -253,37 +336,34 @@ impl<E: Pairing> ZkPari<E> {
 
         // W_A(X) = (z_A(X) - x_A(X) - v_a)/(X - zeta), of degree <= m
         // W_R(X) = (R(X) - v_R)/(X - zeta), of degree <= 2m+1
-        let one = E::ScalarField::ONE;
-        let chall_vanishing_poly = DensePolynomial::from_coefficients_vec(vec![-challenge, one]);
-        let v_a_poly = DensePolynomial::from_coefficients_vec(vec![v_a]);
-        let v_r_poly = DensePolynomial::from_coefficients_vec(vec![v_r]);
-        let witness_a = (&w_a_masked - &v_a_poly) / &chall_vanishing_poly;
-        let witness_r = (&r_poly - &v_r_poly) / &chall_vanishing_poly;
+        // Synthetic division never reads the constant term, so subtracting
+        // v_a / v_R first is unnecessary (see `divide_by_linear`).
+        let (witness_a, witness_r) = join(
+            || divide_by_linear(&w_a_masked.coeffs, challenge),
+            || divide_by_linear(&r_poly.coeffs, challenge),
+        );
         end_timer!(timer_open_poly);
 
         // U = sum_i W_A[i] Sigma_A[i] + sum_i W_R[i] Sigma_R[i]
         // Two MSMs directly over the SRS slices: merging them into one call
         // costs a ~150MB base-vector copy at large sizes, which outweighs the
-        // bucket amortization.
+        // bucket amortization. They run concurrently instead.
         let timer_msms = start_timer!(|| "Computing the opening MSMs");
-        debug_assert!(witness_a.coeffs.len() <= pk.sigma_a.len());
-        debug_assert!(witness_r.coeffs.len() <= pk.sigma_r.len());
-        let w_a_proof =
-            E::G1::msm_unchecked(&pk.sigma_a[..witness_a.coeffs.len()], &witness_a.coeffs);
-        let w_r_proof =
-            E::G1::msm_unchecked(&pk.sigma_r[..witness_r.coeffs.len()], &witness_r.coeffs);
+        debug_assert!(witness_a.len() <= pk.sigma_a.len());
+        debug_assert!(witness_r.len() <= pk.sigma_r.len());
+        let (w_a_proof, w_r_proof) = join(
+            || msm::<E::G1>(&pk.sigma_a[..witness_a.len()], &witness_a),
+            || msm::<E::G1>(&pk.sigma_r[..witness_r.len()], &witness_r),
+        );
         let u: E::G1Affine = (w_a_proof + w_r_proof).into();
         end_timer!(timer_msms);
         end_timer!(timer_opening);
 
-        let output = Ok(Proof {
+        Ok(Proof {
             t_g: t,
             u_g: u,
             v_a,
-        });
-
-        end_timer!(timer_p);
-        output
+        })
     }
 
     /// Synthesize the circuit in proving mode and return the finalized SR1CS
@@ -362,13 +442,24 @@ impl<E: Pairing> ZkPari<E> {
         let mut z_a = vec![E::ScalarField::zero(); domain_size];
         let mut z_b = vec![E::ScalarField::zero(); domain_size];
 
+        // One row per task; each row is a short dot product, evaluated
+        // sequentially. (`Sr1csAdapter::evaluate_constraint` would open a
+        // nested parallel iterator over the row's handful of terms, which
+        // costs more in scheduling than the row itself.)
+        let eval_row = |terms: &[(E::ScalarField, usize)]| {
+            terms
+                .iter()
+                .fold(E::ScalarField::zero(), |acc, (coeff, idx)| {
+                    acc + *coeff * assignment[*idx]
+                })
+        };
         cfg_iter_mut!(z_a[..num_constraints])
             .zip(&mut z_b[..num_constraints])
             .zip(a_mat)
             .zip(b_mat)
             .for_each(|(((a, b), at_i), bt_i)| {
-                *a = Sr1csAdapter::<E::ScalarField>::evaluate_constraint(at_i, &assignment);
-                *b = Sr1csAdapter::<E::ScalarField>::evaluate_constraint(bt_i, &assignment);
+                *a = eval_row(at_i);
+                *b = eval_row(bt_i);
             });
 
         let instance_len = instance_assignment.len();

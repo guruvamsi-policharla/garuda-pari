@@ -34,6 +34,16 @@
 //! `HashIdx`), so challenges — and hence proofs — are bound to the exact
 //! circuit.
 //!
+//! # Proving
+//!
+//! [`ZkPari::prove`] synthesizes the circuit and converts it on every call.
+//! When many proofs are made for one circuit, build a [`ProverTemplate`]
+//! once and use [`ZkPari::prove_with_template`]: it records the SR1CS
+//! matrices and variable layout so each proof only runs the gadgets for
+//! their witness values, removing ~0.4 s of sequential work per proof on
+//! the 2^20-constraint payment circuits. The prover's FFTs and MSMs run
+//! inside the caller's rayon pool (see [`utils::msm`]).
+//!
 //! With the `circuits` feature, the crate additionally ships the private
 //! payment circuits from the accompanying paper (see [`circuits`]).
 
@@ -50,6 +60,7 @@ pub mod data_structures;
 mod generator;
 mod prover;
 mod simulator;
+mod template;
 pub mod utils;
 mod verifier;
 
@@ -57,6 +68,7 @@ mod verifier;
 mod test;
 
 pub use data_structures::{Proof, ProvingKey, SuccinctIndex, Trapdoor, VerifyingKey};
+pub use template::ProverTemplate;
 
 /// The ZK-Pari SNARK.
 pub struct ZkPari<E: Pairing> {

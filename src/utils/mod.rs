@@ -1,6 +1,9 @@
-//! Shared utilities: MSM helpers, the Fiat-Shamir transcript, and the
-//! protocol's challenge derivation.
+//! Shared utilities: the prover's MSM and polynomial kernels, the
+//! verifier's small MSM, the Fiat-Shamir transcript, and the protocol's
+//! challenge derivation.
 
+pub mod msm;
+pub mod poly;
 pub mod transcript;
 
 use crate::data_structures::VerifyingKey;

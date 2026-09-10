@@ -66,6 +66,7 @@ use ark_ff::{AdditiveGroup, BigInteger, PrimeField, Zero};
 use ark_r1cs_std::convert::{ToBitsGadget, ToBytesGadget};
 use ark_r1cs_std::fields::fp::FpVar;
 use ark_r1cs_std::groups::CurveVar;
+use ark_r1cs_std::select::TwoBitLookupGadget;
 use ark_r1cs_std::uint8::UInt8;
 use ark_r1cs_std::GR1CSVar;
 use ark_relations::gr1cs::{ConstraintSystemRef, SynthesisError};
@@ -108,12 +109,25 @@ impl HashKind {
     }
 }
 
+/// One 8-bit Pedersen window in the form the in-circuit gadget consumes:
+/// for each pair of adjacent bits `(2j, 2j+1)`, the affine `x` and `y`
+/// coordinates of `[O, G_2j, G_2j+1, G_2j + G_2j+1]`, indexed by the 2-bit
+/// value. Precomputing these once per [`HashCfg`] keeps circuit synthesis
+/// free of group arithmetic — in particular of `normalize_batch`, whose
+/// rayon-parallel batch inversion spawns a task per point and made
+/// synthesis *slower* on many cores when called per window.
+pub type PedersenLookups = [([Fr; 4], [Fr; 4]); 4];
+
 /// The hash instantiation every primitive is parametrized by.
 #[derive(Clone)]
 pub enum HashCfg {
     /// Pedersen generator table: one 8-bit window of Jubjub doubling powers
     /// per input byte, sized for the largest preimage and sliced per call.
-    Pedersen { table: Vec<Vec<EdwardsProjective>> },
+    /// `lookups[i]` is `table[i]` re-expressed as the gadget's 2-bit tables.
+    Pedersen {
+        table: Vec<Vec<EdwardsProjective>>,
+        lookups: Vec<PedersenLookups>,
+    },
     /// Poseidon round constants and MDS matrix.
     Poseidon { params: PoseidonConfig<Fr> },
 }
@@ -133,7 +147,7 @@ impl HashCfg {
 
     pub fn pedersen() -> Self {
         let mut rng = StdRng::seed_from_u64(0x4a75_626a_7562); // "Jubjub"
-        let table = (0..PEDERSEN_MAX_BYTES)
+        let table: Vec<Vec<EdwardsProjective>> = (0..PEDERSEN_MAX_BYTES)
             .map(|_| {
                 let mut base = EdwardsProjective::rand(&mut rng);
                 let mut powers = Vec::with_capacity(8);
@@ -144,7 +158,11 @@ impl HashCfg {
                 powers
             })
             .collect();
-        Self::Pedersen { table }
+        let lookups = table
+            .iter()
+            .map(|powers| pedersen_lookups(powers))
+            .collect();
+        Self::Pedersen { table, lookups }
     }
 
     pub fn poseidon() -> Self {
@@ -220,25 +238,53 @@ fn pedersen_hash(table: &[Vec<EdwardsProjective>], dom: u64, inputs: &[Fr]) -> F
     acc.into_affine().x
 }
 
+/// The 2-bit lookup tables for one 8-bit window of doubling powers: for
+/// each bit pair, the affine coordinates of `[O, G_a, G_b, G_a + G_b]`.
+fn pedersen_lookups(powers: &[EdwardsProjective]) -> PedersenLookups {
+    debug_assert_eq!(powers.len(), 8);
+    let zero = EdwardsProjective::zero().into_affine();
+    let mut out = [([Fr::zero(); 4], [Fr::zero(); 4]); 4];
+    for (j, pair) in powers.chunks(2).enumerate() {
+        let (g_a, g_b) = (pair[0], pair[1]);
+        let pts = [
+            zero,
+            g_a.into_affine(),
+            g_b.into_affine(),
+            (g_a + g_b).into_affine(),
+        ];
+        out[j] = (pts.map(|p| p.x), pts.map(|p| p.y));
+    }
+    out
+}
+
+/// In-circuit mirror of [`pedersen_hash`]: `sum_i bits_i * G_i` via the
+/// twisted-Edwards 2-bit-lookup gadget, then the x-coordinate.
+///
+/// This is `EdwardsVar::precomputed_base_multiscalar_mul_le` unrolled over
+/// precomputed affine tables: the same gadget calls in the same order (two
+/// `two_bit_lookup`s and one point addition per bit pair), hence the same
+/// constraints and the same digest, minus the per-window `normalize_batch`
+/// the library version performs at synthesis time.
 fn pedersen_hash_var(
-    table: &[Vec<EdwardsProjective>],
+    lookups: &[PedersenLookups],
     dom: u64,
     inputs: &[FpVar<Fr>],
 ) -> Result<FpVar<Fr>, SynthesisError> {
     let bytes = serialize_var(dom, inputs)?;
     assert!(
-        bytes.len() <= table.len(),
+        bytes.len() <= lookups.len(),
         "preimage exceeds generator table"
     );
-    let windows = bytes
-        .iter()
-        .map(|b| b.to_bits_le())
-        .collect::<Result<Vec<_>, _>>()?;
-    let point = EdwardsVar::precomputed_base_multiscalar_mul_le(
-        &table[..bytes.len()],
-        windows.iter().map(|w| w.as_slice()),
-    )?;
-    Ok(point.x)
+    let mut acc = EdwardsVar::zero();
+    for (byte, window) in bytes.iter().zip(lookups) {
+        let bits = byte.to_bits_le()?;
+        for (pair, (xs, ys)) in bits.chunks(2).zip(window) {
+            let x = FpVar::two_bit_lookup(pair, xs)?;
+            let y = FpVar::two_bit_lookup(pair, ys)?;
+            acc += EdwardsVar::new(x, y);
+        }
+    }
+    Ok(acc.x)
 }
 
 // ── Poseidon ────────────────────────────────────────────────────────────
@@ -277,7 +323,7 @@ fn poseidon_hash_var(
 /// Native hash of `dom` and `inputs` under the configured backend.
 pub fn hash(cfg: &HashCfg, dom: u64, inputs: &[Fr]) -> Fr {
     match cfg {
-        HashCfg::Pedersen { table } => pedersen_hash(table, dom, inputs),
+        HashCfg::Pedersen { table, .. } => pedersen_hash(table, dom, inputs),
         HashCfg::Poseidon { params } => poseidon_hash(params, dom, inputs),
     }
 }
@@ -290,7 +336,7 @@ pub fn hash_var(
     inputs: &[FpVar<Fr>],
 ) -> Result<FpVar<Fr>, SynthesisError> {
     match cfg {
-        HashCfg::Pedersen { table } => pedersen_hash_var(table, dom, inputs),
+        HashCfg::Pedersen { lookups, .. } => pedersen_hash_var(lookups, dom, inputs),
         HashCfg::Poseidon { params } => poseidon_hash_var(params, dom, inputs),
     }
 }

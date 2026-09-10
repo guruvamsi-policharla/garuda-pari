@@ -39,7 +39,13 @@
 //! adapter, so both counts are reported: `r1cs` is what the gadgets emit,
 //! `sr1cs` is what the prover pays for (each R1CS row splits into squares,
 //! plus outlining rows; the FFT domain rounds up to a power of two).
-//! `prove` includes circuit synthesis, as everywhere in these benches.
+//!
+//! Proving uses `ZkPari::prove_with_template`: the constraint structure
+//! (SR1CS matrices, adapter variable layout, outlining) is recorded once
+//! per circuit in a `ProverTemplate` — the `template ms` column — and each
+//! proof then only runs the gadgets for their witness values. `prove`
+//! therefore includes witness generation but not constraint synthesis; the
+//! end-to-end gate below still exercises the plain `prove` path.
 //!
 //! Before the table, an end-to-end flow runs as a correctness gate (per
 //! backend): Alice sends 300 to Bob (real prove/verify), the ledger
@@ -54,8 +60,12 @@
 //! of the same receive against Bob's updated commitment is rejected, and
 //! a second claim of the same position is unwitnessable.
 //!
-//! Threads: single-threaded by default. Set `ZKPARI_BENCH_THREADS=0` for all
-//! cores, or `=N` for N.
+//! Threads: proving is measured three times — pinned to one thread, on an
+//! 8-thread pool, and on an all-cores pool — and the table reports each
+//! plus the speedup over one thread. The prover's MSMs run inside the
+//! caller's pool (`zkpari::utils::msm`), so the thread counts are exact.
+//! Keygen and verification run single-threaded by default; set
+//! `ZKPARI_BENCH_THREADS=0` for all cores, or `=N` for N.
 //!
 //! Run with: cargo bench --bench circuits
 
@@ -72,7 +82,7 @@ use zkpari::circuits::op::OpCircuit;
 use zkpari::circuits::recv::RecvCircuit;
 use zkpari::circuits::send::SendCircuit;
 use zkpari::circuits::smt::{roots_from_siblings, SmtInsertion, SparseMerkleTree};
-use zkpari::ZkPari;
+use zkpari::{ProverTemplate, ZkPari};
 
 /// Hash instantiations benchmarked, in table order.
 const BACKENDS: &[HashKind] = &[HashKind::Pedersen, HashKind::Poseidon];
@@ -98,6 +108,9 @@ const NULL_TREE_DEPTH: usize = POSITION_BITS;
 
 const PROVE_ITERS: usize = 5;
 
+/// The fixed thread count reported next to the all-cores column.
+const TARGET_THREADS: usize = 8;
+
 fn main() {
     in_bench_pool(run);
 }
@@ -109,14 +122,26 @@ struct Row {
     instance_len: usize,
     domain: usize,
     keygen_ms: f64,
-    prove_ms: f64,
+    /// Building the prover template (once per circuit).
+    template_ms: f64,
+    /// Proving time pinned to one thread.
+    prove_1t_ms: f64,
+    /// Proving time on a `TARGET_THREADS`-thread pool.
+    prove_8t_ms: f64,
+    /// Proving time on an all-cores pool.
+    prove_par_ms: f64,
     verify_us: f64,
     proof_bytes: usize,
 }
 
 /// Keygen/prove/verify a circuit and collect one table row.
 /// `r1cs` is the pre-adapter constraint count (None for native SR1CS).
-fn measure<C: ConstraintSynthesizer<Fr> + Clone>(
+///
+/// Proving is timed in a single-threaded pool, a `TARGET_THREADS` pool,
+/// and an all-cores pool, so the table shows the prover's multi-core
+/// speedup directly; keygen, template construction, and verification run
+/// in the caller's (`ZKPARI_BENCH_THREADS`) pool.
+fn measure<C: ConstraintSynthesizer<Fr> + Clone + Sync>(
     name: &str,
     circuit: C,
     public_input: &[Fr],
@@ -130,17 +155,41 @@ fn measure<C: ConstraintSynthesizer<Fr> + Clone>(
         keys = Some(ZkPari::<E>::keygen(circuit.clone(), rng));
     });
     let (pk, vk) = keys.unwrap();
-
-    eprint!(" prove x{prove_iters} ...");
-    let mut proof = None;
-    let prove_ms = median_ms(prove_iters, || {
-        proof = Some(ZkPari::<E>::prove(circuit.clone(), &pk, rng).expect("proving failed"));
+    eprint!(" template ...");
+    let mut template = None;
+    let template_ms = median_ms(1, || {
+        template = Some(ProverTemplate::new(circuit.clone()).expect("template failed"));
     });
-    let proof = proof.unwrap();
-    assert!(
-        ZkPari::<E>::verify(&proof, &vk, public_input),
-        "sanity verification failed for {name}"
-    );
+    let template = template.unwrap();
+
+    let mut prove_in = |threads: usize| {
+        let mut proof = None;
+        let ms = in_pool(threads, || {
+            median_ms(prove_iters, || {
+                proof = Some(
+                    ZkPari::<E>::prove_with_template(circuit.clone(), &pk, &template, rng)
+                        .expect("proving failed"),
+                );
+            })
+        });
+        (ms, proof.unwrap())
+    };
+    eprint!(" prove x{prove_iters} (1 thread) ...");
+    let (prove_1t_ms, proof) = prove_in(1);
+    eprint!(" ({TARGET_THREADS} threads) ...");
+    let (prove_8t_ms, proof_8t) = prove_in(TARGET_THREADS);
+    eprint!(" ({} threads) ...", all_cores());
+    let (prove_par_ms, proof_par) = prove_in(0);
+    for (label, p) in [
+        ("single-threaded", &proof),
+        ("8-thread", &proof_8t),
+        ("all-cores", &proof_par),
+    ] {
+        assert!(
+            ZkPari::<E>::verify(p, &vk, public_input),
+            "sanity verification failed for {name} ({label} proof)"
+        );
+    }
 
     eprint!(" verify ...");
     let verify_us = 1000.0
@@ -156,7 +205,10 @@ fn measure<C: ConstraintSynthesizer<Fr> + Clone>(
         instance_len: vk.succinct_index.instance_len,
         domain: vk.domain.size as usize,
         keygen_ms,
-        prove_ms,
+        template_ms,
+        prove_1t_ms,
+        prove_8t_ms,
+        prove_par_ms,
         verify_us,
         proof_bytes: compressed_size(&proof),
     }
@@ -187,7 +239,11 @@ fn run() {
     println!("║      position nullifiers + sparse Merkle tree; Pedersen vs Poseidon  ║");
     println!("╚══════════════════════════════════════════════════════════════════════╝");
     println!();
-    println!("Threads: {}.", thread_label());
+    println!(
+        "Threads:  keygen/verify {}; prove measured on 1, {TARGET_THREADS}, and all {} cores.",
+        thread_label(),
+        all_cores()
+    );
     println!("Hashes:   one collision-resistant hash for Merkle nodes and commitments,");
     println!("          instantiated as Pedersen/Jubjub (8-bit byte windows) or Poseidon");
     println!("          (width 3, alpha 5, 8 + 57 rounds). No PRF anywhere.");
@@ -261,19 +317,31 @@ fn run() {
         ));
     }
 
+    let cores = all_cores();
+    let par_header = format!("prove {cores}T ms");
+    let par_speedup = format!("{cores}T x");
     println!();
-    println!("  circuit                  │    r1cs │    sr1cs │   domain │ |x| │ keygen ms │ prove ms │ verify us │ proof B");
-    println!("  ─────────────────────────┼─────────┼──────────┼──────────┼─────┼───────────┼──────────┼───────────┼────────");
+    println!(
+        "  circuit                  │    r1cs │    sr1cs │   domain │ |x| │ keygen ms │ template ms │ prove 1T ms │ prove {TARGET_THREADS}T ms │ {TARGET_THREADS}T x │ {par_header:>13} │ {par_speedup:>6} │ verify us │ proof B"
+    );
+    println!(
+        "  ─────────────────────────┼─────────┼──────────┼──────────┼─────┼───────────┼─────────────┼─────────────┼─────────────┼───────┼───────────────┼────────┼───────────┼────────"
+    );
     for r in &rows {
         println!(
-            "  {:<24} │ {:>7} │ {:>8} │ {:>8} │ {:>3} │ {:>9.1} │ {:>8.1} │ {:>9.1} │ {:>6}",
+            "  {:<24} │ {:>7} │ {:>8} │ {:>8} │ {:>3} │ {:>9.1} │ {:>11.1} │ {:>11.1} │ {:>11.1} │ {:>5.2}x │ {:>13.1} │ {:>5.2}x │ {:>9.1} │ {:>6}",
             r.name,
             r.r1cs.map_or_else(|| "—".to_string(), |n| n.to_string()),
             r.sr1cs,
             r.domain,
             r.instance_len,
             r.keygen_ms,
-            r.prove_ms,
+            r.template_ms,
+            r.prove_1t_ms,
+            r.prove_8t_ms,
+            r.prove_1t_ms / r.prove_8t_ms,
+            r.prove_par_ms,
+            r.prove_1t_ms / r.prove_par_ms,
             r.verify_us,
             r.proof_bytes,
         );
@@ -282,6 +350,12 @@ fn run() {
     println!(
         "  Receipt tree depth {RECEIPT_DEPTH}; nullifier SMT depth {NULL_TREE_DEPTH}. \
          |x| counts the leading constant 1. Proofs are 2 G1 + 1 F."
+    );
+    println!(
+        "  prove 1T / {TARGET_THREADS}T / {cores}T: the same prover in rayon pools of 1, \
+         {TARGET_THREADS}, and {cores} threads; each includes witness generation \
+         (the gadgets' native arithmetic, ~0.2 s single-threaded for Pedersen R_recv) \
+         but not constraint synthesis, which the template (template ms) does once."
     );
     println!();
 }
@@ -601,7 +675,10 @@ fn e2e_flow(kind: HashKind, rng: &mut StdRng) {
     cheat.path = receipt_tree.path(0);
     let mut cheat_tree = SparseMerkleTree::new(&cfg, NULL_TREE_DEPTH); // Bob's pre-receive state
     cheat.attach_nullifier_insertion(&mut cheat_tree);
-    assert_unsatisfiable(cheat.clone(), "wrong-position witness must not satisfy R_recv");
+    assert_unsatisfiable(
+        cheat.clone(),
+        "wrong-position witness must not satisfy R_recv",
+    );
     if let Ok(forged) = ZkPari::<E>::prove(cheat.clone(), &recv_pk, rng) {
         assert!(
             !ZkPari::<E>::verify(&forged, &recv_vk, &cheat.public_input()),
@@ -642,7 +719,11 @@ fn e2e_flow(kind: HashKind, rng: &mut StdRng) {
         pid: double.pos,
         siblings,
     };
-    assert_eq!(double.com(), ledger_bob, "double-claim opens the current com");
+    assert_eq!(
+        double.com(),
+        ledger_bob,
+        "double-claim opens the current com"
+    );
     assert_unsatisfiable(double, "double-receive witness must not satisfy R_recv");
 
     // Keep the linter honest about the updated ledger state.

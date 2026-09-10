@@ -197,12 +197,7 @@ fn hash_native_matches_circuit() {
             .map(|x| FpVar::new_witness(cs.clone(), || Ok(*x)).unwrap())
             .collect();
 
-        for (dom, arity) in [
-            (DOM_ACCT, 3),
-            (DOM_REC, 4),
-            (DOM_REC, 5),
-            (DOM_NODE, 2),
-        ] {
+        for (dom, arity) in [(DOM_ACCT, 3), (DOM_REC, 4), (DOM_REC, 5), (DOM_NODE, 2)] {
             let native = hash(&cfg, dom, &inputs[..arity]);
             let circuit = hash_var(&cfg, dom, &vars[..arity]).unwrap();
             assert_eq!(
@@ -256,7 +251,9 @@ fn smt_insertion_witness_is_consistent() {
         }
         assert_eq!(empty_root, expected, "{kind:?}: empty root");
 
-        let pids: Vec<u64> = (0..5).map(|_| rng.gen_range(0..1u64 << NULL_DEPTH)).collect();
+        let pids: Vec<u64> = (0..5)
+            .map(|_| rng.gen_range(0..1u64 << NULL_DEPTH))
+            .collect();
         let mut seen = std::collections::HashSet::new();
         for pid in pids {
             if !seen.insert(pid) {
@@ -537,5 +534,74 @@ fn op_branches_are_shape_identical() {
             shape(random_op_receive(&cfg, &mut rng)),
             "{kind:?}"
         );
+    }
+}
+
+/// The template prover on every payment relation under both backends:
+/// a template built from one instance proves a *different* instance of the
+/// same shape (checking that witness-only synthesis lays variables out
+/// exactly like the full pipeline the template was built from), the proof
+/// verifies against the statement, and a genuinely unsatisfiable witness is
+/// still rejected with `Unsatisfiable`.
+#[test]
+fn template_prover_matches_full_prover() {
+    use crate::{ProverTemplate, ZkPari};
+    use ark_bls12_381::Bls12_381 as E;
+    use ark_relations::gr1cs::SynthesisError;
+
+    let mut rng = rng();
+    for kind in BACKENDS {
+        let cfg = HashCfg::of(kind);
+
+        // R_send
+        let (pk, vk) = ZkPari::<E>::keygen(random_send(&cfg, &mut rng), &mut rng);
+        let template = ProverTemplate::new(random_send(&cfg, &mut rng)).unwrap();
+        let send = random_send(&cfg, &mut rng);
+        let proof =
+            ZkPari::<E>::prove_with_template(send.clone(), &pk, &template, &mut rng).unwrap();
+        assert!(
+            ZkPari::<E>::verify(&proof, &vk, &send.public_input()),
+            "{kind:?}: R_send template proof rejected"
+        );
+
+        // R_recv, plus the wrong-position witness through the template path.
+        let (shape, _, _) = random_recv(&cfg, &mut rng);
+        let (pk, vk) = ZkPari::<E>::keygen(shape.clone(), &mut rng);
+        let template = ProverTemplate::new(shape).unwrap();
+        let (recv, tree, _) = random_recv(&cfg, &mut rng);
+        let proof =
+            ZkPari::<E>::prove_with_template(recv.clone(), &pk, &template, &mut rng).unwrap();
+        assert!(
+            ZkPari::<E>::verify(&proof, &vk, &recv.public_input()),
+            "{kind:?}: R_recv template proof rejected"
+        );
+        let mut cheat = recv.clone();
+        let mut fresh_tree = SparseMerkleTree::new(&cfg, NULL_DEPTH);
+        cheat.pos = 0;
+        cheat.path = tree.path(0);
+        cheat.attach_nullifier_insertion(&mut fresh_tree);
+        assert!(
+            matches!(
+                ZkPari::<E>::prove_with_template(cheat, &pk, &template, &mut rng),
+                Err(SynthesisError::Unsatisfiable)
+            ),
+            "{kind:?}: wrong-position witness must be rejected by the template prover"
+        );
+
+        // R_op: one template serves both branches (they are shape-identical).
+        let (pk, vk) = ZkPari::<E>::keygen(random_op_send(&cfg, &mut rng), &mut rng);
+        let template = ProverTemplate::new(random_op_send(&cfg, &mut rng)).unwrap();
+        for op in [
+            random_op_send(&cfg, &mut rng),
+            random_op_receive(&cfg, &mut rng),
+        ] {
+            let proof =
+                ZkPari::<E>::prove_with_template(op.clone(), &pk, &template, &mut rng).unwrap();
+            assert!(
+                ZkPari::<E>::verify(&proof, &vk, &op.public_input()),
+                "{kind:?}: R_op template proof rejected (is_send = {})",
+                op.is_send
+            );
+        }
     }
 }

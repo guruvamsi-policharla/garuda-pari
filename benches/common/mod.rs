@@ -105,17 +105,28 @@ pub fn bench_threads() -> usize {
         .unwrap_or(1)
 }
 
-/// Run `body` inside a rayon pool sized by [`bench_threads`].
+/// Run `body` inside a rayon pool of `threads` threads (`0` = all cores).
 ///
 /// `install` also governs the parallel iterators inside arkworks, so this pins
 /// the whole measurement — including key generation, proving, and the MSMs
-/// inside verification — to the chosen thread count.
-pub fn in_bench_pool<T: Send>(body: impl FnOnce() -> T + Send) -> T {
+/// inside verification — to the chosen thread count. Nesting is fine: a body
+/// running in one pool may `in_pool` into another.
+pub fn in_pool<T: Send>(threads: usize, body: impl FnOnce() -> T + Send) -> T {
     let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(bench_threads())
+        .num_threads(threads)
         .build()
         .expect("failed to build the benchmark thread pool");
     pool.install(body)
+}
+
+/// Run `body` inside a rayon pool sized by [`bench_threads`].
+pub fn in_bench_pool<T: Send>(body: impl FnOnce() -> T + Send) -> T {
+    in_pool(bench_threads(), body)
+}
+
+/// Number of threads an all-cores pool gets on this machine.
+pub fn all_cores() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get())
 }
 
 /// Human-readable description of the thread setting, for bench headers.
