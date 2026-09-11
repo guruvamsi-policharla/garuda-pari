@@ -175,6 +175,84 @@ fn roundtrip_native_sr1cs() {
     assert!(ZkPari::<E>::verify(&proof, &vk, &[]));
 }
 
+/// The template prover must produce verifying proofs for adapter-converted
+/// and native-SR1CS circuits alike, from templates built on *different*
+/// instances of the same shape (the layout self-check inside
+/// `ProverTemplate::new` covers the adapter mirroring itself).
+#[test]
+fn template_prover_roundtrip() {
+    use crate::ProverTemplate;
+    let mut rng = rng();
+
+    // R1CS through the adapter, with a public input.
+    let shape = MulCircuit {
+        a: Some(Fr::rand(&mut rng)),
+        b: Some(Fr::rand(&mut rng)),
+    };
+    let (pk, vk) = ZkPari::<E>::keygen(shape.clone(), &mut rng);
+    let template = ProverTemplate::new(shape).unwrap();
+    let (a_val, b_val) = (Fr::rand(&mut rng), Fr::rand(&mut rng));
+    let circuit = MulCircuit {
+        a: Some(a_val),
+        b: Some(b_val),
+    };
+    let proof = ZkPari::<E>::prove_with_template(circuit, &pk, &template, &mut rng).unwrap();
+    assert!(ZkPari::<E>::verify(&proof, &vk, &[a_val * b_val]));
+    assert!(!ZkPari::<E>::verify(
+        &proof,
+        &vk,
+        &[a_val * b_val + Fr::ONE]
+    ));
+
+    // Native SR1CS with a public input.
+    let shape = CoeffChain {
+        coeff: Fr::from(3u64),
+        len: 20,
+        seed: 5,
+    };
+    let (pk, vk) = ZkPari::<E>::keygen(shape, &mut rng);
+    let template = ProverTemplate::new(shape).unwrap();
+    let circuit = CoeffChain { seed: 11, ..shape };
+    let proof = ZkPari::<E>::prove_with_template(circuit, &pk, &template, &mut rng).unwrap();
+    assert!(ZkPari::<E>::verify(&proof, &vk, &circuit.public_input()));
+    assert!(!ZkPari::<E>::verify(&proof, &vk, &shape.public_input()));
+
+    // Native SR1CS with no public input. (Unsatisfiable witnesses on the
+    // template path are covered by the payment-circuit tests, which have
+    // real ones; the shape-mismatch panic is tested separately below.)
+    let shape = RangeProofCircuit { value: Some(1) };
+    let (pk, vk) = ZkPari::<E>::keygen(shape.clone(), &mut rng);
+    let template = ProverTemplate::new(shape).unwrap();
+    let proof = ZkPari::<E>::prove_with_template(
+        RangeProofCircuit {
+            value: Some(u64::MAX),
+        },
+        &pk,
+        &template,
+        &mut rng,
+    )
+    .unwrap();
+    assert!(ZkPari::<E>::verify(&proof, &vk, &[]));
+}
+
+/// Proving a circuit of a different shape against a template must panic
+/// rather than produce a proof.
+#[test]
+#[should_panic(expected = "circuit shape does not match the prover template")]
+fn template_prover_rejects_wrong_shape() {
+    use crate::ProverTemplate;
+    let mut rng = rng();
+    let shape = CoeffChain {
+        coeff: Fr::from(3u64),
+        len: 20,
+        seed: 5,
+    };
+    let (pk, _) = ZkPari::<E>::keygen(shape, &mut rng);
+    let template = ProverTemplate::new(shape).unwrap();
+    let _ =
+        ZkPari::<E>::prove_with_template(CoeffChain { len: 21, ..shape }, &pk, &template, &mut rng);
+}
+
 /// A serialized proof must be exactly 2 G1 + 1 F = 128 bytes on BLS12-381,
 /// must deserialize and verify, and verification must reject (not panic on)
 /// malformed statements.
