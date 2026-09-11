@@ -29,12 +29,12 @@ End-to-end private transfer [poseidon] (receipts d40, nullifier SMT d40): Alice 
 
   circuit                  │    r1cs │    sr1cs │   domain │ |x| │ keygen ms │ template ms │ prove 1T ms │ prove 8T ms │ 8T x │  prove 18T ms │  18T x │ verify us │ proof B
   ─────────────────────────┼─────────┼──────────┼──────────┼─────┼───────────┼─────────────┼─────────────┼─────────────┼───────┼───────────────┼────────┼───────────┼────────
-  R_send pedersen          │   16109 │    32227 │    32768 │   5 │    1105.1 │        22.3 │       837.0 │       143.6 │  5.83x │          93.4 │  8.96x │     747.3 │    128
-  R_recv pedersen          │  398111 │   796231 │  1048576 │   5 │   29763.3 │       633.5 │     20072.1 │      3822.5 │  5.25x │        2225.2 │  9.02x │     753.7 │    128
-  R_op pedersen            │  406460 │   812931 │  1048576 │   6 │   30951.9 │       685.2 │     20395.8 │      3844.3 │  5.31x │        2319.0 │  8.79x │     805.1 │    128
-  R_send poseidon          │    1647 │     3303 │     4096 │   5 │     181.0 │         8.1 │       136.7 │        26.2 │  5.22x │          18.4 │  7.42x │     805.5 │    128
-  R_recv poseidon          │   30729 │    61467 │    65536 │   5 │    2305.6 │       178.3 │      1632.8 │       293.9 │  5.56x │         163.3 │ 10.00x │     768.0 │    128
-  R_op poseidon            │   31706 │    63423 │    65536 │   6 │    2502.7 │       178.4 │      1646.2 │       291.5 │  5.65x │         168.9 │  9.75x │     761.2 │    128
+  R_send pedersen          │   16109 │    32227 │    32768 │   5 │    1158.0 │        25.7 │       870.7 │       163.8 │  5.31x │         115.6 │  7.53x │     774.3 │    128
+  R_recv pedersen          │  398111 │   796231 │  1048576 │   5 │   31846.6 │       739.9 │     21695.6 │      4131.3 │  5.25x │        2458.0 │  8.83x │     815.0 │    128
+  R_op pedersen            │  406460 │   812931 │  1048576 │   6 │   33494.5 │       744.7 │     21672.1 │      4082.2 │  5.31x │        2433.9 │  8.90x │     790.8 │    128
+  R_send poseidon          │    1647 │     3303 │     4096 │   5 │     182.0 │         8.5 │       137.2 │        31.5 │  4.35x │          27.9 │  4.91x │     832.8 │    128
+  R_recv poseidon          │   30729 │    61467 │    65536 │   5 │    2452.3 │       183.8 │      1698.4 │       311.0 │  5.46x │         193.0 │  8.80x │     838.1 │    128
+  R_op poseidon            │   31706 │    63423 │    65536 │   6 │    2465.5 │       183.0 │      1712.8 │       308.9 │  5.54x │         193.1 │  8.87x │     836.7 │    128
 
   Receipt tree depth 40; nullifier SMT depth 40. |x| counts the leading constant 1. Proofs are 2 G1 + 1 F.
   prove 1T / 8T / 18T: the same prover in rayon pools of 1, 8, and 18 threads; each includes witness generation (the gadgets' native arithmetic, ~0.2 s single-threaded for Pedersen R_recv) but not constraint synthesis, which the template (template ms) does once.
