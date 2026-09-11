@@ -3,8 +3,7 @@ use std::rc::Rc;
 use crate::data_structures::{Proof, ProvingKey};
 use crate::template::ProverTemplate;
 use crate::utils::compute_chall;
-use crate::utils::msm::msm;
-use crate::utils::poly::{divide_by_linear, join, square_minus_over_vanishing};
+use crate::utils::poly::{divide_by_linear, square_minus_over_vanishing};
 use crate::ZkPari;
 use ark_ec::{pairing::Pairing, VariableBaseMSM};
 use ark_ff::{AdditiveGroup, Field, Zero};
@@ -272,13 +271,10 @@ impl<E: Pairing> ZkPari<E> {
 
         // T = sum_j w_j Sigma_W[j] + eta_1 Sigma_W[k+1] + eta_2 Sigma_W[k+2]
         //     + sum_i q~[i] Sigma_Q[i]
-        // Separate MSMs over the SRS slices (avoids copying the bases); the
-        // two large ones run concurrently, see `utils::poly::join`.
+        // Separate MSMs over the SRS slices (avoids copying the bases).
         debug_assert_eq!(witness_assignment.len(), pk.sigma_w.len());
-        let (t_w, t_q) = join(
-            || msm::<E::G1>(&pk.sigma_w, witness_assignment),
-            || msm::<E::G1>(&pk.sigma_q[..q_tilde.coeffs.len()], &q_tilde.coeffs),
-        );
+        let t_w = E::G1::msm_unchecked(&pk.sigma_w, witness_assignment);
+        let t_q = E::G1::msm_unchecked(&pk.sigma_q[..q_tilde.coeffs.len()], &q_tilde.coeffs);
         let t_mask = E::G1::msm_unchecked(
             &[pk.sigma_mask_const, pk.sigma_mask_linear],
             &[eta_1, eta_2],
@@ -338,23 +334,19 @@ impl<E: Pairing> ZkPari<E> {
         // W_R(X) = (R(X) - v_R)/(X - zeta), of degree <= 2m+1
         // Synthetic division never reads the constant term, so subtracting
         // v_a / v_R first is unnecessary (see `divide_by_linear`).
-        let (witness_a, witness_r) = join(
-            || divide_by_linear(&w_a_masked.coeffs, challenge),
-            || divide_by_linear(&r_poly.coeffs, challenge),
-        );
+        let witness_a = divide_by_linear(&w_a_masked.coeffs, challenge);
+        let witness_r = divide_by_linear(&r_poly.coeffs, challenge);
         end_timer!(timer_open_poly);
 
         // U = sum_i W_A[i] Sigma_A[i] + sum_i W_R[i] Sigma_R[i]
         // Two MSMs directly over the SRS slices: merging them into one call
         // costs a ~150MB base-vector copy at large sizes, which outweighs the
-        // bucket amortization. They run concurrently instead.
+        // bucket amortization.
         let timer_msms = start_timer!(|| "Computing the opening MSMs");
         debug_assert!(witness_a.len() <= pk.sigma_a.len());
         debug_assert!(witness_r.len() <= pk.sigma_r.len());
-        let (w_a_proof, w_r_proof) = join(
-            || msm::<E::G1>(&pk.sigma_a[..witness_a.len()], &witness_a),
-            || msm::<E::G1>(&pk.sigma_r[..witness_r.len()], &witness_r),
-        );
+        let w_a_proof = E::G1::msm_unchecked(&pk.sigma_a[..witness_a.len()], &witness_a);
+        let w_r_proof = E::G1::msm_unchecked(&pk.sigma_r[..witness_r.len()], &witness_r);
         let u: E::G1Affine = (w_a_proof + w_r_proof).into();
         end_timer!(timer_msms);
         end_timer!(timer_opening);

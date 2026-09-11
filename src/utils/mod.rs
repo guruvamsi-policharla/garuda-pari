@@ -1,8 +1,6 @@
-//! Shared utilities: the prover's MSM and polynomial kernels, the
-//! verifier's small MSM, the Fiat-Shamir transcript, and the protocol's
-//! challenge derivation.
+//! Shared utilities: MSM helpers, the Fiat-Shamir transcript, the
+//! protocol's challenge derivation, and the prover's polynomial kernels.
 
-pub mod msm;
 pub mod poly;
 pub mod transcript;
 

@@ -41,8 +41,7 @@
 //! once and use [`ZkPari::prove_with_template`]: it records the SR1CS
 //! matrices and variable layout so each proof only runs the gadgets for
 //! their witness values, removing ~0.4 s of sequential work per proof on
-//! the 2^20-constraint payment circuits. The prover's FFTs and MSMs run
-//! inside the caller's rayon pool (see [`utils::msm`]).
+//! the 2^20-constraint payment circuits.
 //!
 //! With the `circuits` feature, the crate additionally ships the private
 //! payment circuits from the accompanying paper (see [`circuits`]).

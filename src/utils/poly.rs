@@ -11,30 +11,6 @@ use ark_std::{cfg_chunks, cfg_chunks_mut, cfg_iter, cfg_iter_mut};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
-/// Run two closures, concurrently when the `parallel` feature is on.
-///
-/// Used to overlap independent MSMs: each is already parallel across its
-/// Pippenger windows, but with a window count comparable to the core count
-/// a single MSM leaves the pool unevenly loaded (especially on asymmetric
-/// P/E-core machines), and two in flight fill the gaps.
-#[inline]
-pub fn join<A, B, RA, RB>(a: A, b: B) -> (RA, RB)
-where
-    A: FnOnce() -> RA + Send,
-    B: FnOnce() -> RB + Send,
-    RA: Send,
-    RB: Send,
-{
-    #[cfg(feature = "parallel")]
-    {
-        rayon::join(a, b)
-    }
-    #[cfg(not(feature = "parallel"))]
-    {
-        (a(), b())
-    }
-}
-
 /// Smallest chunk a thread is handed in the parallel scans below; below
 /// this the rayon overhead dominates the field arithmetic.
 const MIN_CHUNK: usize = 1 << 12;

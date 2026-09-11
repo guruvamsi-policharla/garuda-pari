@@ -62,9 +62,7 @@
 //!
 //! Threads: proving is measured three times — pinned to one thread, on an
 //! 8-thread pool, and on an all-cores pool — and the table reports each
-//! plus the speedup over one thread. The prover's MSMs run inside the
-//! caller's pool (`zkpari::utils::msm`), so the thread counts are exact.
-//! Keygen and verification run single-threaded by default; set
+//! plus the speedup over one thread. Keygen and verification run single-threaded by default; set
 //! `ZKPARI_BENCH_THREADS=0` for all cores, or `=N` for N.
 //!
 //! Run with: cargo bench --bench circuits
